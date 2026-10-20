@@ -1504,6 +1504,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClCompile Include="..\src\libs\mt32\PartialManager.cpp" />
     <ClCompile Include="..\src\libs\mt32\Poly.cpp" />
     <ClCompile Include="..\src\gui\render.cpp" />
+    <ClCompile Include="..\src\gui\render_presence.cpp" />
     <ClCompile Include="..\src\gui\render_scalers.cpp" />
     <ClCompile Include="..\src\aviwriter\riff.cpp" />
     <ClCompile Include="..\src\aviwriter\riff_wav_writer.cpp" />
@@ -1816,6 +1817,7 @@ for /d %%i in ("$(SolutionDir)\..\contrib\translations\*") do copy "%%i\*.lng" "
     <ClInclude Include="..\include\regionalloctracking.h" />
     <ClInclude Include="..\include\regs.h" />
     <ClInclude Include="..\include\render.h" />
+    <ClInclude Include="..\include\render_presence.h" />
     <ClInclude Include="..\include\resource.h" />
     <ClInclude Include="..\include\sdlmain.h" />
     <ClInclude Include="..\include\serialport.h" />

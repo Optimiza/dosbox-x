@@ -381,6 +381,9 @@
     <ClCompile Include="..\src\gui\render.cpp">
       <Filter>Sources\gui</Filter>
     </ClCompile>
+    <ClCompile Include="..\src\gui\render_presence.cpp">
+      <Filter>Sources\gui</Filter>
+    </ClCompile>
     <ClCompile Include="..\src\gui\render_scalers.cpp">
       <Filter>Sources\gui</Filter>
     </ClCompile>
@@ -2358,6 +2361,9 @@
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\render.h">
+      <Filter>Includes</Filter>
+    </ClInclude>
+    <ClInclude Include="..\include\render_presence.h">
       <Filter>Includes</Filter>
     </ClInclude>
     <ClInclude Include="..\include\resource.h">

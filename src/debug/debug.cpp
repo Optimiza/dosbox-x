@@ -43,6 +43,7 @@ using namespace std;
 #endif
 
 #include "debug.h"
+#include "render_presence.h"
 #if defined(C_DOSBOX_AGENT)
 #include "agent/agent_bridge.h"
 #endif
@@ -5364,6 +5365,7 @@ Bitu DEBUG_Loop(void) {
     else {
         //TODO Disable sound
         GFX_Events();
+        PRESENCE_ParkedTick();
         // Interrupt started ? - then skip it
         uint16_t oldCS	= SegValue(cs);
         uint32_t oldEIP	= reg_eip;
