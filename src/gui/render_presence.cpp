@@ -122,6 +122,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "held") ok = ParseFloat(value, 0.0f, 1.0f, look.held);
         else if (key == "fade") ok = ParseFloat(value, 0.0f, 60.0f, look.fade);
         else if (key == "size") ok = ParseFloat(value, 0.001f, 0.5f, look.size);
+        else if (key == "glide") ok = ParseFloat(value, 0.0f, 5.0f, look.glide);
         else if (key == "steps") {
             float steps = 0;
             ok = ParseFloat(value, 1.0f, 64.0f, steps) && steps == std::floor(steps);
@@ -155,6 +156,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
        differs is a new one, repainted whole */
     if (!(look == look_)) look_generation_++;
     look_ = look;
+    if (!pointer) glide_ = Glide();  /* turned off: the next arrow appears where it is */
     pointer_ = pointer;
     return true;
 }
@@ -177,6 +179,7 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     under_.clear();
     drawn_ = false;                  /* a new output buffer holds no overlay */
     presented_ = Key();
+    glide_ = Glide();
     full_.assign({0, (uint16_t)std::min(height, 65535u)});
 }
 
@@ -204,10 +207,33 @@ Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float 
     k.look = look_generation_;
     k.arrow = pointer_ && have_pointer && !look_.sprite.empty();
     if (k.arrow) {
-        k.ax = (int)std::lround(std::min(std::max(fx, 0.0f), 1.0f) * (float)width_);
-        k.ay = (int)std::lround(std::min(std::max(fy, 0.0f), 1.0f) * (float)height_);
+        float x = 0, y = 0;
+        ArrowAt(now_ms, std::min(std::max(fx, 0.0f), 1.0f), std::min(std::max(fy, 0.0f), 1.0f), x, y);
+        k.ax = (int)std::lround(x * (float)width_);
+        k.ay = (int)std::lround(y * (float)height_);
     }
     return k;
+}
+
+void Overlay::ArrowAt(uint32_t now_ms, float fx, float fy, float &x, float &y) const {
+    Glide &g = glide_;
+    const float span_ms = look_.glide * 1000.0f;
+    auto at = [&](float &gx, float &gy) {
+        const float u = span_ms > 0 ? std::min(1.0f, (float)(uint32_t)(now_ms - g.since_ms) / span_ms) : 1.0f;
+        const float eased = 1.0f - (1.0f - u) * (1.0f - u) * (1.0f - u);
+        gx = g.from_x + (g.to_x - g.from_x) * eased;
+        gy = g.from_y + (g.to_y - g.from_y) * eased;
+    };
+    if (!g.shown) {
+        g = Glide{true, fx, fy, fx, fy, now_ms};
+    } else if (fx != g.to_x || fy != g.to_y) {
+        /* a new place: glide on from where the arrow is now, not from where it was going */
+        at(g.from_x, g.from_y);
+        g.to_x = fx;
+        g.to_y = fy;
+        g.since_ms = now_ms;
+    }
+    at(x, y);
 }
 
 bool Overlay::NeedsRepaint(uint32_t now_ms, bool have_pointer, float fx, float fy) const {

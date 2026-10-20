@@ -193,7 +193,7 @@ TEST(Presence, DrawsTheArrowAtThePointerOnlyWhenAskedAndMovesIt) {
     Frame frame(20, 20, 0x00FFFFFFu);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
     EXPECT_EQ(frame.at(10, 10), 0x00FFFFFFu) << "no arrow until the pointer is asked for";
-    ASSERT_TRUE(o.Configure("held pointer=1", error, 0));
+    ASSERT_TRUE(o.Configure("held pointer=1 glide=0", error, 0));     /* no glide: it jumps */
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
     EXPECT_EQ(frame.at(10, 10), 0x00000000u) << "the arrow's outline at its hot spot";
     EXPECT_EQ(frame.at(12, 10), 0x00FF8C00u) << "its fill beside it";
@@ -204,6 +204,28 @@ TEST(Presence, DrawsTheArrowAtThePointerOnlyWhenAskedAndMovesIt) {
     EXPECT_EQ(frame.at(19, 19), 0x00000000u) << "an arrow at the corner is cut, not overrun";
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0.25f, 0.25f);
     EXPECT_EQ(frame.at(5, 5), 0x00FFFFFFu) << "no driver, no arrow";
+}
+
+TEST(Presence, TheArrowGlidesToItsNewPlaceEasingOut) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure("held rgb=FF8C00 edge=0.01 steps=1 acting=1 held=0.5 fade=1"
+                            " outline=000000 size=0.2 sprite=Xo/oX pointer=1 glide=0.2", error, 0))
+        << error;
+    const Format f = Rgb32();
+    o.Resize(100, 100, &f);
+    Frame frame(100, 100, 0x00FFFFFFu);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.2f, 0.2f);
+    EXPECT_EQ(frame.at(20, 20), 0x00000000u) << "the first arrow appears where it is";
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 1000, true, 0.8f, 0.8f);
+    EXPECT_EQ(frame.at(20, 20), 0x00000000u) << "a new place is glided to from the old one";
+    EXPECT_TRUE(o.NeedsRepaint(1100, true, 0.8f, 0.8f)) << "a gliding arrow repaints the window";
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 1100, true, 0.8f, 0.8f);
+    EXPECT_EQ(frame.at(20, 20), 0x00FFFFFFu) << "half way it has left";
+    EXPECT_EQ(frame.at(95, 95), 0x00FFFFFFu) << "half way it has not arrived";
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 1200, true, 0.8f, 0.8f);
+    EXPECT_EQ(frame.at(95, 95), 0x00000000u) << "at the end it is there";
+    EXPECT_FALSE(o.NeedsRepaint(1300, true, 0.8f, 0.8f)) << "and nothing more is repainted";
 }
 
 TEST(Presence, DrawsOnASixteenBitOutputWithAPitchWiderThanItsRows) {
