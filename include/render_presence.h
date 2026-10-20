@@ -33,6 +33,11 @@ struct Look {
     float size = 0.06f;       /* arrow height, a fraction of the shorter side */
     /* the arrow, top row first: 'X' outline, 'o' fill, '.' untouched */
     std::vector<std::string> sprite;
+    bool operator==(const Look &o) const {
+        return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
+               acting == o.acting && held == o.held && fade == o.fade && size == o.size &&
+               sprite == o.sprite;
+    }
 };
 
 /* Where each of red, green and blue sits in an output pixel of `bytes` bytes,
@@ -73,9 +78,11 @@ public:
        of which the scaler presents the line runs `changed` (its alternating
        unchanged/changed counts; nullptr when it wrote nothing). Returns the line
        runs to present: `changed` when the overlay stayed as it was, or the
-       whole frame when it moved. */
+       whole frame when it moved. `shown` is false for a frame that is drawn on
+       but never presented (an aborted one), so what it held is drawn again. */
     const uint16_t *Compose(uint8_t *buf, size_t pitch, const uint16_t *changed,
-                            uint32_t now_ms, bool have_pointer, float fx, float fy);
+                            uint32_t now_ms, bool have_pointer, float fx, float fy,
+                            bool shown = true);
 
     State state() const { return state_; }
     bool drawn() const { return drawn_; }
@@ -104,7 +111,7 @@ private:
     int ArrowScale() const;
     std::vector<Span> Covered(const Key &key) const;
     void Draw(uint8_t *buf, size_t pitch, const Key &key) const;
-    uint32_t Blend(uint32_t under, uint32_t rgb, int alpha256) const;
+    uint32_t Blend(uint32_t under, const uint32_t c8[3], int alpha256) const;
     uint32_t Pixel(uint32_t rgb) const;
 
     Look look_;
@@ -115,6 +122,10 @@ private:
     State faded_from_ = State::Off;  /* the state before it, which a fade starts from */
     unsigned width_ = 0, height_ = 0;
     Format fmt_;
+    /* each channel's value as 8 bits, and 8 bits as the channel's value: the
+       blend's divisions, done once per output format */
+    std::vector<uint8_t> to8_[3];
+    std::vector<uint32_t> from8_[3];
     std::vector<Span> covered_;      /* what the overlay drawn in the buffer covers */
     std::vector<uint8_t> under_;     /* the pixels it covers, in that order */
     bool drawn_ = false;             /* the buffer holds the overlay now */
@@ -135,7 +146,8 @@ void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes);
 /* The scaler is about to write the output buffer `buf`: see Overlay::Undraw. */
 void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch);
 /* The frame about to be presented: see Overlay::Compose. */
-const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *changed);
+const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *changed,
+                                  bool shown = true);
 /* Whether a frame the scaler did not write should still be presented. */
 bool PRESENCE_WantsRepaint();
 /* The debugger holds the machine: repaint if the overlay moved (a fade, a new state). */
