@@ -524,7 +524,7 @@ void RENDER_EndUpdate( bool abort ) {
                before it is presented, so only the window ever shows it. */
             /* drawn back even on an abandoned frame, so the buffer never stays without it */
             const uint16_t *changed = PRESENCE_EndFrame(presence_base, render.scale.outPitch,
-                                                        Scaler_ChangedLines);
+                                                        Scaler_ChangedLines, !abort);
             GFX_EndUpdate( abort? NULL : changed );
             render.frameskip.hadSkip[render.frameskip.index] = 0;
         } else if (!abort && PRESENCE_WantsRepaint()) {
@@ -962,9 +962,15 @@ forcenormal:
 		render.scale.outMode = scalerMode32;
 	else 
 		E_Exit("Failed to create a rendering output");
-	/* text output draws no scaled frame to put the overlay on */
+	/* TrueType text draws no scaled frame to put the overlay on; its graphics
+	   modes draw one like any other output */
+#if defined(USE_TTF)
+	const bool ttf_text = sdl.desktop.want_type == SCREEN_TTF && ttf.inUse;
+#else
+	const bool ttf_text = false;
+#endif
 	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
-	                       sdl.desktop.want_type == SCREEN_TTF ? 0u :
+	                       ttf_text ? 0u :
 	                       render.scale.outMode == scalerMode32 ? 4u :
 	                       render.scale.outMode == scalerMode8 ? 0u : 2u);
 	ScalerLineBlock_t *lineBlock;

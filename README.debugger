@@ -299,8 +299,9 @@ with one line:
   PRESENCE held frames=1234 pointer=1 output=640x400x32
 
 `frames` counts the frames presented with the overlay drawn, and `output` is
-the output it is drawn on, or `none` when there is none it can draw on (no
-window yet, an 8-bit output, or the TrueType text output). An unknown state or
+the output it is drawn on: `none` while there is no output yet, `undrawable`
+for one it cannot draw on (an 8-bit output, or the TrueType output while it
+shows text; its graphics modes are drawn on like any other). An unknown state or
 key, or a value out of its range, answers ERR naming it and changes nothing.
 
 The overlay is drawn into the scaled output just before it is presented, after
@@ -308,8 +309,8 @@ the frame was handed to capture: screenshots, video capture and the VGA memory
 never contain it. The scaler writes that output in place, rewriting only what
 changed, so the overlay never stays in it while the scaler works: the pixels it
 covers are put back before each frame is written and it is drawn anew after,
-which costs a copy of the edge and the arrow per frame and nothing while it is
-off. While the debugger holds the machine, its loop repaints the window when the
+which costs a copy of the edge and the arrow per frame while it is on, and a
+check per frame while it is off. While the debugger holds the machine, its loop repaints the window when the
 overlay changes (a new state, the fade), and only then.
 
 Debugger keyboard shortcuts
