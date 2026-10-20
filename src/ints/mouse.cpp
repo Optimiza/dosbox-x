@@ -23,7 +23,6 @@
 
 #include <string.h>
 #include <math.h>
-#include <algorithm>
 #include <vector>
 
 #include "dosbox.h"
@@ -271,8 +270,11 @@ bool Mouse_PresencePointer(float &fx, float &fy) {
     const float w = (float)mouse.max_x - (float)mouse.min_x + 1.0f;
     const float h = (float)mouse.max_y - (float)mouse.min_y + 1.0f;
     if (w <= 0.0f || h <= 0.0f) return false;
-    fx = std::min(std::max((mouse.x - (float)mouse.min_x) / w, 0.0f), 1.0f);
-    fy = std::min(std::max((mouse.y - (float)mouse.min_y) / h, 0.0f), 1.0f);
+    /* clamped by hand: windows.h's min and max macros break std::min and std::max here */
+    fx = (mouse.x - (float)mouse.min_x) / w;
+    fy = (mouse.y - (float)mouse.min_y) / h;
+    fx = fx < 0.0f ? 0.0f : fx > 1.0f ? 1.0f : fx;
+    fy = fy < 0.0f ? 0.0f : fy > 1.0f ? 1.0f : fy;
     return true;
 }
 
