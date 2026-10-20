@@ -31,12 +31,13 @@ struct Look {
     float held = 0.28f;
     float fade = 2.5f;        /* seconds from acting back to held */
     float size = 0.06f;       /* arrow height, a fraction of the shorter side */
+    float glide = 0.2f;       /* seconds the arrow takes to ease out to a new place */
     /* the arrow, top row first: 'X' outline, 'o' fill, '.' untouched */
     std::vector<std::string> sprite;
     bool operator==(const Look &o) const {
         return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
                acting == o.acting && held == o.held && fade == o.fade && size == o.size &&
-               sprite == o.sprite;
+               glide == o.glide && sprite == o.sprite;
     }
 };
 
@@ -107,6 +108,9 @@ private:
     struct Span { unsigned y, x0, x1; };
 
     Key KeyAt(uint32_t now_ms, bool have_pointer, float fx, float fy) const;
+    /* Where the arrow is drawn at `now_ms`, as a fraction of the output: gliding
+       from where it was drawn to the pointer at (fx, fy), the first time there. */
+    void ArrowAt(uint32_t now_ms, float fx, float fy, float &x, float &y) const;
     int Band() const;
     int ArrowScale() const;
     std::vector<Span> Covered(const Key &key) const;
@@ -132,6 +136,14 @@ private:
     Key presented_;                  /* what the screen was last shown */
     std::vector<uint16_t> full_;     /* the line runs of a whole frame */
     uint64_t frames_ = 0;
+    /* the arrow's glide: from where it was drawn to the pointer, since when.
+       Mutable because asking where the arrow is is what moves it on. */
+    struct Glide {
+        bool shown = false;
+        float from_x = 0, from_y = 0, to_x = 0, to_y = 0;
+        uint32_t since_ms = 0;
+    };
+    mutable Glide glide_;
 };
 
 Overlay &Instance();
