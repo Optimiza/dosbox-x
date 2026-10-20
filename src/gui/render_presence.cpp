@@ -110,7 +110,6 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
 
     Look look = look_;
     bool pointer = pointer_;
-    bool restyled = false;
     while (in >> word) {
         const size_t eq = word.find('=');
         if (eq == std::string::npos) { error = "PRESENCE argument without a value: " + word; return false; }
@@ -145,7 +144,6 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         }
         else { error = "PRESENCE does not know the argument " + key; return false; }
         if (!ok) { error = "PRESENCE " + key + "=" + value + " is not a value it takes"; return false; }
-        restyled = restyled || (key != "pointer");
     }
 
     if (next != state_) {
@@ -153,9 +151,11 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         since_ms_ = now_ms;
     }
     state_ = next;
+    /* a client sends the whole look with every state, so only a look that
+       differs is a new one, repainted whole */
+    if (!(look == look_)) look_generation_++;
     look_ = look;
     pointer_ = pointer;
-    if (restyled) look_generation_++;
     return true;
 }
 
@@ -163,6 +163,13 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     width_ = width;
     height_ = height;
     fmt_ = fmt ? *fmt : Format();
+    for (int i = 0; i < 3; i++) {
+        to8_[i].assign(fmt_.max[i] + 1, 0);
+        for (uint32_t v = 0; v <= fmt_.max[i]; v++) to8_[i][v] = (uint8_t)((v * 255) / fmt_.max[i]);
+        from8_[i].assign(256, 0);
+        for (uint32_t v = 0; v < 256; v++)
+            from8_[i][v] = ((v * fmt_.max[i] + 127) / 255) << fmt_.shift[i];
+    }
     covered_.clear();
     under_.clear();
     drawn_ = false;                  /* a new output buffer holds no overlay */
@@ -232,13 +239,12 @@ uint32_t Overlay::Pixel(uint32_t rgb) const {
     return v;
 }
 
-uint32_t Overlay::Blend(uint32_t under, uint32_t rgb, int alpha256) const {
-    const uint32_t c8[3] = {(rgb >> 16) & 0xff, (rgb >> 8) & 0xff, rgb & 0xff};
+uint32_t Overlay::Blend(uint32_t under, const uint32_t c8[3], int alpha256) const {
     uint32_t v = under & ~(fmt_.mask[0] | fmt_.mask[1] | fmt_.mask[2]);
     for (int i = 0; i < 3; i++) {
-        const uint32_t was8 = (((under & fmt_.mask[i]) >> fmt_.shift[i]) * 255) / fmt_.max[i];
+        const uint32_t was8 = to8_[i][(under & fmt_.mask[i]) >> fmt_.shift[i]];
         const uint32_t now8 = (was8 * (uint32_t)(256 - alpha256) + c8[i] * (uint32_t)alpha256) >> 8;
-        v |= ((now8 * fmt_.max[i] + 127) / 255) << fmt_.shift[i];
+        v |= from8_[i][now8];
     }
     return v;
 }
@@ -247,14 +253,16 @@ void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
     const unsigned bytes = fmt_.bytes;
     const int w = (int)width_, h = (int)height_, band = Band();
     const int a = key.alpha * 256 / ALPHA_LEVELS;
+    const uint32_t c8[3] = {(look_.rgb >> 16) & 0xff, (look_.rgb >> 8) & 0xff, look_.rgb & 0xff};
+    /* the alpha at each distance from the rim, so a pixel costs no division */
+    std::vector<int> alpha_at((size_t)band);
+    for (int d = 0; d < band; d++) alpha_at[(size_t)d] = a * (look_.steps - d * look_.steps / band) / look_.steps;
     for (int y = 0; y < h; y++) {
         uint8_t *out = buf + (size_t)y * pitch;
         auto shade = [&](int x) {
             const int d = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
-            const int ring = d * look_.steps / band;
-            const int alpha = a * (look_.steps - ring) / look_.steps;
             uint8_t *p = out + (size_t)x * bytes;
-            WritePixel(p, bytes, Blend(ReadPixel(p, bytes), look_.rgb, alpha));
+            WritePixel(p, bytes, Blend(ReadPixel(p, bytes), c8, alpha_at[(size_t)d]));
         };
         if (y < band || y >= h - band) {
             for (int x = 0; x < w; x++) shade(x);
@@ -292,13 +300,14 @@ void Overlay::Undraw(uint8_t *buf, size_t pitch) {
 }
 
 const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *changed,
-                                 uint32_t now_ms, bool have_pointer, float fx, float fy) {
+                                 uint32_t now_ms, bool have_pointer, float fx, float fy,
+                                 bool shown) {
     if (!drawable() || buf == nullptr) return changed;
     const Key key = KeyAt(now_ms, have_pointer, fx, fy);
     Undraw(buf, pitch);                 /* if the scaler did not write, the old overlay is here */
     const bool moved = !(key == presented_);
     if (key.state != State::Off) {
-        covered_ = Covered(key);
+        if (moved || covered_.empty()) covered_ = Covered(key);
         const unsigned bytes = fmt_.bytes;
         under_.clear();
         for (const auto &s : covered_) {
@@ -309,19 +318,22 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
         drawn_ = true;
         frames_++;
     }
-    presented_ = key;
+    if (shown) presented_ = key;
     return moved ? full_.data() : changed;
 }
 
 std::string Overlay::Describe() const {
     char line[160];
+    /* `none` while there is no output yet, `undrawable` for one it cannot draw
+       on (8-bit, TrueType text): a client tells "not yet" from "never here" */
     if (drawable())
         std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%ux%ux%u",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0, width_,
                       height_, fmt_.bytes * 8u);
     else
-        std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=none",
-                      StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0);
+        std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%s",
+                      StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0,
+                      width_ != 0 && height_ != 0 ? "undrawable" : "none");
     return line;
 }
 
@@ -364,11 +376,13 @@ void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch) {
     presence::Instance().Undraw(buf, pitch);
 }
 
-const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *changed) {
+const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *changed,
+                                  bool shown) {
     if (Idle()) return changed;
     float fx = 0, fy = 0;
     const bool pointer = Mouse_PresencePointer(fx, fy);
-    return presence::Instance().Compose(buf, pitch, changed, (uint32_t)GetTicks(), pointer, fx, fy);
+    return presence::Instance().Compose(buf, pitch, changed, (uint32_t)GetTicks(), pointer, fx, fy,
+                                        shown);
 }
 
 bool PRESENCE_WantsRepaint() {
