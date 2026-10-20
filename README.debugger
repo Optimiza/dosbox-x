@@ -288,10 +288,13 @@ The `key=value` words set how it is drawn, and a key left out keeps its value:
             and separated by `/`: `X` the outline, `o` the fill, `.` untouched
   outline   the arrow's outline colour, six hex digits (the fill is `rgb`)
   size      the arrow's height, a fraction of the picture's shorter side
+  glide     the seconds the arrow takes to ease out to a new place, 0 to jump
   pointer   1 to draw the arrow (with a sprite given), 0 not to
 
 The arrow follows the built-in INT 33h driver's position, within the range the
-driver keeps it in; with no driver installed there is no arrow.
+driver keeps it in, gliding to each new place from where it was drawn rather
+than jumping; with no driver installed there is no arrow. The glide is drawing
+only: the guest's pointer is where the driver says at once.
 
 PRESENCE is answered at once, whether the guest runs or the debugger holds it,
 with one line:
