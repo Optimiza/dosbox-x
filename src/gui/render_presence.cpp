@@ -164,6 +164,9 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     height_ = height;
     fmt_ = fmt ? *fmt : Format();
     for (int i = 0; i < 3; i++) {
+        to8_[i].clear();
+        from8_[i].clear();
+        if (fmt_.max[i] == 0) continue;         /* no format: nothing to draw, nothing to convert */
         to8_[i].assign(fmt_.max[i] + 1, 0);
         for (uint32_t v = 0; v <= fmt_.max[i]; v++) to8_[i][v] = (uint8_t)((v * 255) / fmt_.max[i]);
         from8_[i].assign(256, 0);
