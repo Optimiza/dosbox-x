@@ -232,7 +232,38 @@ TEST(Presence, AnOutputItCannotDrawOnIsLeftAlone) {
     const uint16_t changed[] = {0, 20};
     EXPECT_EQ(o.Compose(frame.buf(), frame.pitch(), changed, 0, false, 0, 0), changed);
     EXPECT_EQ(frame.at(0, 0), 0x00000000u);
-    EXPECT_NE(o.Describe().find("output=none"), std::string::npos);
+    EXPECT_NE(o.Describe().find("output=undrawable"), std::string::npos)
+        << "an output that is there but cannot be drawn on is not one still to come";
+    Overlay fresh;
+    EXPECT_NE(fresh.Describe().find("output=none"), std::string::npos);
+}
+
+TEST(Presence, AFrameDrawnButNeverShownIsDrawnAgain) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
+    const Format f = Rgb32();
+    o.Resize(20, 20, &f);
+    Frame frame(20, 20, 0x00000000u);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0, false);
+    EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0)) << "an aborted frame showed nothing";
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
+    EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0));
+}
+
+TEST(Presence, TheSameLookSentAgainIsNotANewOne) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
+    const Format f = Rgb32();
+    o.Resize(20, 20, &f);
+    Frame frame(20, 20, 0x00000000u);
+    const uint16_t changed[] = {0, 20};
+    o.Compose(frame.buf(), frame.pitch(), changed, 0, false, 0, 0);
+    ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
+    EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0)) << "an unchanged look repaints the whole frame";
+    ASSERT_TRUE(o.Configure(std::string("acting") + kLook + " rgb=00FF00", error, 0));
+    EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0));
 }
 
 } /* namespace */
