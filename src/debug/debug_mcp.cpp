@@ -7,6 +7,7 @@
          (defined(C_SDL2_NET) && C_SDL2_NET))
 
 #include "debug.h"
+#include "render_presence.h"
 
 #if defined(C_SDL2_NET) && C_SDL2_NET
 #include <SDL2/SDL_net.h>
@@ -449,7 +450,7 @@ bool ParseControlRequest(const std::string& line,
                          std::string& error)
 {
     if (line.compare(0, 4, "REQ ") != 0) {
-        error = "expected REQ <id> <PING|BREAK|EXEC>";
+        error = "expected REQ <id> <PING|BREAK|EXEC|PRESENCE>";
         return false;
     }
 
@@ -485,13 +486,19 @@ bool ParseControlRequest(const std::string& line,
 
     if (request.command != "PING" &&
             request.command != "BREAK" &&
-            request.command != "EXEC") {
+            request.command != "EXEC" &&
+            request.command != "PRESENCE") {
         error = "unknown request command";
         return false;
     }
 
     if (request.command == "EXEC" && request.payload.empty()) {
         error = "missing debugger command";
+        return false;
+    }
+
+    if (request.command == "PRESENCE" && request.payload.empty()) {
+        error = "missing presence state";
         return false;
     }
 
@@ -554,6 +561,14 @@ void ProcessControlCommand(const std::string& line)
 
     if (request.command == "PING") {
         SendResponse(request.id, true, {"PONG"});
+        return;
+    }
+
+    if (request.command == "PRESENCE") {
+        // Answered as it is set, running or stopped: it marks the window, never the guest.
+        std::vector<std::string> lines;
+        const bool ok = PRESENCE_Command(request.payload, lines);
+        SendResponse(request.id, ok, lines);
         return;
     }
 
