@@ -152,6 +152,28 @@ Resume commands (`RUN`, `RUNWATCH`, and `VRT`) are acknowledged before
 DOSBox-X leaves the debugger loop. Their response is only a successful
 acceptance of the command, not a post-resume state snapshot.
 
+Run state command
+-----------------
+
+Debugger-enabled builds accept a `RUNSTATE` command wherever debugger text
+commands are accepted, including through the external control channel:
+
+  REQ 7 EXEC RUNSTATE
+
+It prints exactly one line and changes nothing:
+
+  DEBUG: RUNSTATE stopped
+  DEBUG: RUNSTATE running
+
+`stopped` means the debugger's own loop holds the machine (after a breakpoint,
+`BREAK`, `-break-start` or a finished `STEPIN`), where a command such as
+`STEPIN`, `SAVESTATE` or `MEMREAD` is accepted. `running` means the guest runs,
+under `RUN` or `RUNWATCH` alike; the control channel then answers from a timer
+tick. A client with no screen has no other way to tell the two apart: the
+register window shows it, and no other command prints it. After a resume
+command, which is acknowledged before the guest runs, a client asks again
+until the answer is `stopped`.
+
 Single-step command
 -------------------
 
