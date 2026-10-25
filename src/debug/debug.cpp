@@ -383,8 +383,11 @@ bool IsDebuggerRunNormal(void) {
     return runnormal;
 }
 
-const char *DEBUG_RunStateLine(bool in_loop, bool watching) {
-    return in_loop && !watching ? "DEBUG: RUNSTATE stopped" : "DEBUG: RUNSTATE running";
+std::string DEBUG_RunStateLine(bool in_loop, bool watching, unsigned long long cycles, double ms) {
+    char line[128];
+    snprintf(line, sizeof(line), "DEBUG: RUNSTATE %s cycles=%llu ms=%.9f",
+             in_loop && !watching ? "stopped" : "running", cycles, ms);
+    return line;
 }
 
 static void SetColor(Bitu test) {
@@ -3054,9 +3057,10 @@ bool ParseCommand(char* str) {
 	}
 
 	if (command == "RUNSTATE") {
-		/* For a client with no screen: whether the machine is stopped is otherwise only
-		 * drawn, never printed. Changes nothing. */
-		DEBUG_ShowMsg("%s\n", DEBUG_RunStateLine(debugging, debug_running));
+		/* For a client with no screen: whether the machine is stopped, and the register
+		 * window's cc= and pfi=, are otherwise only drawn, never printed. Changes nothing. */
+		DEBUG_ShowMsg("%s\n", DEBUG_RunStateLine(debugging, debug_running,
+			(unsigned long long)cycle_count, (double)PIC_FullIndex()).c_str());
 		return true;
 	}
 
@@ -4563,7 +4567,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
 		DEBUG_ShowMsg("MEMREAD <seg>:<off> <len> - Read 1-256 conventional RAM bytes (external).\n");
 		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
-		DEBUG_ShowMsg("RUNSTATE                  - Say whether the machine is stopped or running.\n");
+		DEBUG_ShowMsg("RUNSTATE                  - Say whether the machine is stopped, its cycles and time.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
 		DEBUG_ShowMsg("LOADSTATE [slot|file]     - Load a state from a slot (1-100) or a .sav file.\n");
 #if C_HEAVY_DEBUG

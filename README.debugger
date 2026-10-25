@@ -162,8 +162,8 @@ commands are accepted, including through the external control channel:
 
 It prints exactly one line and changes nothing:
 
-  DEBUG: RUNSTATE stopped
-  DEBUG: RUNSTATE running
+  DEBUG: RUNSTATE stopped cycles=1234567 ms=2871.000025000
+  DEBUG: RUNSTATE running cycles=1240001 ms=2873.512000000
 
 `stopped` means the debugger's own loop holds the machine (after a breakpoint,
 `BREAK`, `-break-start` or a finished `STEPIN`), where a command such as
@@ -173,6 +173,11 @@ tick. A client with no screen has no other way to tell the two apart: the
 register window shows it, and no other command prints it. After a resume
 command, which is acknowledged before the guest runs, a client asks again
 until the answer is `stopped`.
+
+`cycles` and `ms` are what the register window shows as `cc=` and `pfi=`: the
+cycles the CPU core has counted, and the emulated time in milliseconds, to the
+same nine decimals. No other command prints them either. Read while the guest
+runs, they are where it was when the control channel was served.
 
 Single-step command
 -------------------
