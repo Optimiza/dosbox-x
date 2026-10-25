@@ -262,6 +262,22 @@ static struct {
     uint8_t ps2_unlock_idx;
 } mouse;
 
+/* Where the guest's pointer is, as a fraction of the range the driver keeps it in (0 to 1
+   across, 0 to 1 down), for the presence overlay to draw its arrow at; false when the
+   driver is not installed or has no range. */
+bool Mouse_PresencePointer(float &fx, float &fy) {
+    if (!mouse.enabled) return false;
+    const float w = (float)mouse.max_x - (float)mouse.min_x + 1.0f;
+    const float h = (float)mouse.max_y - (float)mouse.min_y + 1.0f;
+    if (w <= 0.0f || h <= 0.0f) return false;
+    /* clamped by hand: windows.h's min and max macros break std::min and std::max here */
+    fx = (mouse.x - (float)mouse.min_x) / w;
+    fy = (mouse.y - (float)mouse.min_y) / h;
+    fx = fx < 0.0f ? 0.0f : fx > 1.0f ? 1.0f : fx;
+    fy = fy < 0.0f ? 0.0f : fy > 1.0f ? 1.0f : fy;
+    return true;
+}
+
 double clamp(double d, double min, double max) {
   const double t = d < min ? min : d;
   return t > max ? max : t;

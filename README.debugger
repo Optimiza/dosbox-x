@@ -290,6 +290,66 @@ tick handler, and loading a state there would replace the tick handler list
 the timer is walking. A command refused for that can be sent again once the
 stop is reached.
 
+Presence
+--------
+
+Debugger-enabled builds accept a `PRESENCE` command wherever debugger text
+commands are accepted. A client driving the emulator over the control channel
+marks with it the window it drives, so whoever sits at the host can tell that
+somebody is driving it and keep their hands off:
+
+  REQ 12 EXEC PRESENCE held rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283
+         fade=2.5 outline=2A1400 size=0.06 sprite=X.../XX../XoX./XXXX pointer=1
+
+(one line). The first word is the state:
+
+  off      nothing is drawn
+  held     a dim edge on the inner sides of the picture
+  acting   the same edge, brighter; going back to held, it fades over `fade`
+           seconds
+
+The `key=value` words set how it is drawn, and a key left out keeps its value:
+
+  rgb       the colour, six hex digits
+  edge      the edge's width, a fraction of the picture's shorter side
+  steps     the bands its gradient is drawn in, strongest at the rim
+  acting    the alpha while acting, 0 to 1
+  held      the alpha while held, 0 to 1
+  fade      the seconds from acting back to held
+  sprite    an arrow drawn at the guest's mouse position, its rows top first
+            and separated by `/`: `X` the outline, `o` the fill, `.` untouched
+  outline   the arrow's outline colour, six hex digits (the fill is `rgb`)
+  size      the arrow's height, a fraction of the picture's shorter side
+  glide     the seconds the arrow takes to ease out to a new place, 0 to jump
+  pointer   1 to draw the arrow (with a sprite given), 0 not to
+
+The arrow follows the built-in INT 33h driver's position, within the range the
+driver keeps it in, gliding to each new place from where it was drawn rather
+than jumping; with no driver installed there is no arrow. The glide is drawing
+only: the guest's pointer is where the driver says at once.
+
+PRESENCE is answered at once, whether the guest runs or the debugger holds it
+(it marks the window, never the guest), with one line:
+
+  PRESENCE held frames=1234 pointer=1 output=640x400x32
+
+`frames` counts the frames presented with the overlay drawn, and `output` is
+the output it is drawn on: `none` while there is no output yet, `undrawable`
+for one it cannot draw on (an 8-bit output, or the TrueType output while it
+shows text; its graphics modes are drawn on like any other). An unknown state or
+key, or a value out of its range, answers ERR naming it and changes nothing;
+as for any command that returns an error, the response then ends with the
+`*** Debugger command not recognized` line. The arguments keep their case.
+
+The overlay is drawn into the scaled output just before it is presented, after
+the frame was handed to capture: screenshots, video capture and the VGA memory
+never contain it. The scaler writes that output in place, rewriting only what
+changed, so the overlay never stays in it while the scaler works: the pixels it
+covers are put back before each frame is written and it is drawn anew after,
+which costs a copy of the edge and the arrow per frame while it is on, and a
+check per frame while it is off. While the debugger holds the machine, its loop repaints the window when the
+overlay changes (a new state, the fade), and only then.
+
 Debugger keyboard shortcuts
 ---------------------------
 

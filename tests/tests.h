@@ -31,6 +31,7 @@
 #include "agent/agent_parser_tests.cpp"
 #include "agent/agent_transport_tests.cpp"
 #include "debugger_runstate_tests.cpp"
+#include "presence_tests.cpp"
 
 #else
 //google test code causes problem on win9x, remove them and add empty implementations for linkage.

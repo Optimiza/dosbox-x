@@ -44,6 +44,7 @@ using namespace std;
 #endif
 
 #include "debug.h"
+#include "render_presence.h"
 #if defined(C_DOSBOX_AGENT)
 #include "agent/agent_bridge.h"
 #endif
@@ -3156,6 +3157,17 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "PRESENCE") {
+		/* Answered at once, running or stopped: it marks the window, never the guest (see
+		 * README.debugger, "Presence"). The argument keeps its case, which tells an arrow's
+		 * outline from its fill. */
+		std::vector<std::string> lines;
+		const bool ok = PRESENCE_Command(RawCommandArgument(str), lines);
+		for (const auto &line : lines)
+			DEBUG_ShowMsg("%s\n", line.c_str());
+		return ok;
+	}
+
 	if (command == "MEMREAD") {
 		/* External bounded memory observation: returns the actual conventional
 		 * RAM bytes through the debugger response. Read-only - it never executes
@@ -4570,6 +4582,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("RUNSTATE                  - Say whether the machine is stopped, its cycles and time.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
 		DEBUG_ShowMsg("LOADSTATE [slot|file]     - Load a state from a slot (1-100) or a .sav file.\n");
+		DEBUG_ShowMsg("PRESENCE state [key=val]  - Mark the window a client drives (off, held, acting).\n");
 #if C_HEAVY_DEBUG
 		DEBUG_ShowMsg("LOG [num]                 - Write CPU log file.\n");
 		DEBUG_ShowMsg("LOGS/LOGL/LOGC [num]      - Write short/long/cs:ip-only CPU log file.\n");
@@ -5560,6 +5573,7 @@ Bitu DEBUG_Loop(void) {
     else {
         //TODO Disable sound
         GFX_Events();
+        PRESENCE_ParkedTick();
         // Interrupt started ? - then skip it
         uint16_t oldCS	= SegValue(cs);
         uint32_t oldEIP	= reg_eip;

@@ -49,6 +49,9 @@ bool Mouse_IsLocked();
 void Mouse_BeforeNewVideoMode(bool setmode);
 void Mouse_AfterNewVideoMode(bool setmode);
 
+/* the guest pointer as a fraction of the driver's range, for the presence overlay */
+bool Mouse_PresencePointer(float &fx, float &fy);
+
 void UpdateMouseReportRate(void);
 void ChangeMouseReportRate(unsigned int new_rate);
 

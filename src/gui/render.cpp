@@ -27,6 +27,7 @@
 #include "logging.h"
 #include "video.h"
 #include "render.h"
+#include "render_presence.h"
 #include "setup.h"
 #include "control.h"
 #include "mapper.h"
@@ -328,6 +329,12 @@ static void RENDER_ScalerLineHandler(const void * s) {
 
 void D3D11_DrawLine_8bpp(const void* src);
 
+/* Where the output buffer the scaler writes this frame begins: the scaler moves
+   `render.scale.outWrite` down it line by line, so it is kept here for the presence
+   overlay, taken off it before the scaler writes and drawn over it once the frame is
+   complete. */
+static uint8_t *presence_base = nullptr;
+
 static void RENDER_StartLineHandler(const void * s) {
     if (render.disablerender)
         return;
@@ -343,6 +350,8 @@ static void RENDER_StartLineHandler(const void * s) {
             RENDER_DrawLine = RENDER_EmptyLineHandler;
             return;
         }
+        presence_base = render.scale.outWrite;
+        PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
         render.scale.outWrite += render.scale.outPitch * Scaler_ChangedLines[0];
 #if defined(C_SCALER_FULL_LINE)
         RENDER_scaler_countdown = RENDER_scaler_countdown_init;
@@ -426,6 +435,8 @@ bool RENDER_StartUpdate(void) {
         //Will always have to update the screen with this one anyway, so let's update already
         if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
             return false;
+        presence_base = render.scale.outWrite;
+        PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
         render.fullFrame = true;
         vga.draw.must_complete_frame = true;
         RENDER_DrawLine = RENDER_ClearCacheHandler;
@@ -434,6 +445,8 @@ bool RENDER_StartUpdate(void) {
             /* Assume pal changes always do a full screen update anyway */
             if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
                 return false;
+            presence_base = render.scale.outWrite;
+            PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
             RENDER_DrawLine = render.scale.linePalHandler;
             vga.draw.must_complete_frame = true;
             render.fullFrame = true;
@@ -504,8 +517,19 @@ void RENDER_EndUpdate( bool abort ) {
                 flags, fps, (uint8_t*)scalerSourceCacheBuffer, (uint8_t*)&render.pal.rgb );
         }
         if ( render.scale.outWrite) {
-            GFX_EndUpdate( abort? NULL : Scaler_ChangedLines );
+            /* THE PRESENCE OVERLAY GOES ON HERE, after the capture above took the frame and
+               before it is presented, so only the window ever shows it. */
+            /* drawn back even on an abandoned frame, so the buffer never stays without it */
+            const uint16_t *changed = PRESENCE_EndFrame(presence_base, render.scale.outPitch,
+                                                        Scaler_ChangedLines, !abort);
+            GFX_EndUpdate( abort? NULL : changed );
             render.frameskip.hadSkip[render.frameskip.index] = 0;
+        } else if (!abort && PRESENCE_WantsRepaint()) {
+            /* Nothing changed on screen, but the overlay did (a fade, the pointer). */
+            uint8_t *pixels = nullptr;
+            Bitu pitch = 0;
+            if (GFX_StartUpdate(pixels, pitch))
+                GFX_EndUpdate(PRESENCE_EndFrame(pixels, pitch, nullptr));
         } else {
 #if 0
             Bitu total = 0, i;
@@ -588,6 +612,7 @@ void RENDER_Reset( void ) {
 
 	if (width == 0 || height == 0) {
 		render.disablerender = true;
+		PRESENCE_OutputChanged(0, 0, 0);
 		return;
 	}
 
@@ -934,6 +959,17 @@ forcenormal:
 		render.scale.outMode = scalerMode32;
 	else 
 		E_Exit("Failed to create a rendering output");
+	/* TrueType text draws no scaled frame to put the overlay on; its graphics
+	   modes draw one like any other output */
+#if defined(USE_TTF)
+	const bool ttf_text = sdl.desktop.want_type == SCREEN_TTF && ttf.inUse;
+#else
+	const bool ttf_text = false;
+#endif
+	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
+	                       ttf_text ? 0u :
+	                       render.scale.outMode == scalerMode32 ? 4u :
+	                       render.scale.outMode == scalerMode8 ? 0u : 2u);
 	ScalerLineBlock_t *lineBlock;
 
 	/* how many bytes will be needed in the write cache?
