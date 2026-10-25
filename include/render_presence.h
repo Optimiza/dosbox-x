@@ -150,7 +150,7 @@ Overlay &Instance();
 
 } /* namespace presence */
 
-/* The channel's PRESENCE command: the reply lines, or false and the error. */
+/* The debugger's PRESENCE command: the reply lines, or false and the error. */
 bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines);
 /* The render's output changed size or format: `bytes` per pixel, 0 for one it
    cannot be drawn on. */
