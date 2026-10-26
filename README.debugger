@@ -335,6 +335,7 @@ C <seg> <off>                               Set code view to address
 D <seg> <off>                               Set data view to address (segment:offset)
 DV <offset>                                 Set data view to address (linear/virtual address)
 DP <offset>                                 Set data view to address (physical)
+VGAMEMDUMP <offset> <length> <filename>   Dump video memory, planes interleaved, to a binary file
 LOG <hexadecimal count>                     Log CPU state, for the specified number of instructions, to LOGCPU.TXT
 LOGS <hexadecimal count>                    Log CPU state, short log, to LOGCPU.TXT
 LOGL <hexadecimal count>                    Log CPU state, long log, to LOGCPU.TXT
