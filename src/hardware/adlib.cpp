@@ -1560,6 +1560,10 @@ void SaveRad() {
 }
 #endif
 
+bool OPL_RawCapturing(void) {
+	return module != NULL && module->capture != NULL;
+}
+
 void OPL_SaveRawEvent(bool pressed) {
 	if (!pressed)
 		return;
