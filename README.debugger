@@ -309,7 +309,7 @@ SMV <off> [bytes in hex]                    Set memory at linear/virtual <off> t
 FM <seg> <off>                              Freeze (lock) memory value at <seg>:<off>
 TAP W|R|C <seg>:<off> ... <file>              Record memory writes or reads without stopping
 TAPLIST                                     List the taps, flushing their files
-TAPDEL <id>|*                              Remove one tap or all of them
+TAPDEL <id>|*                              Remove one tap or all of them (a state load or the dynamic core ends taps on RAM)
 EV <value> [value] ...                      Show register/expression value(s)
 BP <seg> <off>                              Add breakpoint (real mode)
 BPM <seg> <off>                             Add breakpoint (protected mode)

@@ -2409,7 +2409,12 @@ static long TapBeamLine(void) {
 	return in_frame < 0 ? -1 : (long)(in_frame / vga.draw.delay.htotal);
 }
 
+/* A row's block is read through the guest's own accessors, which can reach a tapped page:
+ * that read is the tap's, not the guest's. */
+static bool tap_reading_block = false;
+
 void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t value) {
+	if (tap_reading_block) return;
 	const PhysPt at = (PhysPt)((page << 12u) | (addr & 0xfffu));
 	for (MemTap *t : taps) {
 		const bool writes = t->kind != 'R';
@@ -2443,11 +2448,13 @@ void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t va
 		TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
 		fprintf(t->rows, "r %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, TapBeamLine(),
 			(double)PIC_FullIndex(), cs_now, ip_now, data, mask);
+		tap_reading_block = true;
 		for (uint32_t i = 0; i < t->block_length; i++) {
 			uint8_t b = 0;
 			if (mem_readb_checked(t->block + i, &b)) b = 0;
 			fprintf(t->rows, "%02x", b);
 		}
+		tap_reading_block = false;
 		fputc('\n', t->rows);
 		t->rows_kept++;
 	}
@@ -2477,14 +2484,18 @@ static TapPageHandler *TapHandlerFor(PageNum page) {
 
 static void TapRefit(TapPageHandler *h) {
 	if (h->taps.empty()) {
-		if (MEM_GetPageHandler(h->page) == h) MEM_SetPageHandler(h->page, 1, h->orig);
+		const bool installed = MEM_GetPageHandler(h->page) == h;
+		if (installed) MEM_SetPageHandler(h->page, 1, h->orig);
 		tap_handlers.erase(std::find(tap_handlers.begin(), tap_handlers.end(), h));
 		PAGING_ClearTLB();
-		delete h;
+		/* A handler something else displaced may still be held by it (the dynamic core keeps the
+		 * handler it covers and puts it back); with no taps it only forwards, and is left alone. */
+		if (installed) delete h;
 		return;
 	}
+	/* A handler something else displaced stays out: putting it back would cover the page's new
+	 * handler with the one it replaced. */
 	h->Retap();
-	if (MEM_GetPageHandler(h->page) != h) MEM_SetPageHandler(h->page, 1, h);
 	PAGING_ClearTLB();
 }
 
@@ -2536,18 +2547,21 @@ static std::string OriginalCaseTail(const char *typed, const char *upper_tail) {
 static bool TapCommand(const char *typed, char *found) {
 	char kind = 0;
 	unsigned int seg = 0;
-	unsigned long off = 0, length = 1, bseg = 0, boff = 0, blen = 0;
+	/* Offsets are read wide: where unsigned long is 32 bits one past 32 bits would wrap unseen. */
+	unsigned long long off = 0, boff = 0;
+	unsigned long length = 1, bseg = 0, blen = 0;
 	int consumed = 0;
 	char k[2] = {0};
-	if (sscanf(found, "%1s %x:%lx %n", k, &seg, &off, &consumed) != 3) consumed = 0;
+	if (sscanf(found, "%1s %x:%llx %n", k, &seg, &off, &consumed) != 3) consumed = 0;
 	kind = k[0];
 	char *rest = found + consumed;
 	int more = 0;
 	if (consumed && kind == 'C' && sscanf(rest, "%lx %n", &length, &more) == 1) rest += more;
 	else if (kind == 'C') consumed = 0;
-	if (consumed && kind == 'W' && sscanf(rest, "%lx:%lx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
+	if (consumed && kind == 'W' && sscanf(rest, "%lx:%llx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
 	const bool shape = consumed && (kind == 'W' || kind == 'R' || kind == 'C') && *rest != 0
-		&& seg <= 0xffffu && length >= 1 && length <= 1024 && blen <= 128 && bseg <= 0xffffu;
+		&& seg <= 0xffffu && off <= 0xffffffffull && length >= 1 && length <= 1024 && blen <= 128
+		&& bseg <= 0xffffu && boff <= 0xffffffffull;
 	if (!shape) {
 		DEBUG_ShowMsg("DEBUG: TAP usage: TAP W seg:off [bseg:boff blen] file | TAP R seg:off file | TAP C seg:off len file (hex; len at most 400, blen at most 80)\n");
 		return false;
@@ -2598,10 +2612,12 @@ static bool TapCommand(const char *typed, char *found) {
 	for (PageNum page = phys >> 12u; page <= (phys + t->length - 1u) >> 12u; page++) {
 		TapPageHandler *h = TapHandlerFor(page);
 		h->taps.push_back(t);
-		TapRefit(h);
+		h->Retap();
+		if (MEM_GetPageHandler(page) != h) MEM_SetPageHandler(page, 1, h);
+		PAGING_ClearTLB();
 	}
 	TapFlush(t);
-	DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X FILE=%s success\n", t->id, kind, (unsigned int)phys,
+	DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X success FILE=%s\n", t->id, kind, (unsigned int)phys,
 		(unsigned int)t->length, t->path.c_str());
 	return true;
 }
