@@ -3316,6 +3316,8 @@ static void DosTraceRow(const char *fmt, ...) {
     va_start(ap, fmt);
     vfprintf(dostrace_file, fmt, ap);
     va_end(ap);
+    /* Flushed per row, so the file can be read while the guest runs. */
+    fflush(dostrace_file);
     dostrace_rows++;
 }
 
