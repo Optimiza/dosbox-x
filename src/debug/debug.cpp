@@ -23,7 +23,9 @@
 #include <cstdint>
 #include <cstring>
 #include <ios>
+#include <algorithm>
 #include <list>
+#include <map>
 #include <vector>
 #include <fstream>
 #include <iomanip>
@@ -2194,6 +2196,329 @@ static bool ParseMemoryDumpArguments(char *&found, uint16_t &seg, uint32_t &ofs,
 	return true;
 }
 
+/* TAP: guest memory accesses recorded without stopping the machine.
+ *
+ * A memory breakpoint stops at the first write, and the heavy debugger sees a write only when
+ * it changes a byte, never a read. A tap wraps the page handler of the physical page it sits
+ * on and withholds that page's host pointer from the TLB for the side it taps, so every guest
+ * access of that side reaches the wrapper, which records it and forwards it to the handler it
+ * displaced. The debugger's own reads and writes (the checked accessors) are forwarded
+ * unrecorded.
+ *
+ * A capture (W or R) keeps one row per access covering its trigger byte; a write row carries
+ * the block as it stood before the write landed. A count (C) tallies every write into its range
+ * by access and by writer. An access is told in the lanes of the dword holding the byte it
+ * covers, as a 386 drives its byte enables. The rows file is flushed and a count's table file
+ * rewritten by TAPLIST, the one command a client sends at each stop. */
+static const unsigned long long TAP_ROWS_MAX = 100000ull;
+static const size_t TAP_BUCKETS_MAX = 256u;
+
+struct MemTap {
+	unsigned int id;
+	char kind;
+	PhysPt start;
+	uint32_t length;
+	LinearPt block = 0;
+	uint32_t block_length = 0;
+	std::string path;
+	FILE *rows = NULL;
+	unsigned long long total = 0, rows_kept = 0, overflow_rows = 0;
+	unsigned long long overflow_values = 0, overflow_pcs = 0;
+	std::map<std::pair<uint32_t, std::pair<uint32_t, uint32_t> >, unsigned long long> values;
+	std::map<std::pair<uint16_t, uint32_t>, unsigned long long> pcs;
+};
+
+class TapPageHandler : public PageHandler {
+public:
+	TapPageHandler(PageNum page, PageHandler *displaced) : page(page), orig(displaced) {}
+	PageNum page;
+	PageHandler *orig;
+	std::vector<MemTap*> taps;
+
+	void Retap(void) {
+		Bitu withheld = 0;
+		for (const MemTap *t : taps) withheld |= (t->kind == 'R') ? PFLAG_READABLE : PFLAG_WRITEABLE;
+		flags = orig->getFlags() & ~withheld;
+	}
+	HostPt GetHostReadPt(PageNum phys_page) override { return orig->GetHostReadPt(phys_page); }
+	HostPt GetHostWritePt(PageNum phys_page) override { return orig->GetHostWritePt(phys_page); }
+
+	uint8_t readb(PhysPt addr) override { const uint8_t v = ReadB(addr); Hit('R', addr, 1, v); return v; }
+	uint16_t readw(PhysPt addr) override { const uint16_t v = ReadW(addr); Hit('R', addr, 2, v); return v; }
+	uint32_t readd(PhysPt addr) override { const uint32_t v = ReadD(addr); Hit('R', addr, 4, v); return v; }
+	void writeb(PhysPt addr, uint8_t v) override { Hit('W', addr, 1, v); WriteB(addr, v); }
+	void writew(PhysPt addr, uint16_t v) override { Hit('W', addr, 2, v); WriteW(addr, v); }
+	void writed(PhysPt addr, uint32_t v) override { Hit('W', addr, 4, v); WriteD(addr, v); }
+	bool readb_checked(PhysPt addr, uint8_t *v) override {
+		if (Readable()) { *v = ReadB(addr); return false; }
+		return orig->readb_checked(addr, v);
+	}
+	bool readw_checked(PhysPt addr, uint16_t *v) override {
+		if (Readable()) { *v = ReadW(addr); return false; }
+		return orig->readw_checked(addr, v);
+	}
+	bool readd_checked(PhysPt addr, uint32_t *v) override {
+		if (Readable()) { *v = ReadD(addr); return false; }
+		return orig->readd_checked(addr, v);
+	}
+	bool writeb_checked(PhysPt addr, uint8_t v) override {
+		if (Writeable()) { WriteB(addr, v); return false; }
+		return orig->writeb_checked(addr, v);
+	}
+	bool writew_checked(PhysPt addr, uint16_t v) override {
+		if (Writeable()) { WriteW(addr, v); return false; }
+		return orig->writew_checked(addr, v);
+	}
+	bool writed_checked(PhysPt addr, uint32_t v) override {
+		if (Writeable()) { WriteD(addr, v); return false; }
+		return orig->writed_checked(addr, v);
+	}
+
+private:
+	bool Readable(void) const { return (orig->getFlags() & PFLAG_READABLE) != 0; }
+	bool Writeable(void) const { return (orig->getFlags() & PFLAG_WRITEABLE) != 0; }
+	HostPt RHost(PhysPt addr) { return orig->GetHostReadPt(page) + (addr & 0xfffu); }
+	HostPt WHost(PhysPt addr) { return orig->GetHostWritePt(page) + (addr & 0xfffu); }
+	uint8_t ReadB(PhysPt a) { return Readable() ? host_readb(RHost(a)) : orig->readb(a); }
+	uint16_t ReadW(PhysPt a) { return Readable() ? host_readw(RHost(a)) : orig->readw(a); }
+	uint32_t ReadD(PhysPt a) { return Readable() ? host_readd(RHost(a)) : orig->readd(a); }
+	void WriteB(PhysPt a, uint8_t v) { if (Writeable()) host_writeb(WHost(a), v); else orig->writeb(a, v); }
+	void WriteW(PhysPt a, uint16_t v) { if (Writeable()) host_writew(WHost(a), v); else orig->writew(a, v); }
+	void WriteD(PhysPt a, uint32_t v) { if (Writeable()) host_writed(WHost(a), v); else orig->writed(a, v); }
+	void Hit(char side, PhysPt addr, unsigned int width, uint32_t value);
+};
+
+static std::vector<MemTap*> mem_taps;
+static std::vector<TapPageHandler*> tap_handlers;
+static unsigned int tap_next_id = 1;
+
+/* The value and byte enables of the part of an access at `at` that lands in the dword `dword`. */
+static void TapLanes(PhysPt at, unsigned int width, uint32_t value, PhysPt dword, uint32_t &data, uint32_t &mask) {
+	data = mask = 0;
+	for (unsigned int i = 0; i < width; i++) {
+		const PhysPt byte = at + i;
+		if (byte < dword || byte >= dword + 4u) continue;
+		const unsigned int lane = (unsigned int)(byte - dword);
+		data |= ((value >> (8u * i)) & 0xffu) << (8u * lane);
+		mask |= 0xffu << (8u * lane);
+	}
+}
+
+/* The beam's line now, as the light pen latches it; -1 before the first frame is timed. */
+static long TapBeamLine(void) {
+	if (vga.draw.delay.htotal <= 0) return -1;
+	const double in_frame = PIC_FullIndex() - vga.draw.delay.framestart;
+	return in_frame < 0 ? -1 : (long)(in_frame / vga.draw.delay.htotal);
+}
+
+void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t value) {
+	const PhysPt at = (PhysPt)((page << 12u) | (addr & 0xfffu));
+	for (MemTap *t : taps) {
+		const bool writes = t->kind != 'R';
+		if (writes != (side == 'W')) continue;
+		const PhysPt last = at + width - 1u;
+		if (last < t->start || at >= t->start + t->length) continue;
+		const uint16_t cs_now = SegValue(cs);
+		const uint32_t ip_now = reg_eip;
+		if (t->kind == 'C') {
+			const PhysPt from = std::max(at, t->start) & ~(PhysPt)3u;
+			for (PhysPt dword = from; dword <= std::min(last, t->start + t->length - 1u); dword += 4u) {
+				uint32_t data, mask;
+				TapLanes(at, width, value, dword, data, mask);
+				t->total++;
+				const auto key = std::make_pair((uint32_t)dword, std::make_pair(data, mask));
+				auto v = t->values.find(key);
+				if (v != t->values.end()) v->second++;
+				else if (t->values.size() < TAP_BUCKETS_MAX) t->values[key] = 1;
+				else t->overflow_values++;
+				const auto pc = std::make_pair(cs_now, ip_now);
+				auto w = t->pcs.find(pc);
+				if (w != t->pcs.end()) w->second++;
+				else if (t->pcs.size() < TAP_BUCKETS_MAX) t->pcs[pc] = 1;
+				else t->overflow_pcs++;
+			}
+			continue;
+		}
+		t->total++;
+		if (t->rows_kept >= TAP_ROWS_MAX || t->rows == NULL) { t->overflow_rows++; continue; }
+		uint32_t data, mask;
+		TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
+		fprintf(t->rows, "r %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, TapBeamLine(),
+			(double)PIC_FullIndex(), cs_now, ip_now, data, mask);
+		for (uint32_t i = 0; i < t->block_length; i++) {
+			uint8_t b = 0;
+			if (mem_readb_checked(t->block + i, &b)) b = 0;
+			fprintf(t->rows, "%02x", b);
+		}
+		fputc('\n', t->rows);
+		t->rows_kept++;
+	}
+}
+
+static bool TapPhysical(LinearPt lin, PhysPt &phys) {
+	PageNum page = lin >> 12u;
+	if (!PAGING_MakePhysPage(page)) return false;
+	phys = (PhysPt)((page << 12u) | (lin & 0xfffu));
+	return true;
+}
+
+/* Pages whose handler slot a tap may take: the alias of the HMA follows the A20 gate, so a
+ * slot there would tap one of two pages depending on the gate. */
+static bool TapPageAllowed(PageNum page) {
+	return page < 0x100u || (page >= 0x110u && page < MEM_TotalPages());
+}
+
+static TapPageHandler *TapHandlerFor(PageNum page) {
+	PageHandler *now = MEM_GetPageHandler(page);
+	for (TapPageHandler *h : tap_handlers)
+		if (h == now) return h;
+	TapPageHandler *h = new TapPageHandler(page, now);
+	tap_handlers.push_back(h);
+	return h;
+}
+
+static void TapRefit(TapPageHandler *h) {
+	if (h->taps.empty()) {
+		if (MEM_GetPageHandler(h->page) == h) MEM_SetPageHandler(h->page, 1, h->orig);
+		tap_handlers.erase(std::find(tap_handlers.begin(), tap_handlers.end(), h));
+		PAGING_ClearTLB();
+		delete h;
+		return;
+	}
+	h->Retap();
+	if (MEM_GetPageHandler(h->page) != h) MEM_SetPageHandler(h->page, 1, h);
+	PAGING_ClearTLB();
+}
+
+static void TapFlush(MemTap *t) {
+	if (t->rows != NULL) { fflush(t->rows); return; }
+	if (t->kind != 'C') return;
+	const std::string tmp = t->path + ".tmp";
+	FILE *f = fopen(tmp.c_str(), "w");
+	if (f == NULL) return;
+	for (const auto &v : t->values)
+		fprintf(f, "v %08X %08X %08X %llu\n", v.first.first, v.first.second.first, v.first.second.second, v.second);
+	for (const auto &p : t->pcs)
+		fprintf(f, "p %04X %08X %llu\n", p.first.first, p.first.second, p.second);
+	fclose(f);
+	remove(t->path.c_str());
+	rename(tmp.c_str(), t->path.c_str());
+}
+
+static bool TapInstalled(const MemTap *t) {
+	for (const TapPageHandler *h : tap_handlers)
+		if (std::find(h->taps.begin(), h->taps.end(), t) != h->taps.end() && MEM_GetPageHandler(h->page) != h)
+			return false;
+	return true;
+}
+
+static void TapRemove(MemTap *t) {
+	std::vector<TapPageHandler*> holding;
+	for (TapPageHandler *h : tap_handlers)
+		if (std::find(h->taps.begin(), h->taps.end(), t) != h->taps.end()) holding.push_back(h);
+	for (TapPageHandler *h : holding) {
+		h->taps.erase(std::find(h->taps.begin(), h->taps.end(), t));
+		TapRefit(h);
+	}
+	TapFlush(t);
+	if (t->rows != NULL) fclose(t->rows);
+	mem_taps.erase(std::find(mem_taps.begin(), mem_taps.end(), t));
+	delete t;
+}
+
+/* `ParseCommand` upper-cases the whole line, so a filename is taken back from the line as typed:
+ * the same number of characters, counted from its end. */
+static std::string OriginalCaseTail(const char *typed, const char *upper_tail) {
+	std::string line(typed);
+	while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
+	const size_t n = strlen(upper_tail);
+	return n <= line.size() ? line.substr(line.size() - n) : std::string(upper_tail);
+}
+
+static bool TapCommand(const char *typed, char *found) {
+	char kind = 0;
+	unsigned int seg = 0;
+	unsigned long off = 0, length = 1, bseg = 0, boff = 0, blen = 0;
+	int consumed = 0;
+	char k[2] = {0};
+	if (sscanf(found, "%1s %x:%lx %n", k, &seg, &off, &consumed) != 3) consumed = 0;
+	kind = k[0];
+	char *rest = found + consumed;
+	int more = 0;
+	if (consumed && kind == 'C' && sscanf(rest, "%lx %n", &length, &more) == 1) rest += more;
+	else if (kind == 'C') consumed = 0;
+	if (consumed && kind == 'W' && sscanf(rest, "%lx:%lx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
+	const bool shape = consumed && (kind == 'W' || kind == 'R' || kind == 'C') && *rest != 0
+		&& seg <= 0xffffu && length >= 1 && length <= 1024 && blen <= 128 && bseg <= 0xffffu;
+	if (!shape) {
+		DEBUG_ShowMsg("DEBUG: TAP usage: TAP W seg:off [bseg:boff blen] file | TAP R seg:off file | TAP C seg:off len file (hex; len at most 400, blen at most 80)\n");
+		return false;
+	}
+	if (!debugging || debug_running) {
+		DEBUG_ShowMsg("DEBUG: TAP requires the debugger to be stopped\n");
+		return false;
+	}
+	if (CPU_IsDynamicCore()) {
+		DEBUG_ShowMsg("DEBUG: TAP needs a core that reads memory through the page handlers, not the dynamic core\n");
+		return false;
+	}
+	const LinearPt lin = (LinearPt)GetAddress((uint16_t)seg, (uint32_t)off);
+	PhysPt phys = 0;
+	for (uint32_t i = 0; i < length; i++) {
+		PhysPt p = 0;
+		const bool mapped = TapPhysical(lin + i, p);
+		if (i == 0) phys = p;
+		if (!mapped || p != phys + i || !TapPageAllowed(p >> 12u)) {
+			DEBUG_ShowMsg("DEBUG: TAP %04X:%08lX+%lX is not one run of RAM pages a tap can hold (unmapped, split by paging, or in the HMA's A20 alias)\n",
+				seg, off, (unsigned long)i);
+			return false;
+		}
+	}
+	MemTap *t = new MemTap();
+	t->kind = kind;
+	t->start = phys;
+	t->length = (uint32_t)length;
+	if (blen) {
+		t->block = (LinearPt)GetAddress((uint16_t)bseg, (uint32_t)boff);
+		t->block_length = (uint32_t)blen;
+	}
+	t->path = OriginalCaseTail(typed, rest);
+	/* A count's table is rewritten at each TAPLIST, so its file is proved writable now, or the
+	 * tap would count into a table nobody could read. */
+	t->rows = fopen(t->path.c_str(), "w");
+	if (t->rows == NULL) {
+		DEBUG_ShowMsg("DEBUG: TAP cannot write %s\n", t->path.c_str());
+		delete t;
+		return false;
+	}
+	if (kind == 'C') {
+		fclose(t->rows);
+		t->rows = NULL;
+	}
+	t->id = tap_next_id++;
+	mem_taps.push_back(t);
+	for (PageNum page = phys >> 12u; page <= (phys + t->length - 1u) >> 12u; page++) {
+		TapPageHandler *h = TapHandlerFor(page);
+		h->taps.push_back(t);
+		TapRefit(h);
+	}
+	TapFlush(t);
+	DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X FILE=%s success\n", t->id, kind, (unsigned int)phys,
+		(unsigned int)t->length, t->path.c_str());
+	return true;
+}
+
+static void TapList(void) {
+	for (MemTap *t : mem_taps) {
+		TapFlush(t);
+		DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X INSTALLED=%d TOTAL=%llu ROWS=%llu OVERFLOW_ROWS=%llu VALUES=%u OVERFLOW_VALUES=%llu PCS=%u OVERFLOW_PCS=%llu\n",
+			t->id, t->kind, (unsigned int)t->start, (unsigned int)t->length, TapInstalled(t) ? 1 : 0,
+			t->total, t->rows_kept, t->overflow_rows, (unsigned int)t->values.size(), t->overflow_values,
+			(unsigned int)t->pcs.size(), t->overflow_pcs);
+	}
+	DEBUG_ShowMsg("DEBUG: TAPLIST %u\n", (unsigned int)mem_taps.size());
+}
+
 bool ParseCommand(char* str) {
     std::string copy_str = str;
     for (auto &c : copy_str) c = toupper(c);
@@ -2291,6 +2616,35 @@ bool ParseCommand(char* str) {
 			return true;
 		}
 		SaveMemoryBin(*found ? found : "MEMDUMP.BIN",seg,ofs,num);
+		return true;
+	}
+
+	if (command == "TAP") return TapCommand(str, found);
+
+	if (command == "TAPLIST") {
+		TapList();
+		return true;
+	}
+
+	if (command == "TAPDEL") { // Remove one tap, or every tap with *
+		if (!debugging || debug_running) {
+			DEBUG_ShowMsg("DEBUG: TAPDEL requires the debugger to be stopped\n");
+			return false;
+		}
+		unsigned int id = 0;
+		const bool every = found[0] == '*';
+		if (!every && sscanf(found, "%u", &id) != 1) {
+			DEBUG_ShowMsg("DEBUG: TAPDEL usage: TAPDEL id | TAPDEL *\n");
+			return false;
+		}
+		unsigned int removed = 0;
+		for (size_t i = mem_taps.size(); i-- > 0;)
+			if (every || mem_taps[i]->id == id) { TapRemove(mem_taps[i]); removed++; }
+		if (!every && !removed) {
+			DEBUG_ShowMsg("DEBUG: TAPDEL no tap %u\n", id);
+			return false;
+		}
+		DEBUG_ShowMsg("DEBUG: TAPDEL %u removed\n", removed);
 		return true;
 	}
 
@@ -4342,6 +4696,8 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
 		DEBUG_ShowMsg("MEMDUMP seg:off len [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
 		DEBUG_ShowMsg("MEMDUMPBIN seg:off len [filename] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+		DEBUG_ShowMsg("TAP W|R|C seg:off ... file  - Record writes or reads of a byte, or count writes to a range, without stopping.\n");
+		DEBUG_ShowMsg("TAPLIST / TAPDEL id|*     - List the taps (flushing their files), or remove them.\n");
         DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
