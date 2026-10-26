@@ -2528,7 +2528,12 @@ static long TapBeamLine(void) {
 	return in_frame < 0 ? -1 : (long)(in_frame / vga.draw.delay.htotal);
 }
 
+/* A row's block is read through the guest's own accessors, which can reach a tapped page:
+ * that read is the tap's, not the guest's. */
+static bool tap_reading_block = false;
+
 void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t value) {
+	if (tap_reading_block) return;
 	const PhysPt at = (PhysPt)((page << 12u) | (addr & 0xfffu));
 	for (MemTap *t : taps) {
 		const bool writes = t->kind != 'R';
@@ -2562,11 +2567,13 @@ void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t va
 		TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
 		fprintf(t->rows, "r %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, TapBeamLine(),
 			(double)PIC_FullIndex(), cs_now, ip_now, data, mask);
+		tap_reading_block = true;
 		for (uint32_t i = 0; i < t->block_length; i++) {
 			uint8_t b = 0;
 			if (mem_readb_checked(t->block + i, &b)) b = 0;
 			fprintf(t->rows, "%02x", b);
 		}
+		tap_reading_block = false;
 		fputc('\n', t->rows);
 		t->rows_kept++;
 	}
@@ -2602,8 +2609,9 @@ static void TapRefit(TapPageHandler *h) {
 		delete h;
 		return;
 	}
+	/* A handler something else displaced stays out: putting it back would cover the page's new
+	 * handler with the one it replaced. */
 	h->Retap();
-	if (MEM_GetPageHandler(h->page) != h) MEM_SetPageHandler(h->page, 1, h);
 	PAGING_ClearTLB();
 }
 
@@ -2717,10 +2725,12 @@ static bool TapCommand(const char *typed, char *found) {
 	for (PageNum page = phys >> 12u; page <= (phys + t->length - 1u) >> 12u; page++) {
 		TapPageHandler *h = TapHandlerFor(page);
 		h->taps.push_back(t);
-		TapRefit(h);
+		h->Retap();
+		if (MEM_GetPageHandler(page) != h) MEM_SetPageHandler(page, 1, h);
+		PAGING_ClearTLB();
 	}
 	TapFlush(t);
-	DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X FILE=%s success\n", t->id, kind, (unsigned int)phys,
+	DEBUG_ShowMsg("DEBUG: TAP %u %c PHYS=%X LEN=%X success FILE=%s\n", t->id, kind, (unsigned int)phys,
 		(unsigned int)t->length, t->path.c_str());
 	return true;
 }
