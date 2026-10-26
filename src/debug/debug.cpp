@@ -2511,6 +2511,34 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "VGAMEMDUMP") { // Dump video memory, as the VGA holds it, to a binary file
+		/* Read-only: the bytes come straight from the emulated video RAM, the four planes
+		 * of each plane address interleaved (plane 0 first), with no CPU window, no latch and
+		 * no register write between them, so it reaches what the segmented dump cannot (a
+		 * linear frame buffer, a planar or unchained mode) without disturbing the machine. */
+		if (!debugging || debug_running) {
+			DEBUG_ShowMsg("DEBUG: VGAMEMDUMP requires the debugger to be stopped\n");
+			return false;
+		}
+		unsigned long ofs = 0, len = 0;
+		int consumed = 0;
+		if (sscanf(found, "%lx %lx %n", &ofs, &len, &consumed) != 2 || found[consumed] == 0
+				|| len < 1 || ofs >= vga.mem.memsize || len > vga.mem.memsize - ofs) {
+			DEBUG_ShowMsg("DEBUG: VGAMEMDUMP usage: VGAMEMDUMP offset length filename (hex, within the %lX bytes of video memory)\n",
+				(unsigned long)vga.mem.memsize);
+			return false;
+		}
+		std::ofstream file(found + consumed, std::ios::binary);
+		if (!file.is_open() || !file.write((const char*)vga.mem.linear + ofs, (std::streamsize)len)) {
+			DEBUG_ShowMsg("DEBUG: VGAMEMDUMP cannot write %s\n", found + consumed);
+			return false;
+		}
+		file.close();
+		DEBUG_ShowMsg("DEBUG: VGAMEMDUMP OFFSET=%lX LEN=%lX MEMSIZE=%lX success\n",
+			ofs, len, (unsigned long)vga.mem.memsize);
+		return true;
+	}
+
     if (command == "MEMFIND") { // Start a memory search instance with seg:ofs range
 		uint32_t valfind;
 		uint8_t valfind8;
@@ -4731,6 +4759,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
 		DEBUG_ShowMsg("MEMDUMP seg:off len [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
 		DEBUG_ShowMsg("MEMDUMPBIN seg:off len [filename] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+		DEBUG_ShowMsg("VGAMEMDUMP offset len filename - Write video memory, planes interleaved, to a binary file.\n");
         DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
