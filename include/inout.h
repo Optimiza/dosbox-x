@@ -55,6 +55,8 @@ void IO_WriteB(Bitu port,uint8_t val);
 void IO_WriteW(Bitu port,uint16_t val);
 void IO_WriteD(Bitu port,uint32_t val);
 
+bool IO_PortHasDevice(Bitu port,Bitu iolen,bool write);
+
 uint8_t IO_ReadB(Bitu port);
 uint16_t IO_ReadW(Bitu port);
 uint32_t IO_ReadD(Bitu port);
