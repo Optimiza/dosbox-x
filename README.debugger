@@ -320,6 +320,7 @@ RUN                                         Resume emulation
 RUNWATCH                                    Resume emulation, but show state while running
 SAVESTATE [slot|file]                       Save a state to a slot (1-100) or a .sav file
 LOADSTATE [slot|file]                       Load a state from a slot (1-100) or a .sav file
+CAPTURE [WAV|OPL|MIDI|VIDEO ON|OFF]            List the captures, or start or stop one
 A20                                         Show A20 gate state
 A20 ON                                      Turn on A20 gate
 A20 OFF                                     Turn off A20 gate

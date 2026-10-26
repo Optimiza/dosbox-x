@@ -2390,6 +2390,34 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+#if !defined(C_EMSCRIPTEN)
+	if (command == "CAPTURE") { // List the captures, or turn one kind on or off
+		int CAPTURE_DebugCommand(const char *kind, bool on, std::vector<std::string> &lines);
+		char kind[16] = {0}, state[8] = {0}, extra[2] = {0};
+		const int n = sscanf(found, "%15s %7s %1s", kind, state, extra);
+		std::vector<std::string> lines;
+		int done = 0;
+		if (n <= 0)
+			done = CAPTURE_DebugCommand(NULL, false, lines);
+		else if (n == 2 && (!strcmp(state, "ON") || !strcmp(state, "OFF")))
+			done = CAPTURE_DebugCommand(kind, !strcmp(state, "ON"), lines);
+		if (done < 0) {
+			DEBUG_ShowMsg("DEBUG: CAPTURE %s did not turn %s\n", kind, state);
+			return false;
+		}
+		if (done == 0) {
+			DEBUG_ShowMsg("DEBUG: CAPTURE usage: CAPTURE [WAV|OPL|MIDI"
+#if (C_SSHOT)
+				"|VIDEO"
+#endif
+				" ON|OFF]\n");
+			return false;
+		}
+		for (const std::string &line : lines) DEBUG_ShowMsg("%s\n", line.c_str());
+		return true;
+	}
+#endif
+
     if (command == "MEMFIND") { // Start a memory search instance with seg:ofs range
 		uint32_t valfind;
 		uint8_t valfind8;
@@ -4576,6 +4604,13 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
 		DEBUG_ShowMsg("MEMDUMP seg:off len [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
 		DEBUG_ShowMsg("MEMDUMPBIN seg:off len [filename] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+#if !defined(C_EMSCRIPTEN)
+		DEBUG_ShowMsg("CAPTURE [kind ON|OFF]     - List the captures, or start or stop WAV, OPL, MIDI"
+#if (C_SSHOT)
+			" or VIDEO"
+#endif
+			".\n");
+#endif
         DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
