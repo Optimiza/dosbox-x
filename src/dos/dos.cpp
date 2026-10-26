@@ -20,6 +20,7 @@
  */
 
 
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
@@ -3263,6 +3264,116 @@ static Bitu DOS_21Handler(void) {
     return CBRET_NONE;
 }
 
+/* DOSTRACE: every INT 21h a guest makes, one `E` row as DOS takes it and one `R` row as DOS hands
+ * it back, matched by `n`. A call that never comes back to its caller's stack (a terminate, or an
+ * EXEC whose child now runs) has `SWITCHED=1` on its `R` row, whose flags are not the caller's. */
+static FILE *dostrace_file = NULL;
+static std::string dostrace_path;
+static unsigned long long dostrace_calls = 0, dostrace_rows = 0, dostrace_dropped = 0;
+static const unsigned long long DOSTRACE_ROWS_MAX = 2000000ull;
+struct DosTraceEntry { unsigned long long n; uint16_t ss; uint32_t sp; };
+static std::vector<DosTraceEntry> dostrace_open;
+
+/* The caller's return address and flags as INT pushed them: 16-bit words, or 32-bit on a big
+ * protected-mode stack. */
+static uint32_t DosTraceStack(unsigned int slot) {
+    const bool wide = cpu.pmode && !(reg_flags & FLAG_VM) && cpu.stack.big;
+    const PhysPt at = SegPhys(ss) + (wide ? reg_esp + slot * 4u : (uint32_t)(uint16_t)(reg_sp + slot * 2u));
+    if (wide) { uint32_t v = 0; mem_readd_checked(at, &v); return v; }
+    uint16_t v = 0; mem_readw_checked(at, &v); return v;
+}
+
+static void DosTraceNameAt(uint32_t off, std::string &out) {
+    for (unsigned int i = 0; i < 128; i++) {
+        uint8_t c = 0;
+        if (mem_readb_checked(SegPhys(ds) + off + i, &c) || c == 0) return;
+        out += (c < 0x20 || c > 0x7e) ? '?' : (char)c;
+    }
+}
+
+/* The ASCIIZ name a call takes, at DS:DX, or DS:SI for the extended open. */
+static std::string DosTraceName(void) {
+    std::string name;
+    const uint8_t ah = reg_ah;
+    const bool at_dx = ah == 0x39 || ah == 0x3a || ah == 0x3b || ah == 0x3c || ah == 0x3d || ah == 0x41
+        || ah == 0x43 || ah == 0x4b || ah == 0x4e || ah == 0x56 || ah == 0x5a || ah == 0x5b
+        || (ah == 0x71 && (reg_al == 0x39 || reg_al == 0x3a || reg_al == 0x3b || reg_al == 0x41
+                           || reg_al == 0x43 || reg_al == 0x4e || reg_al == 0x56));
+    const bool at_si = ah == 0x6c || (ah == 0x71 && reg_al == 0x6c);
+    if (at_dx) DosTraceNameAt(reg_dx, name);
+    else if (at_si) DosTraceNameAt(reg_si, name);
+    return name;
+}
+
+static char DosTraceMode(void) {
+    if (!cpu.pmode) return 'R';
+    return (reg_flags & FLAG_VM) ? 'V' : 'P';
+}
+
+static void DosTraceRow(const char *fmt, ...) {
+    if (dostrace_rows >= DOSTRACE_ROWS_MAX) { dostrace_dropped++; return; }
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(dostrace_file, fmt, ap);
+    va_end(ap);
+    dostrace_rows++;
+}
+
+static Bitu DOS_21HandlerTraced(void) {
+    if (dostrace_file == NULL) return DOS_21Handler();
+    const unsigned long long n = ++dostrace_calls;
+    const uint16_t caller_ip = (uint16_t)DosTraceStack(0), caller_cs = (uint16_t)DosTraceStack(1);
+    const std::string name = DosTraceName();
+    DosTraceRow("E N=%llu T=%.6f M=%c CS=%04X IP=%04X PSP=%04X AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X DS=%04X ES=%04X NAME=%s\n",
+        n, (double)PIC_FullIndex(), DosTraceMode(), caller_cs, caller_ip, dos.psp(), reg_ax, reg_bx, reg_cx,
+        reg_dx, reg_si, reg_di, SegValue(ds), SegValue(es), name.c_str());
+    dostrace_open.push_back({n, SegValue(ss), reg_esp});
+    const Bitu ret = DOS_21Handler();
+    if (dostrace_file == NULL) return ret;
+    DosTraceEntry entry = {0, 0, 0};
+    if (!dostrace_open.empty()) { entry = dostrace_open.back(); dostrace_open.pop_back(); }
+    const bool switched = entry.n != n || SegValue(ss) != entry.ss || reg_esp != entry.sp;
+    const unsigned int cf = switched ? 0u : (unsigned int)(DosTraceStack(2) & FLAG_CF);
+    DosTraceRow("R N=%llu T=%.6f AX=%04X BX=%04X CX=%04X DX=%04X CF=%u SWITCHED=%d\n", n,
+        (double)PIC_FullIndex(), reg_ax, reg_bx, reg_cx, reg_dx, cf ? 1u : 0u, switched ? 1 : 0);
+    return ret;
+}
+
+static void DosTraceStatus(std::vector<std::string> &lines) {
+    char line[512];
+    if (dostrace_file != NULL) fflush(dostrace_file);
+    snprintf(line, sizeof(line), "DEBUG: DOSTRACE %s CALLS=%llu ROWS=%llu DROPPED=%llu FILE=%s",
+        dostrace_file != NULL ? "ON" : "OFF", dostrace_calls, dostrace_rows, dostrace_dropped,
+        dostrace_file != NULL ? dostrace_path.c_str() : "-");
+    lines.push_back(line);
+}
+
+/* `path` NULL lists; empty turns the trace off; else starts it into a new file at `path`. */
+int DOS_TraceCommand(const char *path, std::vector<std::string> &lines) {
+    if (path != NULL && *path == 0) {
+        if (dostrace_file != NULL) { fclose(dostrace_file); dostrace_file = NULL; }
+        dostrace_open.clear();
+        DosTraceStatus(lines);
+        return 1;
+    }
+    if (path != NULL) {
+        if (dostrace_file != NULL) {
+            lines.push_back("DEBUG: DOSTRACE is already on: turn it OFF first");
+            return -1;
+        }
+        dostrace_file = fopen(path, "w");
+        if (dostrace_file == NULL) {
+            lines.push_back(std::string("DEBUG: DOSTRACE cannot write ") + path);
+            return -1;
+        }
+        dostrace_path = path;
+        dostrace_calls = dostrace_rows = dostrace_dropped = 0;
+        dostrace_open.clear();
+    }
+    DosTraceStatus(lines);
+    return 1;
+}
+
 static Bitu BIOS_1BHandler(void) {
     mem_writeb(BIOS_CTRL_BREAK_FLAG,0x00);
 
@@ -4600,7 +4711,7 @@ public:
 		callback[0].Install(DOS_20Handler,CB_IRET,"DOS Int 20");
 		callback[0].Set_RealVec(0x20);
 
-		callback[1].Install(DOS_21Handler,CB_INT21,"DOS Int 21");
+		callback[1].Install(DOS_21HandlerTraced,CB_INT21,"DOS Int 21");
 		callback[1].Set_RealVec(0x21);
 		//Pseudo code for int 21
 		// sti
