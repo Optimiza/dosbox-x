@@ -4949,6 +4949,24 @@ bool ParseCommand(char* str) {
         return true;
     }
 
+    if (command == "DOSTRACE") { // Record every INT 21h, at entry and return, into a file
+        int DOS_TraceCommand(const char *path, std::vector<std::string> &lines);
+        /* `ParseCommand` upper-cases the line, so the filename is taken from the line as typed. */
+        std::string typed(str);
+        const size_t word = typed.find_first_not_of(' ');
+        size_t at = word == std::string::npos ? typed.size() : typed.find(' ', word);
+        at = at == std::string::npos ? typed.size() : typed.find_first_not_of(' ', at);
+        std::string arg = at == std::string::npos ? std::string() : typed.substr(at);
+        while (!arg.empty() && isspace((unsigned char)arg.back())) arg.pop_back();
+        std::vector<std::string> lines;
+        int done;
+        if (arg.empty()) done = DOS_TraceCommand(NULL, lines);
+        else if (!strcasecmp(arg.c_str(), "OFF")) done = DOS_TraceCommand("", lines);
+        else done = DOS_TraceCommand(arg.c_str(), lines);
+        for (const std::string &line : lines) DEBUG_ShowMsg("%s\n", line.c_str());
+        return done > 0;
+    }
+
     if (command == "INP" || command == "INB") {
         uint16_t port = (uint16_t)GetHexValue(found,found);
         uint8_t r = IO_ReadB(port);
@@ -5132,6 +5150,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
 		DEBUG_ShowMsg("MEMREAD <seg>:<off> <len> - Read 1-256 conventional RAM bytes (external).\n");
 		DEBUG_ShowMsg("PORTINFO port             - Which reads and writes of a port (1, 2, 4 bytes) reach a device.\n");
+		DEBUG_ShowMsg("DOSTRACE [file|OFF]       - Record every INT 21h at entry and return into a file, or stop.\n");
 		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
 		DEBUG_ShowMsg("RUNSTATE                  - Say whether the machine is stopped, its cycles and time.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
