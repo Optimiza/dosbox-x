@@ -340,6 +340,9 @@ SR <reg> <value>                            Set register <reg> value to <value>
 SM <seg> <off> [bytes in hex]               Set memory at <seg>:<off> to byte values given
 SMV <off> [bytes in hex]                    Set memory at linear/virtual <off> to byte values
 FM <seg> <off>                              Freeze (lock) memory value at <seg>:<off>
+TAP W|R|C <seg>:<off> ... <file>              Record memory writes or reads without stopping
+TAPLIST                                     List the taps, flushing their files
+TAPDEL <id>|*                              Remove one tap or all of them
 EV <value> [value] ...                      Show register/expression value(s)
 BP <seg> <off>                              Add breakpoint (real mode)
 BPM <seg> <off>                             Add breakpoint (protected mode)
