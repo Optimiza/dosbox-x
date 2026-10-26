@@ -331,6 +331,7 @@ PIC LOWERIRQ <irq>                          Manually lower interrupt signal
 PIC RAISEIRQ <irq>                          Manually raise interrupt signal
 INP/INW/IND <port>                          I/O port read byte/word/dword
 OUTP/OUTW/OUTD <port> <data>                I/O port write byte/word/dword
+PORTINFO <port>                             Show which 1, 2 and 4 byte reads and writes of a port reach a device
 C <seg> <off>                               Set code view to address
 D <seg> <off>                               Set data view to address (segment:offset)
 DV <offset>                                 Set data view to address (linear/virtual address)
