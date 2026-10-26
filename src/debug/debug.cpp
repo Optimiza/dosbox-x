@@ -4370,6 +4370,19 @@ bool ParseCommand(char* str) {
         return true;
     }
 
+    if (command == "DOSTRACE") { // Record every INT 21h, at entry and return, into a file
+        int DOS_TraceCommand(const char *path, std::vector<std::string> &lines);
+        /* `ParseCommand` upper-cases the line, so the filename is taken from the line as typed. */
+        const std::string arg = RawCommandArgument(str);
+        std::vector<std::string> lines;
+        int done;
+        if (arg.empty()) done = DOS_TraceCommand(NULL, lines);
+        else if (!strcasecmp(arg.c_str(), "OFF")) done = DOS_TraceCommand("", lines);
+        else done = DOS_TraceCommand(arg.c_str(), lines);
+        for (const std::string &line : lines) DEBUG_ShowMsg("%s\n", line.c_str());
+        return done > 0;
+    }
+
     if (command == "INP" || command == "INB") {
         uint16_t port = (uint16_t)GetHexValue(found,found);
         uint8_t r = IO_ReadB(port);
@@ -4551,6 +4564,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("CALLBACKS                 - Show callbacks of interrupts.\n");
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
 		DEBUG_ShowMsg("MEMREAD <seg>:<off> <len> - Read 1-256 conventional RAM bytes (external).\n");
+		DEBUG_ShowMsg("DOSTRACE [file|OFF]       - Record every INT 21h at entry and return into a file, or stop.\n");
 		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
 		DEBUG_ShowMsg("LOADSTATE [slot|file]     - Load a state from a slot (1-100) or a .sav file.\n");

@@ -342,6 +342,7 @@ LOGC <hexadecimal count>                    Log CPU state, CS:IP-only log, to LO
 ADDLOG <message>                            Add a message line to the CPU log file
 INTT <intnum>                               Trace interrupt
 INT <intnum>                                Start interrupt
+DOSTRACE [file|OFF]                         Record every INT 21h, at entry and return, into a file or stop
 CALLBACKS                                   Show callbacks of interrupts.
 SELINFO <n>                                 Show selector information
 DOS MCBS                                    Dump DOS kernel MCB chain (conventional memory allocation chain)
