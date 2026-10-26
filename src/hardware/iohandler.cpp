@@ -303,6 +303,60 @@ void IO_WriteSlowPath(Bitu port,Bitu val,Bitu iolen) {
 #endif
 }
 
+/* Whether a device answers an access of `iolen` bytes at `port`, asked without making the
+ * access: a slot still on the slow path is resolved by asking each callout for its handler
+ * (the callouts only pick a handler), and a split access is answered byte by byte. */
+static bool IO_ReadHasDevice(Bitu port,Bitu iolen) {
+    const unsigned int porti = (iolen >= 4) ? 2 : (unsigned int)(iolen - 1);
+    IO_ReadHandler *h = io_readhandlers[porti][port];
+    if (h == IO_ReadSlowPath) {
+        const IO_Type_t order[3] = {IO_TYPE_MB, IO_TYPE_PCI, IO_TYPE_ISA};
+        for (IO_Type_t t : order) {
+            if (t == IO_TYPE_PCI && !pcibus_enable) continue;
+            for (IO_CalloutObject &obj : IO_callouts[IO_callouts_index(t)])
+                if (obj.isInstalled() && obj.m_r_handler != NULL && obj.MatchPort((uint16_t)port)
+                    && obj.m_r_handler(obj,port,iolen) != NULL)
+                    return true;
+        }
+        h = iolen > 1 ? IO_ReadDefault : IO_ReadBlocked;
+    }
+    if (h == IO_ReadBlocked) return false;
+    if (h == IO_ReadDefault) {
+        if (iolen == 1) return false;
+        const Bitu half = iolen / 2;
+        return IO_ReadHasDevice(port,half) && IO_ReadHasDevice(port + half,half);
+    }
+    return true;
+}
+
+static bool IO_WriteHasDevice(Bitu port,Bitu iolen) {
+    const unsigned int porti = (iolen >= 4) ? 2 : (unsigned int)(iolen - 1);
+    IO_WriteHandler *h = io_writehandlers[porti][port];
+    if (h == IO_WriteSlowPath) {
+        const IO_Type_t order[3] = {IO_TYPE_MB, IO_TYPE_PCI, IO_TYPE_ISA};
+        for (IO_Type_t t : order) {
+            if (t == IO_TYPE_PCI && !pcibus_enable) continue;
+            for (IO_CalloutObject &obj : IO_callouts[IO_callouts_index(t)])
+                if (obj.isInstalled() && obj.m_w_handler != NULL && obj.MatchPort((uint16_t)port)
+                    && obj.m_w_handler(obj,port,iolen) != NULL)
+                    return true;
+        }
+        h = iolen > 1 ? IO_WriteDefault : IO_WriteBlocked;
+    }
+    if (h == IO_WriteBlocked) return false;
+    if (h == IO_WriteDefault) {
+        if (iolen == 1) return false;
+        const Bitu half = iolen / 2;
+        return IO_WriteHasDevice(port,half) && IO_WriteHasDevice(port + half,half);
+    }
+    return true;
+}
+
+bool IO_PortHasDevice(Bitu port,Bitu iolen,bool write) {
+    if (port + iolen > IO_MAX) return false;
+    return write ? IO_WriteHasDevice(port,iolen) : IO_ReadHasDevice(port,iolen);
+}
+
 void IO_RegisterReadHandler(Bitu port,IO_ReadHandler * handler,Bitu mask,Bitu range) {
     assert((port+range) <= IO_MAX);
 	while (range--) {

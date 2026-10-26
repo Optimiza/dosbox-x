@@ -4936,6 +4936,19 @@ bool ParseCommand(char* str) {
         return true;
     }
 
+    if (command == "PORTINFO") { // Which accesses of a port reach a device
+        unsigned long port = 0;
+        char extra[2] = {0};
+        if (sscanf(found, "%lx %1s", &port, extra) != 1 || port > 0xffffu) {
+            DEBUG_ShowMsg("DEBUG: PORTINFO usage: PORTINFO port (hex)\n");
+            return false;
+        }
+        DEBUG_ShowMsg("DEBUG: PORTINFO %04lX R1=%d R2=%d R4=%d W1=%d W2=%d W4=%d\n", port,
+            IO_PortHasDevice(port,1,false), IO_PortHasDevice(port,2,false), IO_PortHasDevice(port,4,false),
+            IO_PortHasDevice(port,1,true), IO_PortHasDevice(port,2,true), IO_PortHasDevice(port,4,true));
+        return true;
+    }
+
     if (command == "INP" || command == "INB") {
         uint16_t port = (uint16_t)GetHexValue(found,found);
         uint8_t r = IO_ReadB(port);
@@ -5118,6 +5131,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("CALLBACKS                 - Show callbacks of interrupts.\n");
 		DEBUG_ShowMsg("INT [nr] / INTT [nr]      - Execute / Trace into interrupt.\n");
 		DEBUG_ShowMsg("MEMREAD <seg>:<off> <len> - Read 1-256 conventional RAM bytes (external).\n");
+		DEBUG_ShowMsg("PORTINFO port             - Which reads and writes of a port (1, 2, 4 bytes) reach a device.\n");
 		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
 		DEBUG_ShowMsg("RUNSTATE                  - Say whether the machine is stopped, its cycles and time.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
