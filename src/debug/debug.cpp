@@ -646,7 +646,7 @@ static void AnnotateDirectBranch(char* line, const size_t line_size)
 bool mustCompleteInstruction = false;
 bool skipFirstInstruction = false;
 
-enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE };
+enum EBreakpoint { BKPNT_UNKNOWN, BKPNT_PHYSICAL, BKPNT_INTERRUPT, BKPNT_MEMORY, BKPNT_MEMORY_PROT, BKPNT_MEMORY_LINEAR, BKPNT_MEMORY_FREEZE, BKPNT_CONDITION };
 
 #define BPINT_ALL 0x100
 
@@ -695,6 +695,12 @@ public:
 	static CBreakpoint*				ConsumeLastTriggered			(void);
 	static bool				HasIntBreakpoints	(void);
 
+	// Conditional (heavy debugger only): every term compares a register with a value.
+	struct CondTerm { uint8_t reg; uint8_t op; uint32_t value; };
+	static CBreakpoint*		AddConditionBreakpoint	(const std::vector<CondTerm>& terms, const std::string& text);
+	static bool				CheckConditionBreakpoints	(void);
+	const std::string&		GetCondition	(void)						{ return condText; };
+
 
 private:
 	EBreakpoint	type;
@@ -712,6 +718,10 @@ private:
 	// Shared
 	bool		active;
 	bool		once;
+	// Condition: the terms, as typed back, and whether they held at the last instruction
+	std::vector<CondTerm>	condTerms;
+	std::string				condText;
+	bool					condTruth;
 
 	static std::list<CBreakpoint*>	BPoints;
 	static CBreakpoint*	lastTriggered;
@@ -725,7 +735,7 @@ CBreakpoint::CBreakpoint(void):type(BKPNT_UNKNOWN),location(0),
 #if !C_HEAVY_DEBUG
 oldData(0xCC),
 #endif
-segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false) { }
+segment(0),offset(0),intNr(0),ahValue(0),alValue(0),active(false),once(false),condTruth(false) { }
 
 #if !C_HEAVY_DEBUG
 // Is the 0xCC at this address the INT3 prefix of a callback instruction (see callback.h)?
@@ -1058,6 +1068,107 @@ CBreakpoint* CBreakpoint::ConsumeLastTriggered(void)
 }
 #endif // C_DOSBOX_AGENT
 
+#if C_HEAVY_DEBUG
+static const char *const cond_register_names[] = {
+	"EAX","EBX","ECX","EDX","ESI","EDI","EBP","ESP","EIP",
+	"AX","BX","CX","DX","SI","DI","BP","SP","IP",
+	"AL","BL","CL","DL","AH","BH","CH","DH",
+	"CS","DS","ES","FS","GS","SS","FLAGS" };
+static const char *const cond_op_names[] = { "==","!=","<=",">=","<",">" };
+enum { COND_EQ, COND_NE, COND_LE, COND_GE, COND_LT, COND_GT, COND_OPS };
+
+static uint32_t CondRegisterValue(uint8_t reg) {
+	switch (reg) {
+		case 0: return reg_eax;   case 1: return reg_ebx;   case 2: return reg_ecx;
+		case 3: return reg_edx;   case 4: return reg_esi;   case 5: return reg_edi;
+		case 6: return reg_ebp;   case 7: return reg_esp;   case 8: return reg_eip;
+		case 9: return reg_ax;    case 10: return reg_bx;   case 11: return reg_cx;
+		case 12: return reg_dx;   case 13: return reg_si;   case 14: return reg_di;
+		case 15: return reg_bp;   case 16: return reg_sp;   case 17: return reg_ip;
+		case 18: return reg_al;   case 19: return reg_bl;   case 20: return reg_cl;
+		case 21: return reg_dl;   case 22: return reg_ah;   case 23: return reg_bh;
+		case 24: return reg_ch;   case 25: return reg_dh;   case 26: return SegValue(cs);
+		case 27: return SegValue(ds); case 28: return SegValue(es); case 29: return SegValue(fs);
+		case 30: return SegValue(gs); case 31: return SegValue(ss); default: return (uint32_t)reg_flags;
+	}
+}
+
+static bool CondHolds(const CBreakpoint::CondTerm& t) {
+	const uint32_t v = CondRegisterValue(t.reg);
+	switch (t.op) {
+		case COND_EQ: return v == t.value;
+		case COND_NE: return v != t.value;
+		case COND_LE: return v <= t.value;
+		case COND_GE: return v >= t.value;
+		case COND_LT: return v < t.value;
+		default:      return v > t.value;
+	}
+}
+
+/* "AX==3B && BX!=0": up to four terms, each a register, a comparison and a hex value. The
+ * terms are compiled here, once, because they are evaluated before every instruction. */
+static bool ParseCondition(const char* text, std::vector<CBreakpoint::CondTerm>& terms, std::string& shown) {
+	const char* p = text;
+	terms.clear();
+	shown.clear();
+	while (true) {
+		while (*p == ' ') p++;
+		std::string name;
+		while (isalnum((unsigned char)*p)) name += (char)toupper((unsigned char)*p++);
+		uint8_t reg = 0;
+		while (reg < sizeof(cond_register_names) / sizeof(cond_register_names[0]) && name != cond_register_names[reg]) reg++;
+		if (reg == sizeof(cond_register_names) / sizeof(cond_register_names[0])) return false;
+		while (*p == ' ') p++;
+		uint8_t op = 0;
+		while (op < COND_OPS && strncmp(p, cond_op_names[op], strlen(cond_op_names[op])) != 0) op++;
+		if (op == COND_OPS) return false;
+		p += strlen(cond_op_names[op]);
+		while (*p == ' ') p++;
+		char* end = NULL;
+		const unsigned long value = strtoul(p, &end, 16);
+		if (end == p || value > 0xFFFFFFFFul) return false;
+		p = end;
+		if (terms.size() == 4) return false;
+		terms.push_back({reg, op, (uint32_t)value});
+		char term[48];
+		snprintf(term, sizeof(term), "%s%s%s%lX", shown.empty() ? "" : " && ", cond_register_names[reg], cond_op_names[op], value);
+		shown += term;
+		while (*p == ' ') p++;
+		if (*p == 0) return true;
+		if (p[0] != '&' || p[1] != '&') return false;
+		p += 2;
+	}
+}
+
+CBreakpoint* CBreakpoint::AddConditionBreakpoint(const std::vector<CondTerm>& terms, const std::string& text) {
+	CBreakpoint* bp = new CBreakpoint();
+	bp->type = BKPNT_CONDITION;
+	bp->condTerms = terms;
+	bp->condText = text;
+	/* "Comes true": a condition already holding when it is set fires only once it has not. */
+	bp->condTruth = true;
+	for (const auto& t : terms) if (!CondHolds(t)) { bp->condTruth = false; break; }
+	BPoints.push_front(bp);
+	return bp;
+}
+
+bool CBreakpoint::CheckConditionBreakpoints(void) {
+	for (CBreakpoint* bp : BPoints) {
+		if (bp->type != BKPNT_CONDITION || !bp->active) continue;
+		bool now = true;
+		for (const auto& t : bp->condTerms) if (!CondHolds(t)) { now = false; break; }
+		const bool rose = now && !bp->condTruth;
+		bp->condTruth = now;
+		if (rose) {
+			DEBUG_ShowMsg("DEBUG: Conditional breakpoint: %s\n", bp->condText.c_str());
+			lastTriggered = bp;
+			return true;
+		}
+	}
+	return false;
+}
+#endif
+
 void CBreakpoint::ShowList(void)
 {
 	// iterate list
@@ -1079,6 +1190,8 @@ void CBreakpoint::ShowList(void)
 			DEBUG_ShowMsg("%02X. BPLM %08X (%02X)\n",nr,bp->GetOffset(),bp->GetValue());
         } else if (bp->GetType()==BKPNT_MEMORY_FREEZE ) {
 	        DEBUG_ShowMsg("%02X. FM %08X (%02X)\n",nr,bp->GetOffset(),bp->GetValue());
+		} else if (bp->GetType()==BKPNT_CONDITION) {
+			DEBUG_ShowMsg("%02X. BPIF %s\n",nr,bp->GetCondition().c_str());
 		}
 		nr++;
 	}
@@ -2945,6 +3058,18 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	if (command == "BPIF") { // Add conditional breakpoint: stops when the condition comes true
+		std::vector<CBreakpoint::CondTerm> terms;
+		std::string shown;
+		if (!ParseCondition(found, terms, shown)) {
+			DEBUG_ShowMsg("DEBUG: BPIF usage: BPIF reg==value [&& reg!=value ...] (hex values, up to 4 terms; == != < <= > >=)\n");
+			return false;
+		}
+		CBreakpoint::AddConditionBreakpoint(terms, shown);
+		DEBUG_ShowMsg("DEBUG: Set conditional breakpoint: %s\n", shown.c_str());
+		return true;
+	}
+
 #endif
 
 	if (command == "BPINT") { // Add Interrupt Breakpoint
@@ -4563,6 +4688,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("BPM    [segment]:[offset] - Set memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPPM   [selector]:[offset]- Set pmode-memory breakpoint (memory change).\n");
 		DEBUG_ShowMsg("BPLM   [linear address]   - Set linear memory breakpoint (memory change).\n");
+		DEBUG_ShowMsg("BPIF   [reg op value] ... - Set conditional breakpoint (stops when it comes true).\n");
 #endif
 		DEBUG_ShowMsg("BPLIST                    - List breakpoints.\n");
 		DEBUG_ShowMsg("BPDEL  [bpNr] / *         - Delete breakpoint nr / all.\n");
@@ -7038,6 +7164,9 @@ bool DEBUG_HeavyIsBreakpoint(void) {
 	if (skipFirstInstruction) {
 		skipFirstInstruction = false;
 		return false;
+	}
+	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckConditionBreakpoints()) {
+		return true;
 	}
 	if (!CBreakpoint::BPoints.empty() && CBreakpoint::CheckBreakpoint(SegValue(cs),reg_eip)) {
 		return true;
