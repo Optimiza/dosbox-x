@@ -131,6 +131,7 @@ extern uint16_t DOSBOXID_VAR dosbox_id_baseio;
 # define DOSBOX_ID_8042_KB_INJECT_MOUSEMX               (0x09UL << 8UL)
 # define DOSBOX_ID_8042_KB_INJECT_MOUSEMY               (0x0AUL << 8UL)
 # define DOSBOX_ID_8042_KB_INJECT_MOUSESCRW             (0x0BUL << 8UL)
+# define DOSBOX_ID_8042_KB_INJECT_MOUSEMOTION           (0x0CUL << 8UL)    /* signed bytes, driver units: X bits 16-23, Y bits 24-31 */
 
 #define DOSBOX_ID_REG_8042_KB_STATUS                    (0x00804201UL)
 /* WARNING: bitfields may change over time! */

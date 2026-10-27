@@ -1134,6 +1134,7 @@ void dosbox_integration_trigger_write() {
 			void Mouse_ButtonReleased(uint8_t button);
 			void pc98_keyboard_send(const unsigned char b);
 			void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate);
+			void Mouse_InjectMotion(int dx, int dy);
 			void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel);
 			void KEYBOARD_AddBuffer(uint16_t data);
 
@@ -1162,6 +1163,10 @@ void dosbox_integration_trigger_write() {
 					break;
 				case 0x0B: // mouse scrollwheel injection
 					// TODO
+					break;
+				case 0x0C: // mouse motion injection: X and Y as signed bytes, in the driver's units
+					Mouse_InjectMotion((int8_t)((dosbox_int_register>>16UL)&0xFF),
+						(int8_t)((dosbox_int_register>>24UL)&0xFF));
 					break;
 				default:
 					dosbox_int_error = true;
