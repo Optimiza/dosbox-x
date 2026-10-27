@@ -853,7 +853,6 @@ static bool AllowINT33RMAccess() {
 bool IsDebuggerActive(void);
 #endif
 
-/* FIXME: Re-test this code */
 /* A motion of dx, dy in the driver's units added to the counters INT 33h AX=0Bh reads. */
 static void Mouse_CountMickeys(float dx, float dy) {
     mouse.mickey_accum_x += (dx * mouse.mickeysPerPixel_x);
@@ -897,6 +896,7 @@ void Mouse_InjectMotion(int dx, int dy) {
     Mouse_AddEvent(MOUSE_HAS_MOVED);
 }
 
+/* FIXME: Re-test this code */
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
     extern bool Mouse_Vertical;
     float dx = xrel * mouse.pixelPerMickey_x;
