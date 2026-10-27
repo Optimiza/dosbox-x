@@ -3270,7 +3270,7 @@ static Bitu DOS_21Handler(void) {
 static FILE *dostrace_file = NULL;
 static std::string dostrace_path;
 static unsigned long long dostrace_calls = 0, dostrace_rows = 0, dostrace_dropped = 0;
-static const unsigned long long DOSTRACE_ROWS_MAX = 2000000ull;
+static const unsigned long long DOSTRACE_ROWS_MAX = 1000000ull;
 struct DosTraceEntry { unsigned long long n; uint16_t ss; uint32_t sp; };
 static std::vector<DosTraceEntry> dostrace_open;
 
@@ -3311,7 +3311,14 @@ static char DosTraceMode(void) {
 }
 
 static void DosTraceRow(const char *fmt, ...) {
-    if (dostrace_rows >= DOSTRACE_ROWS_MAX) { dostrace_dropped++; return; }
+    if (dostrace_rows >= DOSTRACE_ROWS_MAX) {
+        /* Said once in the file, so a reader of the file alone knows it was cut. */
+        if (dostrace_dropped++ == 0) {
+            fprintf(dostrace_file, "X ROWS_MAX=%llu\n", DOSTRACE_ROWS_MAX);
+            fflush(dostrace_file);
+        }
+        return;
+    }
     va_list ap;
     va_start(ap, fmt);
     vfprintf(dostrace_file, fmt, ap);
