@@ -162,8 +162,8 @@ commands are accepted, including through the external control channel:
 
 It prints exactly one line and changes nothing:
 
-  DEBUG: RUNSTATE stopped cycles=1234567 ms=2871.000025000
-  DEBUG: RUNSTATE running cycles=1240001 ms=2873.512000000
+  DEBUG: RUNSTATE stopped cycles=1234567 ms=2871.000025000 frames=201
+  DEBUG: RUNSTATE running cycles=1240001 ms=2873.512000000 frames=201
 
 `stopped` means the debugger's own loop holds the machine (after a breakpoint,
 `BREAK`, `-break-start` or a finished `STEPIN`), where a command such as
@@ -178,6 +178,12 @@ until the answer is `stopped`.
 cycles the CPU core has counted, and the emulated time in milliseconds, to the
 same nine decimals. No other command prints them either. Read while the guest
 runs, they are where it was when the control channel was served.
+
+`frames` counts the frames the vertical timer has started since power-on: `VRT`
+stops at the start of the next one, already counted, so a client that runs N
+`VRT`s sees it rise by N, and a frame number names one instant of the run. A
+mode set that restarts the timer starts a frame too. It is not saved in a save
+state, so after `LOADSTATE` it goes on counting this run's frames.
 
 Single-step command
 -------------------
