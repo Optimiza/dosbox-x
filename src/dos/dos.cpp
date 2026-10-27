@@ -3267,7 +3267,10 @@ static Bitu DOS_21Handler(void) {
 static FILE *dostrace_file = NULL;
 static std::string dostrace_path;
 static unsigned long long dostrace_calls = 0, dostrace_rows = 0, dostrace_dropped = 0;
-static const unsigned long long DOSTRACE_ROWS_MAX = 2000000ull;
+/* Which trace a call began in: one that returns after the trace was turned off and on again has
+ * no row in the new file. */
+static unsigned long long dostrace_generation = 0;
+static const unsigned long long DOSTRACE_ROWS_MAX = 1000000ull;
 struct DosTraceEntry { unsigned long long n; uint16_t ss; uint32_t sp; };
 static std::vector<DosTraceEntry> dostrace_open;
 
@@ -3308,7 +3311,14 @@ static char DosTraceMode(void) {
 }
 
 static void DosTraceRow(const char *fmt, ...) {
-    if (dostrace_rows >= DOSTRACE_ROWS_MAX) { dostrace_dropped++; return; }
+    if (dostrace_rows >= DOSTRACE_ROWS_MAX) {
+        /* Said once in the file, so a reader of the file alone knows it was cut. */
+        if (dostrace_dropped++ == 0) {
+            fprintf(dostrace_file, "X ROWS_MAX=%llu\n", DOSTRACE_ROWS_MAX);
+            fflush(dostrace_file);
+        }
+        return;
+    }
     va_list ap;
     va_start(ap, fmt);
     vfprintf(dostrace_file, fmt, ap);
@@ -3321,6 +3331,7 @@ static void DosTraceRow(const char *fmt, ...) {
 static Bitu DOS_21HandlerTraced(void) {
     if (dostrace_file == NULL) return DOS_21Handler();
     const unsigned long long n = ++dostrace_calls;
+    const unsigned long long generation = dostrace_generation;
     const uint16_t caller_ip = (uint16_t)DosTraceStack(0), caller_cs = (uint16_t)DosTraceStack(1);
     const std::string name = DosTraceName();
     DosTraceRow("E N=%llu T=%.6f M=%c CS=%04X IP=%04X PSP=%04X AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X DS=%04X ES=%04X NAME=%s\n",
@@ -3328,7 +3339,7 @@ static Bitu DOS_21HandlerTraced(void) {
         reg_dx, reg_si, reg_di, SegValue(ds), SegValue(es), name.c_str());
     dostrace_open.push_back({n, SegValue(ss), reg_esp});
     const Bitu ret = DOS_21Handler();
-    if (dostrace_file == NULL) return ret;
+    if (dostrace_file == NULL || generation != dostrace_generation) return ret;
     DosTraceEntry entry = {0, 0, 0};
     if (!dostrace_open.empty()) { entry = dostrace_open.back(); dostrace_open.pop_back(); }
     const bool switched = entry.n != n || SegValue(ss) != entry.ss || reg_esp != entry.sp;
@@ -3367,6 +3378,7 @@ int DOS_TraceCommand(const char *path, std::vector<std::string> &lines) {
         }
         dostrace_path = path;
         dostrace_calls = dostrace_rows = dostrace_dropped = 0;
+        dostrace_generation++;
         dostrace_open.clear();
     }
     DosTraceStatus(lines);
