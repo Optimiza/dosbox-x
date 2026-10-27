@@ -275,12 +275,15 @@ void QueueIncoming(std::string message)
 {
     std::lock_guard<std::mutex> lock(g_incoming_mutex);
 
-    if (g_incoming.size() >= MAX_INCOMING_MESSAGES)
+    const bool full = g_incoming.size() >= MAX_INCOMING_MESSAGES;
+    if (full)
         g_incoming.pop_front();
-    else
-        g_unanswered.fetch_add(1);
 
     g_incoming.emplace_back(std::move(message));
+
+    // A request dropped to make room was counted, and the new one takes its count.
+    if (!full)
+        g_unanswered.fetch_add(1);
 }
 
 bool ReplyOwed()
@@ -621,6 +624,7 @@ void ControlServer_Start(const uint16_t port)
     {
         std::lock_guard<std::mutex> lock(g_incoming_mutex);
         g_incoming.clear();
+        g_unanswered.store(0);
     }
 
     {
@@ -647,6 +651,7 @@ void ControlServer_Stop()
     {
         std::lock_guard<std::mutex> lock(g_incoming_mutex);
         g_incoming.clear();
+        g_unanswered.store(0);
     }
 
     {
@@ -695,8 +700,9 @@ void ControlServer_Poll()
                      "[ControlClient] mcp command %s\n",
                      command.c_str());
 
+        // Counted down on every way out, after the reply is queued.
+        struct Answered { ~Answered() { g_unanswered.fetch_sub(1); } } answered;
         ProcessControlCommand(command);
-        g_unanswered.fetch_sub(1);
     }
 }
 
