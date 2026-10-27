@@ -386,10 +386,13 @@ bool IsDebuggerRunNormal(void) {
     return runnormal;
 }
 
-std::string DEBUG_RunStateLine(bool in_loop, bool watching, unsigned long long cycles, double ms) {
-    char line[128];
-    snprintf(line, sizeof(line), "DEBUG: RUNSTATE %s cycles=%llu ms=%.9f",
-             in_loop && !watching ? "stopped" : "running", cycles, ms);
+extern unsigned long long VGA_FramesStarted;
+
+std::string DEBUG_RunStateLine(bool in_loop, bool watching, unsigned long long cycles, double ms,
+                               unsigned long long frames) {
+    char line[160];
+    snprintf(line, sizeof(line), "DEBUG: RUNSTATE %s cycles=%llu ms=%.9f frames=%llu",
+             in_loop && !watching ? "stopped" : "running", cycles, ms, frames);
     return line;
 }
 
@@ -3602,7 +3605,7 @@ bool ParseCommand(char* str) {
 		/* For a client with no screen: whether the machine is stopped, and the register
 		 * window's cc= and pfi=, are otherwise only drawn, never printed. Changes nothing. */
 		DEBUG_ShowMsg("%s\n", DEBUG_RunStateLine(debugging, debug_running,
-			(unsigned long long)cycle_count, (double)PIC_FullIndex()).c_str());
+			(unsigned long long)cycle_count, (double)PIC_FullIndex(), VGA_FramesStarted).c_str());
 		return true;
 	}
 
