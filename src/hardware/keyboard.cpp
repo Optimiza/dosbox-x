@@ -184,9 +184,9 @@ bool MouseTypeNone() {
     return (keyb.ps2mouse.type == MOUSE_NONE);
 }
 
-/* NTS: INT33H emulation is coded to call this ONLY if it hasn't taken over the role of mouse input */
 static void KEYBOARD_AUX_Report(Bitu buttons,int scrollwheel);
 
+/* NTS: INT33H emulation is coded to call this ONLY if it hasn't taken over the role of mouse input */
 void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel) {
     if (IS_PC98_ARCH) {
         LOG_MSG("WARNING: KEYBOARD_AUX_Event called in PC-98 emulation mode. This is a bug.");
