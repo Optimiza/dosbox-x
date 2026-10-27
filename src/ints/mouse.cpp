@@ -51,6 +51,8 @@ static bool adjust_x_max_excess = false,adjust_y_max_excess = false;
 static unsigned int assume_max_x = 0,assume_max_y = 0;
 static int adjust_x = 0,adjust_y = 0;
 static int mickey_threshold = 0;
+/* Motion the guest injected since the counters were last read: read back with no capture. */
+static bool injected_motion = false;
 
 #define VMWARE_PORT         0x5658u        // communication port
 #define VMWARE_PORTHB       0x5659u        // communication port, high bandwidth
@@ -79,6 +81,7 @@ uint16_t GetTextSeg();
 void AUX_INT33_Takeover();
 int KEYBOARD_AUX_Active();
 void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel);
+void KEYBOARD_AUX_InjectedMotion(float x,float y,Bitu buttons);
 extern bool MOUSE_IsLocked();
 extern bool usesystemcursor, dbcs_sbcs, showdbcs, del_flag;
 
@@ -867,6 +870,49 @@ bool IsDebuggerActive(void);
 #endif
 
 /* FIXME: Re-test this code */
+/* A motion of dx, dy in the driver's units added to the counters INT 33h AX=0Bh reads. */
+static void Mouse_CountMickeys(float dx, float dy) {
+    mouse.mickey_accum_x += (dx * mouse.mickeysPerPixel_x);
+    mouse.mickey_accum_y += (dy * mouse.mickeysPerPixel_y);
+
+    if (fabs(mouse.mickey_accum_x) >= mickey_threshold) {
+        mouse.mickey_x += truncf(mouse.mickey_accum_x);
+        mouse.mickey_accum_x -= truncf(mouse.mickey_accum_x);
+    }
+    if (fabs(mouse.mickey_accum_y) >= mickey_threshold) {
+        mouse.mickey_y += truncf(mouse.mickey_accum_y);
+        mouse.mickey_accum_y -= truncf(mouse.mickey_accum_y);
+    }
+
+    if (mouse.mickey_x >= 32768) mouse.mickey_x -= 65536;
+    else if (mouse.mickey_x <= -32769) mouse.mickey_x += 65536;
+    if (mouse.mickey_y >= 32768) mouse.mickey_y -= 65536;
+    else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
+}
+
+/* Motion the guest asks for through the integration device, in the driver's units. It reaches
+ * what a captured host mouse's motion reaches (a PS/2 mouse the guest drives, else the motion
+ * counters and the position), whether or not anyone captured the host mouse: no host pointer is
+ * involved, so the capture that guards host motion has nothing to guard. */
+void Mouse_InjectMotion(int dx, int dy) {
+    if (dx == 0 && dy == 0) return;
+
+    if (!IS_PC98_ARCH && KEYBOARD_AUX_Active()) {
+        KEYBOARD_AUX_InjectedMotion((float)dx,(float)dy,mouse.buttons);
+        return;
+    }
+
+    Mouse_CountMickeys((float)dx, (float)dy);
+    injected_motion = true;
+    mouse.x += dx;
+    mouse.y += dy;
+    if (mouse.x > mouse.max_x) mouse.x = mouse.max_x;
+    if (mouse.x < mouse.min_x) mouse.x = mouse.min_x;
+    if (mouse.y > mouse.max_y) mouse.y = mouse.max_y;
+    if (mouse.y < mouse.min_y) mouse.y = mouse.min_y;
+    Mouse_AddEvent(MOUSE_HAS_MOVED);
+}
+
 void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
     extern bool Mouse_Vertical;
     float dx = xrel * mouse.pixelPerMickey_x;
@@ -897,22 +943,7 @@ void Mouse_CursorMoved(float xrel,float yrel,float x,float y,bool emulate) {
         /* PC-98 mouse */
         if (IS_PC98_ARCH) pc98_mouse_movement_apply(xrel,yrel);
 
-        mouse.mickey_accum_x += (dx * mouse.mickeysPerPixel_x);
-        mouse.mickey_accum_y += (dy * mouse.mickeysPerPixel_y);
-
-        if (fabs(mouse.mickey_accum_x) >= mickey_threshold) {
-            mouse.mickey_x += truncf(mouse.mickey_accum_x);
-            mouse.mickey_accum_x -= truncf(mouse.mickey_accum_x);
-        }
-        if (fabs(mouse.mickey_accum_y) >= mickey_threshold) {
-            mouse.mickey_y += truncf(mouse.mickey_accum_y);
-            mouse.mickey_accum_y -= truncf(mouse.mickey_accum_y);
-        }
-
-        if (mouse.mickey_x >= 32768) mouse.mickey_x -= 65536;
-        else if (mouse.mickey_x <= -32769) mouse.mickey_x += 65536;
-        if (mouse.mickey_y >= 32768) mouse.mickey_y -= 65536;
-        else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
+        Mouse_CountMickeys(dx, dy);
     }
 
     if (emulate) {
@@ -1600,11 +1631,12 @@ void Mouse_Used(void) {
 }
 
 void Mouse_Read_Motion_Data() {
-    const auto locked = MOUSE_IsLocked();
-    reg_cx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_x : 0);
-    reg_dx = (uint16_t)static_cast<int16_t>(locked ? mouse.mickey_y : 0);
+    const auto counted = MOUSE_IsLocked() || injected_motion;
+    reg_cx = (uint16_t)static_cast<int16_t>(counted ? mouse.mickey_x : 0);
+    reg_dx = (uint16_t)static_cast<int16_t>(counted ? mouse.mickey_y : 0);
     mouse.mickey_x = 0;
     mouse.mickey_y = 0;
+    injected_motion = false;
     Mouse_Used();
 }
 
