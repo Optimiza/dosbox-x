@@ -902,9 +902,11 @@ bool CBreakpoint::CheckBreakpoint(uint16_t seg, uint32_t off)
 				if (mem_readb_checked((PhysPt)address,&value)) return false;
 				if (bp->GetValue() != value) {
 					// Yup, memory value changed
+                    /* Put back, and go on: the other bytes of a frozen run and the
+                     * breakpoints after this one in the list are checked at this instruction too. */
                     if (bp->GetType()==BKPNT_MEMORY_FREEZE){
                         mem_writeb_checked((PhysPt)address,bp->GetValue());
-                        return false;
+                        continue;
                     }
 					DEBUG_ShowMsg("DEBUG: Memory breakpoint %s: %04X:%04X - %02X -> %02X\n",(bp->GetType()==BKPNT_MEMORY_PROT)?"(Prot)":"",bp->GetSegment(),bp->GetOffset(),bp->GetValue(),value);
 					bp->SetValue(value);
