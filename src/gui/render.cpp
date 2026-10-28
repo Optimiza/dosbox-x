@@ -612,7 +612,7 @@ void RENDER_Reset( void ) {
 
 	if (width == 0 || height == 0) {
 		render.disablerender = true;
-		PRESENCE_OutputChanged(0, 0, 0);
+		PRESENCE_OutputChanged(0, 0, 0, 0, 0);
 		return;
 	}
 
@@ -969,7 +969,8 @@ forcenormal:
 	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
 	                       ttf_text ? 0u :
 	                       render.scale.outMode == scalerMode32 ? 4u :
-	                       render.scale.outMode == scalerMode8 ? 0u : 2u);
+	                       render.scale.outMode == scalerMode8 ? 0u : 2u,
+	                       (unsigned)render.src.width, (unsigned)render.src.height);
 	ScalerLineBlock_t *lineBlock;
 
 	/* how many bytes will be needed in the write cache?

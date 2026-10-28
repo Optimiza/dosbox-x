@@ -11,6 +11,7 @@
 #ifndef DOSBOX_RENDER_PRESENCE_H
 #define DOSBOX_RENDER_PRESENCE_H
 
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -21,7 +22,8 @@ namespace presence {
 enum class State { Off, Held, Acting };
 
 /* How the overlay is drawn: everything comes from the client, so the emulator
-   holds no look of its own. Colours are 0xRRGGBB, alphas and sizes 0 to 1. */
+   holds no look of its own. Colours are 0xRRGGBB, alphas and sizes 0 to 1. The
+   arrow has no size: each sprite cell is one guest pixel, scaled as the picture is. */
 struct Look {
     uint32_t rgb = 0xFF8C00;
     uint32_t outline = 0x2A1400;
@@ -30,14 +32,13 @@ struct Look {
     float acting = 0.85f;
     float held = 0.28f;
     float fade = 2.5f;        /* seconds from acting back to held */
-    float size = 0.06f;       /* arrow height, a fraction of the shorter side */
-    float glide = 0.2f;       /* seconds the arrow takes to ease out to a new place */
+    float glide = 0.1f;       /* seconds the arrow takes to ease out to a new place */
     /* the arrow, top row first: 'X' outline, 'o' fill, '.' untouched */
     std::vector<std::string> sprite;
     bool operator==(const Look &o) const {
         return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
-               acting == o.acting && held == o.held && fade == o.fade && size == o.size &&
-               glide == o.glide && sprite == o.sprite;
+               acting == o.acting && held == o.held && fade == o.fade && glide == o.glide &&
+               sprite == o.sprite;
     }
 };
 
@@ -64,9 +65,12 @@ public:
        the host clock a fade from acting is timed on. */
     bool Configure(const std::string &args, std::string &error, uint32_t now_ms);
 
-    /* The output the overlay is drawn on; `fmt` null when it cannot be (an
-       8-bit or text output, no output yet). A new output holds no overlay. */
-    void Resize(unsigned width, unsigned height, const Format *fmt);
+    /* The output the overlay is drawn on, scaled from a guest picture of
+       `guest_width` x `guest_height` (0 for none: one output pixel a guest
+       pixel); `fmt` null when it cannot be drawn on (an 8-bit or text output,
+       no output yet). A new output holds no overlay. */
+    void Resize(unsigned width, unsigned height, const Format *fmt, unsigned guest_width,
+                unsigned guest_height);
 
     /* The buffer is about to be written by the scaler: the pixels the overlay
        covers are put back, so the buffer holds only the emulated picture. */
@@ -112,7 +116,8 @@ private:
        from where it was drawn to the pointer at (fx, fy), the first time there. */
     void ArrowAt(uint32_t now_ms, float fx, float fy, float &x, float &y) const;
     int Band() const;
-    int ArrowScale() const;
+    /* Where sprite cell `i` starts along an axis, in output pixels. */
+    static int CellEdge(float scale, size_t i) { return (int)std::lround(scale * (float)i); }
     std::vector<Span> Covered(const Key &key) const;
     void Draw(uint8_t *buf, size_t pitch, const Key &key) const;
     uint32_t Blend(uint32_t under, const uint32_t c8[3], int alpha256) const;
@@ -125,6 +130,7 @@ private:
     uint32_t since_ms_ = 0;          /* when the state last changed */
     State faded_from_ = State::Off;  /* the state before it, which a fade starts from */
     unsigned width_ = 0, height_ = 0;
+    float scale_x_ = 1, scale_y_ = 1;  /* output pixels a guest pixel, each way */
     Format fmt_;
     /* each channel's value as 8 bits, and 8 bits as the channel's value: the
        blend's divisions, done once per output format */
@@ -153,8 +159,10 @@ Overlay &Instance();
 /* The debugger's PRESENCE command: the reply lines, or false and the error. */
 bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines);
 /* The render's output changed size or format: `bytes` per pixel, 0 for one it
-   cannot be drawn on. */
-void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes);
+   cannot be drawn on, scaled from a guest picture of `guest_width` x
+   `guest_height`. */
+void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes,
+                            unsigned guest_width, unsigned guest_height);
 /* The scaler is about to write the output buffer `buf`: see Overlay::Undraw. */
 void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch);
 /* The frame about to be presented: see Overlay::Compose. */
