@@ -160,12 +160,10 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     return true;
 }
 
-void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, unsigned guest_width,
-                     unsigned guest_height) {
+void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     width_ = width;
     height_ = height;
-    scale_x_ = guest_width ? (float)width / (float)guest_width : 1.0f;
-    scale_y_ = guest_height ? (float)height / (float)guest_height : 1.0f;
+    Rescale();
     fmt_ = fmt ? *fmt : Format();
     for (int i = 0; i < 3; i++) {
         to8_[i].clear();
@@ -183,6 +181,19 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, unsigne
     presented_ = Key();
     glide_ = Glide();
     full_.assign({0, (uint16_t)std::min(height, 65535u)});
+}
+
+void Overlay::Guest(unsigned width, unsigned height) {
+    if (width == guest_width_ && height == guest_height_) return;
+    guest_width_ = width;
+    guest_height_ = height;
+    Rescale();
+    look_generation_++;              /* the arrow's size changed: repaint it whole */
+}
+
+void Overlay::Rescale() {
+    scale_x_ = guest_width_ ? (float)width_ / (float)guest_width_ : 1.0f;
+    scale_y_ = guest_height_ ? (float)height_ / (float)guest_height_ : 1.0f;
 }
 
 int Overlay::Band() const {
@@ -388,13 +399,12 @@ bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines) 
     return true;
 }
 
-void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes,
-                            unsigned guest_width, unsigned guest_height) {
+void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes) {
     presence::Format fmt;
     const bool ok = bytes != 0 && presence::FormatFromPixels(
             bytes, (uint32_t)GFX_GetRGB(0, 0, 0), (uint32_t)GFX_GetRGB(255, 0, 0),
             (uint32_t)GFX_GetRGB(0, 255, 0), (uint32_t)GFX_GetRGB(0, 0, 255), fmt);
-    presence::Instance().Resize(width, height, ok ? &fmt : nullptr, guest_width, guest_height);
+    presence::Instance().Resize(width, height, ok ? &fmt : nullptr);
 }
 
 void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch) {
@@ -405,7 +415,9 @@ const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *ch
                                   bool shown) {
     if (Idle()) return changed;
     float fx = 0, fy = 0;
-    const bool pointer = Mouse_PresencePointer(fx, fy);
+    unsigned guest_width = 0, guest_height = 0;
+    const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
+    presence::Instance().Guest(guest_width, guest_height);
     return presence::Instance().Compose(buf, pitch, changed, (uint32_t)GetTicks(), pointer, fx, fy,
                                         shown);
 }
@@ -413,7 +425,9 @@ const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *ch
 bool PRESENCE_WantsRepaint() {
     if (Idle()) return false;
     float fx = 0, fy = 0;
-    const bool pointer = Mouse_PresencePointer(fx, fy);
+    unsigned guest_width = 0, guest_height = 0;
+    const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
+    presence::Instance().Guest(guest_width, guest_height);
     return presence::Instance().NeedsRepaint((uint32_t)GetTicks(), pointer, fx, fy);
 }
 

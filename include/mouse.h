@@ -49,8 +49,10 @@ bool Mouse_IsLocked();
 void Mouse_BeforeNewVideoMode(bool setmode);
 void Mouse_AfterNewVideoMode(bool setmode);
 
-/* the guest pointer as a fraction of the driver's range, for the presence overlay */
-bool Mouse_PresencePointer(float &fx, float &fy);
+/* the guest pointer as a fraction of the driver's range, and the BIOS mode's size
+   in pixels, for the presence overlay: the render's source counts scan lines,
+   which a scan-doubled mode such as 13h draws two to a pixel */
+bool Mouse_PresencePointer(float &fx, float &fy, unsigned &guest_width, unsigned &guest_height);
 
 void UpdateMouseReportRate(void);
 void ChangeMouseReportRate(unsigned int new_rate);
