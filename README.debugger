@@ -305,7 +305,7 @@ marks with it the window it drives, so whoever sits at the host can tell that
 somebody is driving it and keep their hands off:
 
   REQ 12 EXEC PRESENCE held rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283
-         fade=2.5 outline=2A1400 size=0.06 sprite=X.../XX../XoX./XXXX pointer=1
+         fade=2.5 outline=2A1400 sprite=X.../XX../XoX./XXXX pointer=1
 
 (one line). The first word is the state:
 
@@ -325,14 +325,15 @@ The `key=value` words set how it is drawn, and a key left out keeps its value:
   sprite    an arrow drawn at the guest's mouse position, its rows top first
             and separated by `/`: `X` the outline, `o` the fill, `.` untouched
   outline   the arrow's outline colour, six hex digits (the fill is `rgb`)
-  size      the arrow's height, a fraction of the picture's shorter side
   glide     the seconds the arrow takes to ease out to a new place, 0 to jump
   pointer   1 to draw the arrow (with a sprite given), 0 not to
 
-The arrow follows the built-in INT 33h driver's position, within the range the
-driver keeps it in, gliding to each new place from where it was drawn rather
-than jumping; with no driver installed there is no arrow. The glide is drawing
-only: the guest's pointer is where the driver says at once.
+Each sprite cell is one guest pixel, scaled with the picture, so a sprite the
+size of the guest's own pointer is drawn at that size whatever the mode, the
+scaler or the window. The arrow follows the built-in INT 33h driver's position,
+within the range the driver keeps it in, gliding to each new place from where it
+was drawn rather than jumping; with no driver installed there is no arrow. The
+glide is drawing only: the guest's pointer is where the driver says at once.
 
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
