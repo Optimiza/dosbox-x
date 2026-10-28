@@ -121,7 +121,6 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "acting") ok = ParseFloat(value, 0.0f, 1.0f, look.acting);
         else if (key == "held") ok = ParseFloat(value, 0.0f, 1.0f, look.held);
         else if (key == "fade") ok = ParseFloat(value, 0.0f, 60.0f, look.fade);
-        else if (key == "size") ok = ParseFloat(value, 0.001f, 0.5f, look.size);
         else if (key == "glide") ok = ParseFloat(value, 0.0f, 5.0f, look.glide);
         else if (key == "steps") {
             float steps = 0;
@@ -161,9 +160,12 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     return true;
 }
 
-void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
+void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, unsigned guest_width,
+                     unsigned guest_height) {
     width_ = width;
     height_ = height;
+    scale_x_ = guest_width ? (float)width / (float)guest_width : 1.0f;
+    scale_y_ = guest_height ? (float)height / (float)guest_height : 1.0f;
     fmt_ = fmt ? *fmt : Format();
     for (int i = 0; i < 3; i++) {
         to8_[i].clear();
@@ -186,12 +188,6 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
 int Overlay::Band() const {
     const float side = (float)std::min(width_, height_);
     return std::max(1, (int)std::lround(look_.edge * side));
-}
-
-int Overlay::ArrowScale() const {
-    if (look_.sprite.empty()) return 1;
-    const float side = (float)std::min(width_, height_);
-    return std::max(1, (int)std::lround(look_.size * side / (float)look_.sprite.size()));
 }
 
 Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float fy) const {
@@ -252,8 +248,8 @@ std::vector<Overlay::Span> Overlay::Covered(const Key &key) const {
         }
     }
     if (key.arrow) {
-        const unsigned k = (unsigned)ArrowScale();
-        const unsigned rows = (unsigned)look_.sprite.size() * k, cols = (unsigned)look_.sprite[0].size() * k;
+        const unsigned rows = (unsigned)CellEdge(scale_y_, look_.sprite.size());
+        const unsigned cols = (unsigned)CellEdge(scale_x_, look_.sprite[0].size());
         for (unsigned y = (unsigned)key.ay; y < std::min(h, (unsigned)key.ay + rows); y++)
             if ((unsigned)key.ax < w) spans.push_back({y, (unsigned)key.ax, std::min(w, (unsigned)key.ax + cols)});
     }
@@ -301,15 +297,14 @@ void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
         }
     }
     if (!key.arrow) return;
-    const int k = ArrowScale();
     const uint32_t fill = Pixel(look_.rgb), outline = Pixel(look_.outline);
     for (size_t r = 0; r < look_.sprite.size(); r++) {
         const std::string &line = look_.sprite[r];
         for (size_t c = 0; c < line.size(); c++) {
             if (line[c] == '.') continue;
             const uint32_t px = line[c] == 'X' ? outline : fill;
-            for (int y = key.ay + (int)r * k; y < key.ay + ((int)r + 1) * k && y < h; y++)
-                for (int x = key.ax + (int)c * k; x < key.ax + ((int)c + 1) * k && x < w; x++)
+            for (int y = key.ay + CellEdge(scale_y_, r); y < key.ay + CellEdge(scale_y_, r + 1) && y < h; y++)
+                for (int x = key.ax + CellEdge(scale_x_, c); x < key.ax + CellEdge(scale_x_, c + 1) && x < w; x++)
                     WritePixel(buf + (size_t)y * pitch + (size_t)x * bytes, bytes, px);
         }
     }
@@ -393,12 +388,13 @@ bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines) 
     return true;
 }
 
-void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes) {
+void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes,
+                            unsigned guest_width, unsigned guest_height) {
     presence::Format fmt;
     const bool ok = bytes != 0 && presence::FormatFromPixels(
             bytes, (uint32_t)GFX_GetRGB(0, 0, 0), (uint32_t)GFX_GetRGB(255, 0, 0),
             (uint32_t)GFX_GetRGB(0, 255, 0), (uint32_t)GFX_GetRGB(0, 0, 255), fmt);
-    presence::Instance().Resize(width, height, ok ? &fmt : nullptr);
+    presence::Instance().Resize(width, height, ok ? &fmt : nullptr, guest_width, guest_height);
 }
 
 void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch) {
