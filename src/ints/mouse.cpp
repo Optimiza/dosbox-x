@@ -268,8 +268,10 @@ static struct {
 /* Where the guest's pointer is, as a fraction of the range the driver keeps it in (0 to 1
    across, 0 to 1 down), for the presence overlay to draw its arrow at; false when the
    driver is not installed or has no range. */
-bool Mouse_PresencePointer(float &fx, float &fy) {
+bool Mouse_PresencePointer(float &fx, float &fy, unsigned &guest_width, unsigned &guest_height) {
     if (!mouse.enabled) return false;
+    guest_width = (unsigned)CurMode->swidth;
+    guest_height = (unsigned)CurMode->sheight;
     const float w = (float)mouse.max_x - (float)mouse.min_x + 1.0f;
     const float h = (float)mouse.max_y - (float)mouse.min_y + 1.0f;
     if (w <= 0.0f || h <= 0.0f) return false;
