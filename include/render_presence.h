@@ -22,7 +22,7 @@ namespace presence {
 enum class State { Off, Held, Acting };
 
 /* How the overlay is drawn: everything comes from the client, so the emulator
-   holds no look of its own. Colours are 0xRRGGBB, alphas and sizes 0 to 1. The
+   holds no look of its own. Colours are 0xRRGGBB, alphas and the edge 0 to 1. The
    arrow has no size: each sprite cell is one guest pixel, scaled as the picture is. */
 struct Look {
     uint32_t rgb = 0xFF8C00;
@@ -116,6 +116,7 @@ private:
     /* Where the arrow is drawn at `now_ms`, as a fraction of the output: gliding
        from where it was drawn to the pointer at (fx, fy), the first time there. */
     void ArrowAt(uint32_t now_ms, float fx, float fy, float &x, float &y) const;
+    void Rescale();
     int Band() const;
     /* Where sprite cell `i` starts along an axis, in output pixels. */
     static int CellEdge(float scale, size_t i) { return (int)std::lround(scale * (float)i); }
@@ -133,7 +134,6 @@ private:
     unsigned width_ = 0, height_ = 0;
     unsigned guest_width_ = 0, guest_height_ = 0;
     float scale_x_ = 1, scale_y_ = 1;  /* output pixels a guest pixel, each way */
-    void Rescale();
     Format fmt_;
     /* each channel's value as 8 bits, and 8 bits as the channel's value: the
        blend's divisions, done once per output format */
