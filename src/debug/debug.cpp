@@ -389,10 +389,13 @@ bool IsDebuggerRunNormal(void) {
 extern unsigned long long VGA_FramesStarted;
 
 std::string DEBUG_RunStateLine(bool in_loop, bool watching, unsigned long long cycles, double ms,
-                               unsigned long long frames) {
+                               unsigned long long frames, int fired_bpif) {
     char line[160];
-    snprintf(line, sizeof(line), "DEBUG: RUNSTATE %s cycles=%llu ms=%.9f frames=%llu",
-             in_loop && !watching ? "stopped" : "running", cycles, ms, frames);
+    const bool stopped = in_loop && !watching;
+    int n = snprintf(line, sizeof(line), "DEBUG: RUNSTATE %s cycles=%llu ms=%.9f frames=%llu",
+                     stopped ? "stopped" : "running", cycles, ms, frames);
+    if (stopped && fired_bpif >= 0 && n > 0 && (size_t)n < sizeof(line))
+        snprintf(line + n, sizeof(line) - (size_t)n, " bpif=%02X", (unsigned int)fired_bpif);
     return line;
 }
 
@@ -730,6 +733,12 @@ private:
 
 	static std::list<CBreakpoint*>	BPoints;
 	static CBreakpoint*	lastTriggered;
+	/* The BPIF row whose condition came true and stopped the machine, until it runs again. */
+	static CBreakpoint*	firedCondition;
+public:
+	/* That row's place in BPLIST's numbering, or -1 when the machine was not stopped by one. */
+	static int				FiredConditionIndex		(void);
+private:
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
 #endif
@@ -796,6 +805,16 @@ void CBreakpoint::Activate(bool _active)
 // Statics
 std::list<CBreakpoint*> CBreakpoint::BPoints;
 CBreakpoint* CBreakpoint::lastTriggered = nullptr;
+CBreakpoint* CBreakpoint::firedCondition = nullptr;
+
+int CBreakpoint::FiredConditionIndex(void) {
+	int nr = 0;
+	for (CBreakpoint* bp : BPoints) {
+		if (bp == firedCondition) return nr;
+		nr++;
+	}
+	return -1;
+}
 
 CBreakpoint* CBreakpoint::AddBreakpoint(uint16_t seg, uint32_t off, bool once)
 {
@@ -827,6 +846,7 @@ CBreakpoint* CBreakpoint::AddMemBreakpoint(uint16_t seg, uint32_t off)
 
 void CBreakpoint::ActivateBreakpoints()
 {
+	firedCondition = nullptr;
 	// activate all breakpoints
 	std::list<CBreakpoint*>::iterator i;
 	for (i = BPoints.begin(); i != BPoints.end(); ++i)
@@ -843,6 +863,7 @@ void CBreakpoint::DeactivateBreakpoints()
 
 void CBreakpoint::ActivateBreakpointsExceptAt(PhysPt adr)
 {
+	firedCondition = nullptr;
 	// activate all breakpoints, except those at adr
 	std::list<CBreakpoint*>::iterator i;
 	for (i = BPoints.begin(); i != BPoints.end(); ++i) {
@@ -962,6 +983,7 @@ void CBreakpoint::DeleteAll()
 	}
 	(BPoints.clear)();
 	lastTriggered = nullptr;
+	firedCondition = nullptr;
 }
 
 
@@ -1061,6 +1083,8 @@ bool CBreakpoint::DeleteBreakpoint(CBreakpoint* breakpoint)
 		breakpoint->Activate(false);
 		if (lastTriggered == breakpoint)
 			lastTriggered = nullptr;
+		if (firedCondition == breakpoint)
+			firedCondition = nullptr;
 		delete breakpoint;
 		return true;
 	}
@@ -1169,6 +1193,7 @@ bool CBreakpoint::CheckConditionBreakpoints(void) {
 		if (rose) {
 			DEBUG_ShowMsg("DEBUG: Conditional breakpoint: %s\n", bp->condText.c_str());
 			lastTriggered = bp;
+			firedCondition = bp;
 			return true;
 		}
 	}
@@ -3605,7 +3630,8 @@ bool ParseCommand(char* str) {
 		/* For a client with no screen: whether the machine is stopped, and the register
 		 * window's cc= and pfi=, are otherwise only drawn, never printed. Changes nothing. */
 		DEBUG_ShowMsg("%s\n", DEBUG_RunStateLine(debugging, debug_running,
-			(unsigned long long)cycle_count, (double)PIC_FullIndex(), VGA_FramesStarted).c_str());
+			(unsigned long long)cycle_count, (double)PIC_FullIndex(), VGA_FramesStarted,
+			CBreakpoint::FiredConditionIndex()).c_str());
 		return true;
 	}
 
