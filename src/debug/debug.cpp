@@ -2570,8 +2570,8 @@ void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t va
 		if (t->rows_kept >= TAP_ROWS_MAX || t->rows == NULL) { t->overflow_rows++; continue; }
 		uint32_t data, mask;
 		TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
-		fprintf(t->rows, "r %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, TapBeamLine(),
-			(double)PIC_FullIndex(), cs_now, ip_now, data, mask);
+		fprintf(t->rows, "r %llu %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, VGA_FramesStarted,
+			TapBeamLine(), (double)PIC_FullIndex(), cs_now, ip_now, data, mask);
 		tap_reading_block = true;
 		for (uint32_t i = 0; i < t->block_length; i++) {
 			uint8_t b = 0;
