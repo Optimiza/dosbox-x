@@ -239,6 +239,20 @@ TEST(Presence, DrawsTheArrowInTheGuestsPixelsAsTheOutputScalesThem) {
     EXPECT_EQ(odd.at(15, 18), 0x00FFFFFFu) << "and 5 tall together";
 }
 
+TEST(Presence, AnArrowScaledToNothingLeavesNoEmptySpanToUndraw) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook + " pointer=1 glide=0", error, 0)) << error;
+    const Format f = Rgb32();
+    o.Resize(40, 30, &f);
+    o.Guest(1000, 1000);              /* 0.04 output pixels a guest pixel: every span rounds to 0 */
+    Frame frame(40, 30, 0x00FFFFFFu);
+    const std::vector<uint32_t> clean = frame.px;
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+    o.Undraw(frame.buf(), frame.pitch());
+    EXPECT_EQ(frame.px, clean);
+}
+
 TEST(Presence, TheArrowGlidesToItsNewPlaceEasingOut) {
     Overlay o;
     std::string error;
