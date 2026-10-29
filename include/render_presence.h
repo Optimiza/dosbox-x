@@ -123,6 +123,7 @@ private:
     void Rescale();
     int Band() const;
     /* Where sprite cell `i` starts along an axis, in output pixels. */
+    static float GuestPixel(float fraction, unsigned guest_pixels);
     static int CellEdge(float scale, size_t i) { return (int)std::lround(scale * (float)i); }
     std::vector<Span> Covered(const Key &key) const;
     void Draw(uint8_t *buf, size_t pitch, const Key &key) const;
