@@ -35,9 +35,10 @@ Bitu DEBUG_TakeLoopReturn(void);
 #if C_DEBUG
 /* The line RUNSTATE prints: stopped only while the debugger's own loop holds the
    machine, running while the guest runs, under RUN or RUNWATCH alike; then the
-   register window's cycle count and emulated milliseconds. */
+   register window's cycle count and emulated milliseconds, and the frames the vertical timer
+   has started since power-on. */
 std::string DEBUG_RunStateLine(bool debugging, bool debug_running, unsigned long long cycles,
-                               double ms);
+                               double ms, unsigned long long frames);
 bool DEBUG_AgentStep(bool over, bool* continued);
 bool DEBUG_AgentResumeAfterTerminate(void);
 bool DEBUG_AgentCanStartTarget(void);

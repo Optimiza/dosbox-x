@@ -2111,6 +2111,80 @@ void CAPTURE_MidiEvent(bool pressed) {
 	mainMenu.get_item("mapper_caprawmidi").check(!!(CaptureState & CAPTURE_MIDI)).refresh_item(mainMenu);
 }
 
+#if C_DEBUG && !defined(C_EMSCRIPTEN)
+bool OPL_RawCapturing(void);
+
+static std::string CaptureFullPath(const std::string &path) {
+	if (path.empty()) return "-";
+#if defined(WIN32)
+	char fullpath[MAX_PATH];
+	if (GetFullPathName(path.c_str(), MAX_PATH, fullpath, NULL)) return fullpath;
+#elif defined(HAVE_REALPATH)
+	char fullpath[PATH_MAX];
+	if (realpath(path.c_str(), fullpath) != NULL) return fullpath;
+#endif
+	return path;
+}
+
+struct DebugCaptureKind {
+	const char *name;
+	bool (*active)(void);
+	std::string *path;
+	void (*toggle)(bool pressed);
+};
+
+static bool WaveCapturing(void) { return (CaptureState & CAPTURE_WAVE) != 0; }
+static bool MidiCapturing(void) { return (CaptureState & CAPTURE_MIDI) != 0; }
+#if (C_SSHOT)
+static bool VideoCapturing(void) { return (CaptureState & CAPTURE_VIDEO) != 0; }
+#endif
+
+static const DebugCaptureKind debug_capture_kinds[] = {
+	{"WAV", WaveCapturing, &pathwav, CAPTURE_WaveEvent},
+	{"OPL", OPL_RawCapturing, &pathopl, OPL_SaveRawEvent},
+	{"MIDI", MidiCapturing, &pathmid, CAPTURE_MidiEvent},
+#if (C_SSHOT)
+	{"VIDEO", VideoCapturing, &pathvid, CAPTURE_VideoEvent},
+#endif
+};
+
+static std::string CaptureLine(const DebugCaptureKind &k, bool on, const std::string &path) {
+	return std::string("DEBUG: CAPTURE ") + k.name + (on ? " on" : " off") + " path=" + CaptureFullPath(path);
+}
+
+/* The debugger's CAPTURE: every kind with the file it writes, or one kind turned on or off.
+ * A writer opens its file at its first data, so a kind just turned on names none yet ('-'),
+ * and turning one off names the file it closed: the path is read before the stop clears it.
+ * The "recording completed" message box is modal, so it is held off here, where nobody may
+ * be there to dismiss it. 1: done, 0: no such kind, -1: the kind did not take the change. */
+int CAPTURE_DebugCommand(const char *kind, bool on, std::vector<std::string> &lines) {
+	for (const DebugCaptureKind &k : debug_capture_kinds) {
+		if (kind == NULL) {
+			lines.push_back(CaptureLine(k, k.active(), *k.path));
+			continue;
+		}
+		if (strcmp(kind, k.name) != 0) continue;
+		const std::string before = *k.path;
+		if (k.active() != on) {
+			const bool shown = show_recorded_filename;
+			show_recorded_filename = false;
+			k.toggle(true);
+			show_recorded_filename = shown;
+			/* A WAV turned off before its first data keeps its flag: the writer it would close
+			 * was never opened. */
+			if (!on && k.active() && k.toggle == CAPTURE_WaveEvent && capture.wave.writer == NULL) {
+				CaptureState &= ~((unsigned int)CAPTURE_WAVE);
+				mainMenu.get_item("mapper_recwave").check(false).refresh_item(mainMenu);
+			}
+		}
+		if (k.active() != on) return -1;
+		lines.push_back(CaptureLine(k, on, on ? *k.path : before));
+		return 1;
+	}
+	return kind == NULL ? 1 : 0;
+}
+#endif
+
 void CAPTURE_Destroy(Section *sec) {
     (void)sec;//UNUSED
 	// if capture is active, fake mapper event to "toggle" it off for each capture case.

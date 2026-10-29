@@ -29,6 +29,10 @@ namespace {
 constexpr const char* CONTROL_HOST = "127.0.0.1";
 
 constexpr int SOCKET_POLL_TIMEOUT_MS = 50;
+// A reply leaves only on the I/O loop's next pass, and nothing wakes a thread blocked in
+// SDLNet_CheckSockets, so while a request is still owed its reply the wait is this short:
+// sitting out the idle timeout there would add it to every request's round trip.
+constexpr int SOCKET_POLL_REPLY_OWED_MS = 1;
 constexpr int RECONNECT_DELAY_MS = 1000;
 
 constexpr size_t MAX_INCOMING_MESSAGES = 1024;
@@ -40,6 +44,10 @@ constexpr size_t MAX_RECEIVE_BUFFER = 1024 * 1024;
 
 std::atomic<bool> g_running{false};
 std::atomic<bool> g_connected{false};
+
+// Requests queued or being processed by the emulation thread. It drops only after the
+// request's reply is queued, so seeing it at zero means that reply is already visible.
+std::atomic<int> g_unanswered{0};
 
 uint16_t g_port = 0;
 
@@ -267,10 +275,24 @@ void QueueIncoming(std::string message)
 {
     std::lock_guard<std::mutex> lock(g_incoming_mutex);
 
-    if (g_incoming.size() >= MAX_INCOMING_MESSAGES)
+    const bool full = g_incoming.size() >= MAX_INCOMING_MESSAGES;
+    if (full)
         g_incoming.pop_front();
 
     g_incoming.emplace_back(std::move(message));
+
+    // A request dropped to make room was counted, and the new one takes its count.
+    if (!full)
+        g_unanswered.fetch_add(1);
+}
+
+bool ReplyOwed()
+{
+    if (g_unanswered.load() > 0)
+        return true;
+
+    std::lock_guard<std::mutex> lock(g_outgoing_mutex);
+    return !g_outgoing.empty();
 }
 
 bool PopIncoming(std::string& message)
@@ -416,7 +438,8 @@ void ThreadMain()
         const int ready =
                 SDLNet_CheckSockets(
                         g_socket_set,
-                        SOCKET_POLL_TIMEOUT_MS);
+                        ReplyOwed() ? SOCKET_POLL_REPLY_OWED_MS
+                                    : SOCKET_POLL_TIMEOUT_MS);
 
         if (ready < 0) {
             std::fprintf(stderr,
@@ -601,6 +624,7 @@ void ControlServer_Start(const uint16_t port)
     {
         std::lock_guard<std::mutex> lock(g_incoming_mutex);
         g_incoming.clear();
+        g_unanswered.store(0);
     }
 
     {
@@ -627,6 +651,7 @@ void ControlServer_Stop()
     {
         std::lock_guard<std::mutex> lock(g_incoming_mutex);
         g_incoming.clear();
+        g_unanswered.store(0);
     }
 
     {
@@ -675,6 +700,8 @@ void ControlServer_Poll()
                      "[ControlClient] mcp command %s\n",
                      command.c_str());
 
+        // Counted down on every way out, after the reply is queued.
+        struct Answered { ~Answered() { g_unanswered.fetch_sub(1); } } answered;
         ProcessControlCommand(command);
     }
 }

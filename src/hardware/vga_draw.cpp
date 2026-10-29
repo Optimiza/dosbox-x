@@ -6241,8 +6241,14 @@ extern bool DEBUG_HaltOnRetrace;
 Bitu DEBUG_EnableDebugger(void);
 #endif
 
+/* Every frame the vertical timer starts since power-on, the frame VRT stops at included; a
+ * mode set that restarts the timer starts one too. Not in a save state: it counts this run. */
+unsigned long long VGA_FramesStarted = 0;
+
 static void VGA_VerticalTimer(Bitu /*val*/) {
 	double current_time = PIC_GetCurrentEventTime();
+
+	VGA_FramesStarted++;
 
 #if C_DEBUG
 	if (DEBUG_HaltOnRetrace) {

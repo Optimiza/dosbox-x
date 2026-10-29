@@ -184,6 +184,8 @@ bool MouseTypeNone() {
     return (keyb.ps2mouse.type == MOUSE_NONE);
 }
 
+static void KEYBOARD_AUX_Report(Bitu buttons,int scrollwheel);
+
 /* NTS: INT33H emulation is coded to call this ONLY if it hasn't taken over the role of mouse input */
 void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel) {
     if (IS_PC98_ARCH) {
@@ -197,6 +199,20 @@ void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel) {
         keyb.ps2mouse.acy += y;
     }
 
+    KEYBOARD_AUX_Report(buttons,scrollwheel);
+}
+
+/* Motion the guest injected through the integration device: no host pointer moved, so there is
+ * no capture to wait for. */
+void KEYBOARD_AUX_InjectedMotion(float x,float y,Bitu buttons) {
+    if (IS_PC98_ARCH) return;
+
+    keyb.ps2mouse.acx += x;
+    keyb.ps2mouse.acy += y;
+    KEYBOARD_AUX_Report(buttons,0);
+}
+
+static void KEYBOARD_AUX_Report(Bitu buttons,int scrollwheel) {
     keyb.ps2mouse.l = (buttons & 1)>0;
     keyb.ps2mouse.r = (buttons & 2)>0;
     keyb.ps2mouse.m = (buttons & 4)>0;
