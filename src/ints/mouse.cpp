@@ -262,12 +262,18 @@ static struct {
     uint8_t ps2_unlock_idx;
 } mouse;
 
+unsigned RENDER_SourceWidth(void);
+
 /* Where the guest's pointer is, as a fraction of the range the driver keeps it in (0 to 1
    across, 0 to 1 down), for the presence overlay to draw its arrow at; false when the
    driver is not installed or has no range. */
 bool Mouse_PresencePointer(float &fx, float &fy, unsigned &guest_width, unsigned &guest_height) {
     /* no mode set yet (a parked start) leaves CurMode null */
     guest_width = CurMode != NULL ? (unsigned)CurMode->swidth : 0u;
+    /* an 8-dot text mode keeps the BIOS mode's 9-dot swidth while the render takes 8 dots a cell:
+       the width the picture is scaled from is the render's, or the arrow's columns drop */
+    if (CurMode != NULL && CurMode->type == M_TEXT && RENDER_SourceWidth() != 0)
+        guest_width = RENDER_SourceWidth();
     guest_height = CurMode != NULL ? (unsigned)CurMode->sheight : 0u;
     if (!mouse.enabled) return false;
     const float w = (float)mouse.max_x - (float)mouse.min_x + 1.0f;
