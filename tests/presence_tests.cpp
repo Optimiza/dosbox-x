@@ -250,6 +250,19 @@ TEST(Presence, DrawsTheArrowInTheGuestsPixelsAsTheOutputScalesThem) {
     EXPECT_EQ(odd.at(15, 18), 0x00FFFFFFu) << "and 5 tall together";
 }
 
+TEST(Presence, TheHotSpotSitsOnTheWholeGuestPixelThePointerIsIn) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook + " pointer=1 glide=0", error, 0)) << error;
+    const Format f = Rgb32();
+    o.Resize(40, 30, &f);
+    o.Guest(20, 10);                  /* 2 by 3 output pixels a guest pixel */
+    Frame frame(40, 30, 0x00FFFFFFu);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.275f, 0.5f);  /* guest x 5.5 */
+    EXPECT_EQ(frame.at(10, 15), 0x00000000u) << "guest pixel 5 starts at output x 10, not 11";
+    EXPECT_EQ(frame.at(9, 15), 0x00FFFFFFu);
+}
+
 TEST(Presence, AnArrowScaledToNothingLeavesNoEmptySpanToUndraw) {
     Overlay o;
     std::string error;
