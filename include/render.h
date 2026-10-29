@@ -194,6 +194,8 @@ extern ttf_cell newAttrChar[];					// to be replaced by
 extern Render_ttf ttf;
 #endif
 extern Render_t render;
+/* The width in pixels the scaler reads each line from; 0 before any mode is set. */
+unsigned RENDER_SourceWidth(void);
 extern Bitu last_gfx_flags;
 extern ScalerLineHandler_t RENDER_DrawLine;
 void RENDER_SetSize(Bitu width,Bitu height,Bitu bpp,float fps,double scrn_ratio);
