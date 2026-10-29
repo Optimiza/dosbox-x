@@ -19,6 +19,10 @@
 
 namespace presence {
 
+/* What the bare PRESENCE command announces, so a client can refuse a build older than it
+   expects: 1 was the build that announced nothing. */
+constexpr int PROTOCOL_VERSION = 2;
+
 enum class State { Off, Held, Acting };
 
 /* How the overlay is drawn: everything comes from the client, so the emulator
@@ -95,7 +99,7 @@ public:
     uint64_t frames() const { return frames_; }
     bool drawable() const { return fmt_.bytes != 0 && width_ != 0 && height_ != 0; }
     /* One line for the channel's reply. */
-    std::string Describe() const;
+    std::string Describe(bool with_version = false) const;
 
 private:
     struct Key {

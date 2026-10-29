@@ -71,6 +71,17 @@ TEST(Presence, ReadsTheFormatsOfTheOutputsTheirOwnBlackIncluded) {
     EXPECT_FALSE(presence::FormatFromPixels(1, 0u, 0xE0u, 0x1Cu, 0x03u, f));
 }
 
+TEST(Presence, TheBareCommandAnnouncesItsVersion) {
+    std::vector<std::string> lines;
+    EXPECT_TRUE(PRESENCE_Command("", lines));
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_TRUE(PRESENCE_Command("  ", lines));
+    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_EQ(presence::Overlay().Describe().find("version="), std::string::npos)
+        << "only the bare command announces it";
+}
+
 TEST(Presence, DrawsTheEdgeOnlyAndPresentsTheWholeFrameWhenItMoves) {
     Overlay o;
     std::string error;
