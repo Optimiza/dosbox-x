@@ -37,7 +37,7 @@ struct Frame {
 };
 
 const char *const kLook = " rgb=FF8C00 edge=0.1 steps=2 acting=1 held=0.5 fade=1"
-                          " outline=000000 size=0.2 sprite=Xo/oX";
+                          " outline=000000 sprite=Xo/oX";
 
 TEST(Presence, TakesAStateAndALookAndRefusesWhatItDoesNotKnow) {
     Overlay o;
@@ -71,12 +71,24 @@ TEST(Presence, ReadsTheFormatsOfTheOutputsTheirOwnBlackIncluded) {
     EXPECT_FALSE(presence::FormatFromPixels(1, 0u, 0xE0u, 0x1Cu, 0x03u, f));
 }
 
+TEST(Presence, TheBareCommandAnnouncesItsVersion) {
+    std::vector<std::string> lines;
+    EXPECT_TRUE(PRESENCE_Command("", lines));
+    ASSERT_EQ(lines.size(), 1u);
+    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_TRUE(PRESENCE_Command("  ", lines));
+    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_EQ(presence::Overlay().Describe().find("version="), std::string::npos)
+        << "only the bare command announces it";
+}
+
 TEST(Presence, DrawsTheEdgeOnlyAndPresentsTheWholeFrameWhenItMoves) {
     Overlay o;
     std::string error;
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     const uint16_t *runs = o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     ASSERT_NE(runs, nullptr);
@@ -94,6 +106,7 @@ TEST(Presence, AScalerThatRewritesPartOfALineNeverGetsTheOverlayBlendedTwice) {
     ASSERT_TRUE(o.Configure(std::string("held") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     const uint32_t once = frame.at(0, 5);
@@ -115,6 +128,7 @@ TEST(Presence, AFrameTheScalerNeverOpenedIsRedrawnFromWhatTheOverlayCovered) {
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00445566u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     const uint32_t acting = frame.at(0, 0);
@@ -132,6 +146,7 @@ TEST(Presence, TurnedOffItPutsThePictureBackAndThenStaysOutOfTheWay) {
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00123456u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     ASSERT_NE(frame.at(0, 0), 0x00123456u);
@@ -153,6 +168,7 @@ TEST(Presence, FadesFromActingToHeldOverTheFade) {
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     const uint32_t acting = frame.at(0, 0);
@@ -173,6 +189,7 @@ TEST(Presence, ANewLookRepaintsAndLeavesNoTraceOfTheOldOne) {
     ASSERT_TRUE(o.Configure(std::string("held") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     ASSERT_NE(frame.at(1, 10), 0x00000000u);
@@ -190,6 +207,7 @@ TEST(Presence, DrawsTheArrowAtThePointerOnlyWhenAskedAndMovesIt) {
     ASSERT_TRUE(o.Configure(std::string("held") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00FFFFFFu);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
     EXPECT_EQ(frame.at(10, 10), 0x00FFFFFFu) << "no arrow until the pointer is asked for";
@@ -206,14 +224,68 @@ TEST(Presence, DrawsTheArrowAtThePointerOnlyWhenAskedAndMovesIt) {
     EXPECT_EQ(frame.at(5, 5), 0x00FFFFFFu) << "no driver, no arrow";
 }
 
+TEST(Presence, DrawsTheArrowInTheGuestsPixelsAsTheOutputScalesThem) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook + " pointer=1 glide=0", error, 0)) << error;
+    EXPECT_FALSE(o.Configure("held size=0.2", error, 0)) << "the guest's pixels size it, not a share";
+    const Format f = Rgb32();
+    o.Resize(40, 30, &f);
+    o.Guest(20, 10);                  /* each guest pixel 2 wide and 3 tall */
+    Frame frame(40, 30, 0x00FFFFFFu);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+    EXPECT_EQ(frame.at(21, 17), 0x00000000u) << "the hot spot's cell, 2 x 3";
+    EXPECT_EQ(frame.at(22, 15), 0x00FF8C00u) << "the fill starts one guest pixel right";
+    EXPECT_EQ(frame.at(20, 18), 0x00FF8C00u) << "and one guest pixel down";
+    EXPECT_EQ(frame.at(24, 15), 0x00FFFFFFu) << "two guest pixels wide, no more";
+    o.Resize(30, 25, &f);
+    o.Guest(20, 10);                  /* 1.5 by 2.5: the cells take turns */
+    Frame odd(30, 25, 0x00FFFFFFu);
+    o.Compose(odd.buf(), odd.pitch(), nullptr, 0, true, 0.5f, 0.5f);   /* hot spot at 15,13 */
+    EXPECT_EQ(odd.at(16, 15), 0x00000000u);
+    EXPECT_EQ(odd.at(17, 13), 0x00FF8C00u) << "the first cell is 2 wide";
+    EXPECT_EQ(odd.at(15, 16), 0x00FF8C00u) << "and 3 tall";
+    EXPECT_EQ(odd.at(17, 17), 0x00000000u);
+    EXPECT_EQ(odd.at(18, 17), 0x00FFFFFFu) << "the two cells are 3 wide together";
+    EXPECT_EQ(odd.at(15, 18), 0x00FFFFFFu) << "and 5 tall together";
+}
+
+TEST(Presence, TheHotSpotSitsOnTheWholeGuestPixelThePointerIsIn) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook + " pointer=1 glide=0", error, 0)) << error;
+    const Format f = Rgb32();
+    o.Resize(40, 30, &f);
+    o.Guest(20, 10);                  /* 2 by 3 output pixels a guest pixel */
+    Frame frame(40, 30, 0x00FFFFFFu);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.275f, 0.5f);  /* guest x 5.5 */
+    EXPECT_EQ(frame.at(10, 15), 0x00000000u) << "guest pixel 5 starts at output x 10, not 11";
+    EXPECT_EQ(frame.at(9, 15), 0x00FFFFFFu);
+}
+
+TEST(Presence, AnArrowScaledToNothingLeavesNoEmptySpanToUndraw) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook + " pointer=1 glide=0", error, 0)) << error;
+    const Format f = Rgb32();
+    o.Resize(40, 30, &f);
+    o.Guest(1000, 1000);              /* 0.04 output pixels a guest pixel: every span rounds to 0 */
+    Frame frame(40, 30, 0x00FFFFFFu);
+    const std::vector<uint32_t> clean = frame.px;
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+    o.Undraw(frame.buf(), frame.pitch());
+    EXPECT_EQ(frame.px, clean);
+}
+
 TEST(Presence, TheArrowGlidesToItsNewPlaceEasingOut) {
     Overlay o;
     std::string error;
     ASSERT_TRUE(o.Configure("held rgb=FF8C00 edge=0.01 steps=1 acting=1 held=0.5 fade=1"
-                            " outline=000000 size=0.2 sprite=Xo/oX pointer=1 glide=0.2", error, 0))
+                            " outline=000000 sprite=Xo/oX pointer=1 glide=0.2", error, 0))
         << error;
     const Format f = Rgb32();
     o.Resize(100, 100, &f);
+    o.Guest(10, 10);
     Frame frame(100, 100, 0x00FFFFFFu);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.2f, 0.2f);
     EXPECT_EQ(frame.at(20, 20), 0x00000000u) << "the first arrow appears where it is";
@@ -235,6 +307,7 @@ TEST(Presence, DrawsOnASixteenBitOutputWithAPitchWiderThanItsRows) {
     Format f;
     ASSERT_TRUE(presence::FormatFromPixels(2, 0u, 0xF800u, 0x07E0u, 0x001Fu, f));
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     const size_t pitch = 64;                       /* 40 bytes of row, 24 of padding */
     std::vector<uint8_t> buf(pitch * 20, 0x00);
     std::memset(&buf[pitch * 10 + 40], 0xAB, 24);
@@ -250,6 +323,7 @@ TEST(Presence, AnOutputItCannotDrawOnIsLeftAlone) {
     std::string error;
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     o.Resize(20, 20, nullptr);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     const uint16_t changed[] = {0, 20};
     EXPECT_EQ(o.Compose(frame.buf(), frame.pitch(), changed, 0, false, 0, 0), changed);
@@ -266,6 +340,7 @@ TEST(Presence, AFrameDrawnButNeverShownIsDrawnAgain) {
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0, false);
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0)) << "an aborted frame showed nothing";
@@ -279,6 +354,7 @@ TEST(Presence, TheSameLookSentAgainIsNotANewOne) {
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook, error, 0));
     const Format f = Rgb32();
     o.Resize(20, 20, &f);
+    o.Guest(10, 10);
     Frame frame(20, 20, 0x00000000u);
     const uint16_t changed[] = {0, 20};
     o.Compose(frame.buf(), frame.pitch(), changed, 0, false, 0, 0);

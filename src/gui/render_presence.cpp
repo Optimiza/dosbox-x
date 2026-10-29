@@ -121,7 +121,6 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "acting") ok = ParseFloat(value, 0.0f, 1.0f, look.acting);
         else if (key == "held") ok = ParseFloat(value, 0.0f, 1.0f, look.held);
         else if (key == "fade") ok = ParseFloat(value, 0.0f, 60.0f, look.fade);
-        else if (key == "size") ok = ParseFloat(value, 0.001f, 0.5f, look.size);
         else if (key == "glide") ok = ParseFloat(value, 0.0f, 5.0f, look.glide);
         else if (key == "steps") {
             float steps = 0;
@@ -164,6 +163,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
 void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     width_ = width;
     height_ = height;
+    Rescale();
     fmt_ = fmt ? *fmt : Format();
     for (int i = 0; i < 3; i++) {
         to8_[i].clear();
@@ -183,15 +183,31 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     full_.assign({0, (uint16_t)std::min(height, 65535u)});
 }
 
+void Overlay::Guest(unsigned width, unsigned height) {
+    if (width == guest_width_ && height == guest_height_) return;
+    guest_width_ = width;
+    guest_height_ = height;
+    Rescale();
+    look_generation_++;              /* the arrow's size changed: repaint it whole */
+}
+
+void Overlay::Rescale() {
+    scale_x_ = guest_width_ ? (float)width_ / (float)guest_width_ : 1.0f;
+    scale_y_ = guest_height_ ? (float)height_ / (float)guest_height_ : 1.0f;
+}
+
 int Overlay::Band() const {
     const float side = (float)std::min(width_, height_);
     return std::max(1, (int)std::lround(look_.edge * side));
 }
 
-int Overlay::ArrowScale() const {
-    if (look_.sprite.empty()) return 1;
-    const float side = (float)std::min(width_, height_);
-    return std::max(1, (int)std::lround(look_.size * side / (float)look_.sprite.size()));
+/* The pointer's fraction snapped to the top-left of the guest pixel it is in: the guest's cursor
+   sits on a whole guest pixel, while the driver's range can be finer (mode 13h halves its x). */
+float Overlay::GuestPixel(float fraction, unsigned guest_pixels) {
+    fraction = std::min(std::max(fraction, 0.0f), 1.0f);
+    if (guest_pixels == 0) return fraction;
+    const float cell = std::min(std::floor(fraction * (float)guest_pixels), (float)(guest_pixels - 1));
+    return cell / (float)guest_pixels;
 }
 
 Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float fy) const {
@@ -208,7 +224,7 @@ Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float 
     k.arrow = pointer_ && have_pointer && !look_.sprite.empty();
     if (k.arrow) {
         float x = 0, y = 0;
-        ArrowAt(now_ms, std::min(std::max(fx, 0.0f), 1.0f), std::min(std::max(fy, 0.0f), 1.0f), x, y);
+        ArrowAt(now_ms, GuestPixel(fx, guest_width_), GuestPixel(fy, guest_height_), x, y);
         k.ax = (int)std::lround(x * (float)width_);
         k.ay = (int)std::lround(y * (float)height_);
     }
@@ -252,10 +268,13 @@ std::vector<Overlay::Span> Overlay::Covered(const Key &key) const {
         }
     }
     if (key.arrow) {
-        const unsigned k = (unsigned)ArrowScale();
-        const unsigned rows = (unsigned)look_.sprite.size() * k, cols = (unsigned)look_.sprite[0].size() * k;
-        for (unsigned y = (unsigned)key.ay; y < std::min(h, (unsigned)key.ay + rows); y++)
-            if ((unsigned)key.ax < w) spans.push_back({y, (unsigned)key.ax, std::min(w, (unsigned)key.ax + cols)});
+        const unsigned rows = (unsigned)CellEdge(scale_y_, look_.sprite.size());
+        const unsigned cols = (unsigned)CellEdge(scale_x_, look_.sprite[0].size());
+        /* a scale so small a span rounds to nothing leaves no span: an empty one would make
+           Undraw index under_ at its end */
+        if (cols > 0)
+            for (unsigned y = (unsigned)key.ay; y < std::min(h, (unsigned)key.ay + rows); y++)
+                if ((unsigned)key.ax < w) spans.push_back({y, (unsigned)key.ax, std::min(w, (unsigned)key.ax + cols)});
     }
     return spans;
 }
@@ -301,15 +320,14 @@ void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
         }
     }
     if (!key.arrow) return;
-    const int k = ArrowScale();
     const uint32_t fill = Pixel(look_.rgb), outline = Pixel(look_.outline);
     for (size_t r = 0; r < look_.sprite.size(); r++) {
         const std::string &line = look_.sprite[r];
         for (size_t c = 0; c < line.size(); c++) {
             if (line[c] == '.') continue;
             const uint32_t px = line[c] == 'X' ? outline : fill;
-            for (int y = key.ay + (int)r * k; y < key.ay + ((int)r + 1) * k && y < h; y++)
-                for (int x = key.ax + (int)c * k; x < key.ax + ((int)c + 1) * k && x < w; x++)
+            for (int y = key.ay + CellEdge(scale_y_, r); y < key.ay + CellEdge(scale_y_, r + 1) && y < h; y++)
+                for (int x = key.ax + CellEdge(scale_x_, c); x < key.ax + CellEdge(scale_x_, c + 1) && x < w; x++)
                     WritePixel(buf + (size_t)y * pitch + (size_t)x * bytes, bytes, px);
         }
     }
@@ -322,6 +340,7 @@ void Overlay::Undraw(uint8_t *buf, size_t pitch) {
     /* backwards, so where two spans overlap the first one saved, from the clean buffer, wins */
     for (auto s = covered_.rbegin(); s != covered_.rend(); ++s) {
         const size_t n = (size_t)(s->x1 - s->x0) * bytes;
+        if (n == 0) continue;
         at -= n;
         std::memcpy(buf + (size_t)s->y * pitch + (size_t)s->x0 * bytes, &under_[at], n);
     }
@@ -351,7 +370,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
     return moved ? full_.data() : changed;
 }
 
-std::string Overlay::Describe() const {
+std::string Overlay::Describe(bool with_version) const {
     char line[160];
     /* `none` while there is no output yet, `undrawable` for one it cannot draw
        on (8-bit, TrueType text): a client tells "not yet" from "never here" */
@@ -363,7 +382,9 @@ std::string Overlay::Describe() const {
         std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%s",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0,
                       width_ != 0 && height_ != 0 ? "undrawable" : "none");
-    return line;
+    std::string text = line;
+    if (with_version) text += " version=" + std::to_string(PROTOCOL_VERSION);
+    return text;
 }
 
 Overlay &Instance() {
@@ -385,6 +406,10 @@ bool Idle() {
 
 bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines) {
     std::string error;
+    if (args.find_first_not_of(" \t\r\n") == std::string::npos) {
+        lines.assign(1, presence::Instance().Describe(true));
+        return true;
+    }
     if (!presence::Instance().Configure(args, error, (uint32_t)GetTicks())) {
         lines.assign(1, error);
         return false;
@@ -409,7 +434,9 @@ const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *ch
                                   bool shown) {
     if (Idle()) return changed;
     float fx = 0, fy = 0;
-    const bool pointer = Mouse_PresencePointer(fx, fy);
+    unsigned guest_width = 0, guest_height = 0;
+    const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
+    presence::Instance().Guest(guest_width, guest_height);
     return presence::Instance().Compose(buf, pitch, changed, (uint32_t)GetTicks(), pointer, fx, fy,
                                         shown);
 }
@@ -417,7 +444,9 @@ const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *ch
 bool PRESENCE_WantsRepaint() {
     if (Idle()) return false;
     float fx = 0, fy = 0;
-    const bool pointer = Mouse_PresencePointer(fx, fy);
+    unsigned guest_width = 0, guest_height = 0;
+    const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
+    presence::Instance().Guest(guest_width, guest_height);
     return presence::Instance().NeedsRepaint((uint32_t)GetTicks(), pointer, fx, fy);
 }
 

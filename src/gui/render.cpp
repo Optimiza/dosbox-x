@@ -93,6 +93,10 @@ bool scalerSourceCacheBufferAlloc(unsigned int p,unsigned int h) {
 }
 
 Render_t                                render;
+
+unsigned RENDER_SourceWidth(void) {
+	return (unsigned)render.src.width;
+}
 int                                     eurAscii = -1;
 int                                     aspect_ratio_x = 0;
 int                                     aspect_ratio_y = 0;
