@@ -201,6 +201,15 @@ int Overlay::Band() const {
     return std::max(1, (int)std::lround(look_.edge * side));
 }
 
+/* The pointer's fraction snapped to the top-left of the guest pixel it is in: the guest's cursor
+   sits on a whole guest pixel, while the driver's range can be finer (mode 13h halves its x). */
+float Overlay::GuestPixel(float fraction, unsigned guest_pixels) {
+    fraction = std::min(std::max(fraction, 0.0f), 1.0f);
+    if (guest_pixels == 0) return fraction;
+    const float cell = std::min(std::floor(fraction * (float)guest_pixels), (float)(guest_pixels - 1));
+    return cell / (float)guest_pixels;
+}
+
 Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float fy) const {
     Key k;
     k.state = state_;
@@ -215,7 +224,7 @@ Overlay::Key Overlay::KeyAt(uint32_t now_ms, bool have_pointer, float fx, float 
     k.arrow = pointer_ && have_pointer && !look_.sprite.empty();
     if (k.arrow) {
         float x = 0, y = 0;
-        ArrowAt(now_ms, std::min(std::max(fx, 0.0f), 1.0f), std::min(std::max(fy, 0.0f), 1.0f), x, y);
+        ArrowAt(now_ms, GuestPixel(fx, guest_width_), GuestPixel(fy, guest_height_), x, y);
         k.ax = (int)std::lround(x * (float)width_);
         k.ay = (int)std::lround(y * (float)height_);
     }
