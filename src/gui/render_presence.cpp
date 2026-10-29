@@ -261,8 +261,11 @@ std::vector<Overlay::Span> Overlay::Covered(const Key &key) const {
     if (key.arrow) {
         const unsigned rows = (unsigned)CellEdge(scale_y_, look_.sprite.size());
         const unsigned cols = (unsigned)CellEdge(scale_x_, look_.sprite[0].size());
-        for (unsigned y = (unsigned)key.ay; y < std::min(h, (unsigned)key.ay + rows); y++)
-            if ((unsigned)key.ax < w) spans.push_back({y, (unsigned)key.ax, std::min(w, (unsigned)key.ax + cols)});
+        /* a scale so small a span rounds to nothing leaves no span: an empty one would make
+           Undraw index under_ at its end */
+        if (cols > 0)
+            for (unsigned y = (unsigned)key.ay; y < std::min(h, (unsigned)key.ay + rows); y++)
+                if ((unsigned)key.ax < w) spans.push_back({y, (unsigned)key.ax, std::min(w, (unsigned)key.ax + cols)});
     }
     return spans;
 }
@@ -328,6 +331,7 @@ void Overlay::Undraw(uint8_t *buf, size_t pitch) {
     /* backwards, so where two spans overlap the first one saved, from the clean buffer, wins */
     for (auto s = covered_.rbegin(); s != covered_.rend(); ++s) {
         const size_t n = (size_t)(s->x1 - s->x0) * bytes;
+        if (n == 0) continue;
         at -= n;
         std::memcpy(buf + (size_t)s->y * pitch + (size_t)s->x0 * bytes, &under_[at], n);
     }
