@@ -361,7 +361,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
     return moved ? full_.data() : changed;
 }
 
-std::string Overlay::Describe() const {
+std::string Overlay::Describe(bool with_version) const {
     char line[160];
     /* `none` while there is no output yet, `undrawable` for one it cannot draw
        on (8-bit, TrueType text): a client tells "not yet" from "never here" */
@@ -373,7 +373,9 @@ std::string Overlay::Describe() const {
         std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%s",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0,
                       width_ != 0 && height_ != 0 ? "undrawable" : "none");
-    return line;
+    std::string text = line;
+    if (with_version) text += " version=" + std::to_string(PROTOCOL_VERSION);
+    return text;
 }
 
 Overlay &Instance() {
@@ -395,6 +397,10 @@ bool Idle() {
 
 bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines) {
     std::string error;
+    if (args.find_first_not_of(" \t\r\n") == std::string::npos) {
+        lines.assign(1, presence::Instance().Describe(true));
+        return true;
+    }
     if (!presence::Instance().Configure(args, error, (uint32_t)GetTicks())) {
         lines.assign(1, error);
         return false;

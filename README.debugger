@@ -315,6 +315,10 @@ key, or a value out of its range, answers ERR naming it and changes nothing;
 as for any command that returns an error, the response then ends with the
 `*** Debugger command not recognized` line. The arguments keep their case.
 
+The bare command, `PRESENCE` with no state, changes nothing and answers the same line
+with `version=2` appended, so a client can refuse a build that announces no version
+(version 1 was implicit).
+
 The overlay is drawn into the scaled output just before it is presented, after
 the frame was handed to capture: screenshots, video capture and the VGA memory
 never contain it. The scaler writes that output in place, rewriting only what
