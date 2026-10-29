@@ -348,7 +348,7 @@ BP <seg> <off>                              Add breakpoint (real mode)
 BPM <seg> <off>                             Add breakpoint (protected mode)
 BPPM <seg> <off>                            Add memory-change breakpoint (protected mode)
 BPLM <offset>                               Add breakpoint (linear/virtual address)
-BPIF <reg><op><value> [&& ...]             Add breakpoint that stops when up to four register conditions hold
+BPIF <reg><op><value> [&& ...]             Add breakpoint that stops when up to four register conditions come true
 BPINT <intnum>                              Add breakpoint on interrupt
 BPINT <intnum> <value>                      Add breakpoint on interrupt and AH=<value>
 BPLIST                                      List breakpoints

@@ -36,9 +36,9 @@ Bitu DEBUG_TakeLoopReturn(void);
 /* The line RUNSTATE prints: stopped only while the debugger's own loop holds the
    machine, running while the guest runs, under RUN or RUNWATCH alike; then the
    register window's cycle count and emulated milliseconds, and the frames the vertical timer
-   has started since power-on. */
+   has started since power-on; a stop made by a BPIF row adds that row's BPLIST number (bpif=). */
 std::string DEBUG_RunStateLine(bool debugging, bool debug_running, unsigned long long cycles,
-                               double ms, unsigned long long frames);
+                               double ms, unsigned long long frames, int fired_bpif = -1);
 bool DEBUG_AgentStep(bool over, bool* continued);
 bool DEBUG_AgentResumeAfterTerminate(void);
 bool DEBUG_AgentCanStartTarget(void);
