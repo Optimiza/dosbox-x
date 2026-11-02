@@ -106,7 +106,29 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 	used_save_info_dynrec++;
 
 	decode.cycles=0;
+	// A block is limited by its opcode count, but what it may emit is limited by the size of the
+	// cache block it was opened in (CACHE_MAXSIZE, or what the free blocks around it merged to).
+	// Opcodes that carry exception checks emit a stub each when the block closes, so a run of them
+	// can need more than that size. Stop while three of the largest opcodes seen in this block (the
+	// next one and the closing code) and the stubs owed, plus those one more opcode may add, all
+	// still fit. The reserve is an estimate from this block's own opcodes, not a proof.
+	bool started=false,sti_shadow=false;
+	Bitu op_bytes_max=0,op_stubs_max=0,op_stubs=0;
+	const uint8_t* op_pos=nullptr;
 	while (max_opcodes--) {
+		if (started) {
+			const Bitu bytes=(Bitu)(cache.pos-op_pos);
+			if (bytes>op_bytes_max) op_bytes_max=bytes;
+			const Bitu stubs=used_save_info_dynrec-op_stubs;
+			if (stubs>op_stubs_max) op_stubs_max=stubs;
+			const Bitu used=(Bitu)(cache.pos-decode.block->cache.start);
+			// the opcode after an STI is always decoded: the interrupt it enables waits for it
+			if (!sti_shadow && used+3*op_bytes_max+(used_save_info_dynrec+op_stubs_max+1)*dyn_stub_bytes_max>decode.block->cache.size) break;
+		}
+		sti_shadow=false;
+		op_pos=cache.pos;
+		op_stubs=used_save_info_dynrec;
+		started=true;
 		// Init prefixes
 		decode.big_addr=cpu.code.big;
 		decode.big_op=cpu.code.big;
@@ -656,6 +678,7 @@ restart_prefix:
 			gen_call_function_raw(CPU_STI);
 			dyn_check_exception(FC_RETOP);
 			max_opcodes=1;		//Allow 1 extra opcode
+			sti_shadow=true;
 			break;
 
 		case 0xfc:		//CLD

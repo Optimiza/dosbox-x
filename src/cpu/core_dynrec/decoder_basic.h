@@ -652,10 +652,16 @@ static void dyn_run_code(void) {
 	gen_return_function();
 }
 
+// the largest out-of-line stub dyn_fill_blocks has emitted so far, in bytes, starting at a floor;
+// a block's stubs are only turned into code when it closes, so the decoder reserves room for them
+// while it is still decoding (see CreateCacheBlock)
+static Bitu dyn_stub_bytes_max=64;
+
 // fill in code at the end of the block that contains rarely-executed code
 // which is executed conditionally (like exceptions)
 static void dyn_fill_blocks(void) {
 	for (Bitu sct=0; sct<used_save_info_dynrec; sct++) {
+		const uint8_t* const stub_start=cache.pos;
 		gen_fill_branch_long(save_info_dynrec[sct].branch_pos);
 		switch (save_info_dynrec[sct].type) {
 			case db_exception:
@@ -688,6 +694,8 @@ static void dyn_fill_blocks(void) {
 				dyn_return(BR_Cycles);
 				break;
 		}
+		const Bitu stub_bytes=(Bitu)(cache.pos-stub_start);
+		if (stub_bytes>dyn_stub_bytes_max) dyn_stub_bytes_max=stub_bytes;
 	}
 	used_save_info_dynrec=0;
 }
