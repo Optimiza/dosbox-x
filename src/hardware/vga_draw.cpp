@@ -7164,6 +7164,7 @@ void VGA_DebugRedraw(void) {
 		PIC_RemoveEvents(VGA_DisplayStartLatch);
 		VGA_DisplayStartLatch(0);
 		VGA_VerticalTimer(0);
+		VGA_FramesStarted--;	// a redraw while stopped is not a frame the guest ran
 	}
 #endif
 }
