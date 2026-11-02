@@ -179,6 +179,7 @@ static void DrawInput(void);
 static void DEBUG_RaiseTimerIrq(void);
 static void SaveMemory(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num);
 static void SaveMemoryBin(const char *filename, uint16_t seg, uint32_t ofs1, uint32_t num);
+static void SaveMemoryLinear(const char *filename, uint32_t linear, uint32_t num);
 static void LogDEVS(void);
 static void LogMCBS(void);
 static void LogGDT(void);
@@ -2183,6 +2184,14 @@ void VGA_DumpFontRamBIN(const char *filename);
 void VGA_DumpFontRamBMP(const char *filename);
 int32_t DEBUG_Run(int32_t amount,bool quickexit);
 
+static bool ParseMemoryDumpLength(char *&found, uint32_t &num) {
+	bool parsed = false;
+	num = GetHexValue(found,found,&parsed);
+	if (!parsed || (*found != '\0' && *found != ' ')) return false;
+	SkipSpace(found);
+	return true;
+}
+
 static bool ParseMemoryDumpArguments(char *&found, uint16_t &seg, uint32_t &ofs, uint32_t &num) {
 	bool parsed = false;
 	uint32_t segment = GetHexValue(found,found,&parsed);
@@ -2196,11 +2205,7 @@ static bool ParseMemoryDumpArguments(char *&found, uint16_t &seg, uint32_t &ofs,
 	ofs = GetHexValue(found,found,&parsed);
 	if (!parsed || *found != ' ') return false;
 	SkipSpace(found);
-
-	num = GetHexValue(found,found,&parsed);
-	if (!parsed || (*found != '\0' && *found != ' ')) return false;
-	SkipSpace(found);
-	return true;
+	return ParseMemoryDumpLength(found,num);
 }
 
 /* The argument of a debugger command as it was typed. ParseCommand upper-cases its own copy,
@@ -2387,6 +2392,32 @@ bool ParseCommand(char* str) {
 			return true;
 		}
 		SaveMemoryBin(*found ? found : "MEMDUMP.BIN",seg,ofs,num);
+		return true;
+	}
+
+	if (command == "MEMDUMPLIN") { // Dump memory by linear address, through the page tables of CR3
+		bool parsed = false;
+		uint32_t num = 0;
+		uint32_t linear = GetHexValue(found,found,&parsed);
+		if (!parsed || *found != ' ') {
+			DEBUG_ShowMsg("DEBUG: Invalid memory dump arguments. Usage: MEMDUMPLIN linear len [filename].\n");
+			return true;
+		}
+		SkipSpace(found);
+		if (!ParseMemoryDumpLength(found,num)) {
+			DEBUG_ShowMsg("DEBUG: Invalid memory dump arguments. Usage: MEMDUMPLIN linear len [filename].\n");
+			return true;
+		}
+		if ((uint64_t)linear + num > 0x100000000ull) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMPLIN %08X + %X runs past the end of the 32-bit linear space.\n",linear,num);
+			return true;
+		}
+		/* ParseCommand upper-cases its own copy, which a file name does not survive on a case-sensitive file system. */
+		const std::string typed = RawCommandArgument(str);
+		const size_t tail = strlen(found);
+		const std::string filename = !*found ? std::string("MEMDUMP.BIN") :
+			(tail <= typed.size() ? typed.substr(typed.size() - tail) : std::string(found));
+		SaveMemoryLinear(filename.c_str(),linear,num);
 		return true;
 	}
 
@@ -4576,6 +4607,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("EMU MEM/MACHINE           - Show emulator memory or machine info.\n");
 		DEBUG_ShowMsg("MEMDUMP seg:off len [filename] - Write memory to a text file (default: MEMDUMP.TXT).\n");
 		DEBUG_ShowMsg("MEMDUMPBIN seg:off len [filename] - Write memory to a binary file (default: MEMDUMP.BIN).\n");
+		DEBUG_ShowMsg("MEMDUMPLIN linear len [filename] - Write memory by linear address, through the page tables CR3 last loaded (paging on or off; nothing until a DPMI host loaded them).\n");
         DEBUG_ShowMsg("MEMFIND [seg]:[off] [.].. - Start memory find search instance.\n");
 		DEBUG_ShowMsg("MEMS [operator] [value]   - Search value within instance.\n");
 		DEBUG_ShowMsg("SELINFO [segName]         - Show selector info.\n");
@@ -6666,6 +6698,56 @@ static void SaveMemoryBin(const char *filename, uint16_t seg, uint32_t ofs1, uin
 	for (uint32_t x = 0; x < num; ++x) {
 		uint8_t value = 0;
 		mem_readb_checked(address++, &value);
+		file.write((const char*)&value, sizeof(value));
+		if (!file) {
+			DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
+			return;
+		}
+	}
+
+	file.close();
+	DEBUG_ShowMsg("DEBUG: Memory dump binary success.\n");
+}
+
+/* A linear address through the page tables CR3 last loaded, with paging on or off: a real-mode
+ * stop inside a DPMI program's callback still holds that program's tables, which `paging.enabled`
+ * hides. The tables live in RAM, and phys_readd answers 0xFFFFFFFF past it, which would read as a
+ * present entry; a 4 MB page (when the CPU honours PS) is not walked. */
+static bool ReadTableEntry(PhysPt addr, X86PageEntry &entry) {
+	if (MemSize < 4u || addr > MemSize - 4u) return false;
+	entry.load = phys_readd(addr);
+	return true;
+}
+
+static bool LinearToPhysical(uint32_t linear, PhysPt &phys) {
+	/* No page tables were ever loaded: the base is 0 and the "directory" would be the interrupt vector table. */
+	if (paging.cr3 == 0) return false;
+	X86PageEntry table;
+	if (!ReadTableEntry((PhysPt)((paging.base.page << 12u) + (linear >> 22u) * 4u), table) || !table.block.p)
+		return false;
+	if (do_pse && table.dirblock.ps) return false;
+	X86PageEntry entry;
+	if (!ReadTableEntry((PhysPt)((table.block.base << 12u) + ((linear >> 12u) & 0x3ffu) * 4u), entry) || !entry.block.p)
+		return false;
+	phys = (PhysPt)((entry.block.base << 12u) | (linear & 0xfffu));
+	return true;
+}
+
+static void SaveMemoryLinear(const char *filename, uint32_t linear, uint32_t num) {
+	std::ofstream file(filename, std::ios::binary);
+	if (!file.is_open()) {
+		DEBUG_ShowMsg("DEBUG: Unable to open %s for writing.\n", filename);
+		return;
+	}
+
+	for (uint32_t x = 0; x < num; ++x) {
+		PhysPt phys = 0;
+		if (!LinearToPhysical(linear + x, phys)) {
+			DEBUG_ShowMsg("DEBUG: Linear address %08X is not mapped by a present 4 KB page of CR3's tables.\n", linear + x);
+			DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
+			return;
+		}
+		uint8_t value = physdev_readb(phys);
 		file.write((const char*)&value, sizeof(value));
 		if (!file) {
 			DEBUG_ShowMsg("DEBUG: Memory binary dump failed.\n");
