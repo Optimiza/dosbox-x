@@ -185,6 +185,11 @@ stops at the start of the next one, already counted, so a client that runs N
 mode set that restarts the timer starts a frame too. It is not saved in a save
 state, so after `LOADSTATE` it goes on counting this run's frames.
 
+A stop made by a `BPIF` row (a breakpoint on a register condition) adds
+` bpif=NN` to the `stopped` line: the row's number as `BPLIST` shows it, in
+hex. It stays until the machine runs again, or a single step is taken, or the
+row is deleted.
+
 Single-step command
 -------------------
 
