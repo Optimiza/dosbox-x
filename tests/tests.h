@@ -32,6 +32,7 @@
 #include "agent/agent_transport_tests.cpp"
 #include "debugger_runstate_tests.cpp"
 #include "debugger_bpif_tests.cpp"
+#include "debugger_tap_tests.cpp"
 
 #else
 //google test code causes problem on win9x, remove them and add empty implementations for linkage.
