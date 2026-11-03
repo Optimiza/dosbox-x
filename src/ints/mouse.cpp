@@ -873,10 +873,14 @@ static void Mouse_CountMickeys(float dx, float dy) {
     else if (mouse.mickey_y <= -32769) mouse.mickey_y += 65536;
 }
 
-/* Motion the guest asks for through the integration device, in the driver's units. It reaches
- * what a captured host mouse's motion reaches (a PS/2 mouse the guest drives, else the motion
- * counters and the position), whether or not anyone captured the host mouse: no host pointer is
- * involved, so the capture that guards host motion has nothing to guard. */
+/* Motion the guest asks for through the integration device, one unit being one count of a PS/2
+ * mouse, or one pixel of position for the INT 33h driver, which counts the mickeys its own
+ * mickey-to-pixel ratio makes of it; positive X to the right and positive Y downwards as the driver
+ * counts. It reaches a PS/2 mouse the guest drives, else the motion counters and the
+ * position, whether or not anyone captured the host mouse: no host pointer is involved, so the
+ * capture that guards host motion has nothing to guard. A serial mouse and the PC-98 mouse port
+ * are not reached. A PS/2 mouse that is not reporting, or whose 8042 buffer has no room for a
+ * packet, drops the motion, as it drops host motion. */
 void Mouse_InjectMotion(int dx, int dy) {
     if (dx == 0 && dy == 0) return;
 

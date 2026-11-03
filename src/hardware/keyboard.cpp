@@ -207,9 +207,17 @@ void KEYBOARD_AUX_Event(float x,float y,Bitu buttons,int scrollwheel) {
 void KEYBOARD_AUX_InjectedMotion(float x,float y,Bitu buttons) {
     if (IS_PC98_ARCH) return;
 
-    keyb.ps2mouse.acx += x;
-    keyb.ps2mouse.acy += y;
+    /* The report scales the accumulated motion by the resolution and divides it by 16, as it does
+     * for host motion; undoing that makes one unit asked for one count reported. */
+    const float per_count = 16.0f / (float)(1 << keyb.ps2mouse.resolution);
+    keyb.ps2mouse.acx += x * per_count;
+    keyb.ps2mouse.acy += y * per_count;
     KEYBOARD_AUX_Report(buttons,0);
+
+    /* What was not reported is dropped: kept, it would be scaled by whatever resolution the guest
+     * sets before the next report, and not by the one it was undone with. */
+    keyb.ps2mouse.acx = 0;
+    keyb.ps2mouse.acy = 0;
 }
 
 static void KEYBOARD_AUX_Report(Bitu buttons,int scrollwheel) {
