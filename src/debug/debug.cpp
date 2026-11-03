@@ -2516,7 +2516,7 @@ static std::vector<TapPageHandler*> tap_handlers;
 static unsigned int tap_next_id = 1;
 
 /* The value and byte enables of the part of an access at `at` that lands in the dword `dword`. */
-static void TapLanes(PhysPt at, unsigned int width, uint32_t value, PhysPt dword, uint32_t &data, uint32_t &mask) {
+void DEBUG_TapLanes(PhysPt at, unsigned int width, uint32_t value, PhysPt dword, uint32_t &data, uint32_t &mask) {
 	data = mask = 0;
 	for (unsigned int i = 0; i < width; i++) {
 		const PhysPt byte = at + i;
@@ -2552,7 +2552,7 @@ void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t va
 			const PhysPt from = std::max(at, t->start) & ~(PhysPt)3u;
 			for (PhysPt dword = from; dword <= std::min(last, t->start + t->length - 1u); dword += 4u) {
 				uint32_t data, mask;
-				TapLanes(at, width, value, dword, data, mask);
+				DEBUG_TapLanes(at, width, value, dword, data, mask);
 				t->total++;
 				const auto key = std::make_pair((uint32_t)dword, std::make_pair(data, mask));
 				auto v = t->values.find(key);
@@ -2570,7 +2570,7 @@ void TapPageHandler::Hit(char side, PhysPt addr, unsigned int width, uint32_t va
 		t->total++;
 		if (t->rows_kept >= TAP_ROWS_MAX || t->rows == NULL) { t->overflow_rows++; continue; }
 		uint32_t data, mask;
-		TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
+		DEBUG_TapLanes(at, width, value, t->start & ~(PhysPt)3u, data, mask);
 		fprintf(t->rows, "r %llu %ld %.9f %04X %08X %08X %08X ", t->rows_kept + 1ull, TapBeamLine(),
 			(double)PIC_FullIndex(), cs_now, ip_now, data, mask);
 		tap_reading_block = true;
@@ -2660,13 +2660,11 @@ static void TapRemove(MemTap *t) {
 	delete t;
 }
 
-/* `ParseCommand` upper-cases the whole line, so a filename is taken back from the line as typed:
- * the same number of characters, counted from its end. */
-static std::string OriginalCaseTail(const char *typed, const char *upper_tail) {
-	std::string line(typed);
-	while (!line.empty() && isspace((unsigned char)line.back())) line.pop_back();
+/* A filename is taken back from the line as typed (`ParseCommand` upper-cases its own copy): the
+ * same number of characters as the upper-cased tail, counted from the end of the argument. */
+std::string DEBUG_TapPathFromTyped(const std::string &raw, const char *upper_tail) {
 	const size_t n = strlen(upper_tail);
-	return n <= line.size() ? line.substr(line.size() - n) : std::string(upper_tail);
+	return n <= raw.size() ? raw.substr(raw.size() - n) : std::string(upper_tail);
 }
 
 static bool TapCommand(const char *typed, char *found) {
@@ -2719,7 +2717,7 @@ static bool TapCommand(const char *typed, char *found) {
 		t->block = (LinearPt)GetAddress((uint16_t)bseg, (uint32_t)boff);
 		t->block_length = (uint32_t)blen;
 	}
-	t->path = OriginalCaseTail(typed, rest);
+	t->path = DEBUG_TapPathFromTyped(RawCommandArgument(typed), rest);
 	/* A count's table is rewritten at each TAPLIST, so its file is proved writable now, or the
 	 * tap would count into a table nobody could read. */
 	t->rows = fopen(t->path.c_str(), "w");
