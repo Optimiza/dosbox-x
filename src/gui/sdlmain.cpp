@@ -3202,6 +3202,14 @@ void GFX_SwitchFullScreen(void)
 	else
         GFX_ResetScreen();
 
+#if defined(C_SDL2)
+    /* Before the guest sets its first video mode there is no draw callback, so the reset above
+     * changes nothing and the window would stay windowed until the machine runs: a start halted
+     * in the debugger never reached full screen. Ask the window for it directly. */
+    if (!glide.enabled && sdl.draw.callback == NULL && sdl.window != NULL)
+        SDL_SetWindowFullscreen(sdl.window, sdl.desktop.fullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+#endif
+
     // set vsync to host
     // NOTE why forcing ???
 #ifdef WIN32
