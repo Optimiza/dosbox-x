@@ -111,8 +111,10 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 	// Opcodes that carry exception checks emit a stub each when the block closes, so a run of them
 	// can need more than that size. Stop while three of the largest opcodes seen in this block (the
 	// next one and the closing code) and the stubs owed, plus those one more opcode may add, all
-	// still fit. The reserve is an estimate from this block's own opcodes, not a proof.
-	bool started=false,sti_shadow=false;
+	// still fit. The reserve is an estimate from this block's own opcodes, not a proof. The stubs
+	// also need a slot each in save_info_dynrec, which the opcode count used to bound; a run of STI
+	// lifts that count, so the slots are reserved the same way.
+	bool started=false,sti_shadow=false,out_of_room=false;
 	Bitu op_bytes_max=0,op_stubs_max=0,op_stubs=0;
 	const uint8_t* op_pos=nullptr;
 	while (max_opcodes--) {
@@ -122,8 +124,11 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 			const Bitu stubs=used_save_info_dynrec-op_stubs;
 			if (stubs>op_stubs_max) op_stubs_max=stubs;
 			const Bitu used=(Bitu)(cache.pos-decode.block->cache.start);
+			out_of_room=used+3*op_bytes_max+(used_save_info_dynrec+op_stubs_max+1)*dyn_stub_bytes_max>decode.block->cache.size
+				// the stubs owed also have a table of their own, whatever the size of the cache block
+				|| used_save_info_dynrec+3*op_stubs_max+2>sizeof(save_info_dynrec)/sizeof(save_info_dynrec[0]);
 			// the opcode after an STI is always decoded: the interrupt it enables waits for it
-			if (!sti_shadow && used+3*op_bytes_max+(used_save_info_dynrec+op_stubs_max+1)*dyn_stub_bytes_max>decode.block->cache.size) break;
+			if (!sti_shadow && out_of_room) break;
 		}
 		sti_shadow=false;
 		op_pos=cache.pos;
@@ -677,8 +682,12 @@ restart_prefix:
 		case 0xfb:		//STI
 			gen_call_function_raw(CPU_STI);
 			dyn_check_exception(FC_RETOP);
-			max_opcodes=1;		//Allow 1 extra opcode
-			sti_shadow=true;
+			// Allow 1 extra opcode, unless the block is out of room: an STI in that extra opcode must
+			// not allow another, or a run of them is never stopped.
+			if (!out_of_room) {
+				max_opcodes=1;
+				sti_shadow=true;
+			}
 			break;
 
 		case 0xfc:		//CLD
