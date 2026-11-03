@@ -344,8 +344,10 @@ TEST(Presence, AFrameDrawnButNeverShownIsDrawnAgain) {
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0, false);
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0)) << "an aborted frame showed nothing";
+    EXPECT_EQ(o.frames(), 0u) << "frames counts the frames presented with the overlay drawn";
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0));
+    EXPECT_EQ(o.frames(), 1u);
 }
 
 TEST(Presence, TheSameLookSentAgainIsNotANewOne) {

@@ -524,8 +524,8 @@ void RENDER_EndUpdate( bool abort ) {
             /* THE PRESENCE OVERLAY GOES ON HERE, after the capture above took the frame and
                before it is presented, so only the window ever shows it. */
             /* drawn back even on an abandoned frame, so the buffer never stays without it */
-            const uint16_t *changed = PRESENCE_EndFrame(presence_base, render.scale.outPitch,
-                                                        Scaler_ChangedLines, !abort);
+            const uint16_t *changed = presence_base == nullptr ? Scaler_ChangedLines
+                : PRESENCE_EndFrame(presence_base, render.scale.outPitch, Scaler_ChangedLines, !abort);
             GFX_EndUpdate( abort? NULL : changed );
             render.frameskip.hadSkip[render.frameskip.index] = 0;
         } else if (!abort && PRESENCE_WantsRepaint()) {
@@ -1104,6 +1104,8 @@ forcenormal:
 	if (!render.disablerender) RENDER_DrawLine = RENDER_EmptyLineHandler;
 	vga.draw.must_complete_frame = true;
 	render.scale.outWrite = nullptr;
+	/* The frame in progress began on a buffer that may have moved. */
+	presence_base = nullptr;
 	/* Signal the next frame to first reinit the cache */
 	render.scale.clearCache = true;
 

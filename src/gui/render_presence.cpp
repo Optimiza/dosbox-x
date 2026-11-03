@@ -364,7 +364,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
         }
         Draw(buf, pitch, key);
         drawn_ = true;
-        frames_++;
+        if (shown) frames_++;
     }
     if (shown) presented_ = key;
     return moved ? full_.data() : changed;
