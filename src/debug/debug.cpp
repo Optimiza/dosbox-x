@@ -741,6 +741,8 @@ public:
 	static int				FiredConditionIndex		(void);
 	/* A step runs the machine too, so the row that stopped it no longer names the stop. */
 	static void				ForgetFiredCondition	(void) { firedCondition = nullptr; }
+	static CBreakpoint*		FiredCondition		(void) { return firedCondition; }
+	static void				RestoreFiredCondition	(CBreakpoint* bp) { firedCondition = bp; }
 private:
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
@@ -6314,6 +6316,7 @@ void DEBUG_Enable_Handler(bool pressed) {
     }
 
     /* RUNWATCH: break back into the debugger */
+    CBreakpoint* const fired_by = debug_running ? CBreakpoint::FiredCondition() : nullptr;
     if (debug_running) {
         debug_running = false;
         DrawRegistersUpdateOld();
@@ -6335,6 +6338,7 @@ void DEBUG_Enable_Handler(bool pressed) {
         DEBUG_DrawScreen();
 
         CBreakpoint::ActivateBreakpointsExceptAt(SegPhys(cs)+reg_eip);
+        if (fired_by != nullptr) CBreakpoint::RestoreFiredCondition(fired_by);	// the row that stopped RUNWATCH still names the stop
         DOSBOX_SetNormalLoop();	
         GFX_SetTitle(-1,-1,-1,is_paused);
         if (leave) return;
