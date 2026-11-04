@@ -104,7 +104,7 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 	// can need more than that size. Stop while three of the largest opcodes seen in this block (the
 	// next one and the closing code) and the stubs owed, plus those one more opcode may add, all
 	// still fit. The reserve is an estimate from this block's own opcodes, not a proof.
-	bool started=false,sti_shadow=false;
+	bool started=false,sti_shadow=false,after_sti=false;
 	Bitu op_bytes_max=0,op_stubs_max=0,op_stubs=0;
 	const uint8_t* op_pos=nullptr;
 	while (max_opcodes--) {
@@ -117,6 +117,7 @@ static CacheBlockDynRec * CreateCacheBlock(CodePageHandlerDynRec * codepage,Phys
 			// the opcode after an STI is always decoded: the interrupt it enables waits for it
 			if (!sti_shadow && used+3*op_bytes_max+(used_save_info_dynrec+op_stubs_max+1)*dyn_stub_bytes_max>decode.block->cache.size) break;
 		}
+		after_sti=sti_shadow;
 		sti_shadow=false;
 		op_pos=cache.pos;
 		op_stubs=used_save_info_dynrec;
@@ -661,7 +662,8 @@ restart_prefix:
 		case 0xfb:		//STI
 			gen_call_function_raw(CPU_STI);
 			dyn_check_exception(FC_RETOP);
-			max_opcodes=1;		//Allow 1 extra opcode
+			// Allow 1 extra opcode, but not after the extra one: a run of STI would never end its block
+			if (!after_sti) max_opcodes=1;
 			sti_shadow=true;
 			break;
 
