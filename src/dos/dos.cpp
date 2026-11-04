@@ -3270,6 +3270,8 @@ static unsigned long long dostrace_calls = 0, dostrace_rows = 0, dostrace_droppe
 static const unsigned long long DOSTRACE_ROWS_MAX = 1000000ull;
 struct DosTraceEntry { unsigned long long n; uint16_t ss; uint32_t sp; };
 static std::vector<DosTraceEntry> dostrace_open;
+/* Which trace a call began under: a call still inside DOS when the trace is restarted returns into the new file's world, where it has no row to answer. */
+static unsigned dostrace_generation = 0;
 
 /* The caller's return address and flags as INT pushed them: 16-bit words, or 32-bit on a big
  * protected-mode stack. */
@@ -3328,6 +3330,7 @@ static void DosTraceRow(const char *fmt, ...) {
 static Bitu DOS_21HandlerTraced(void) {
     if (dostrace_file == NULL) return DOS_21Handler();
     const unsigned long long n = ++dostrace_calls;
+    const unsigned generation = dostrace_generation;
     const uint16_t caller_ip = (uint16_t)DosTraceStack(0), caller_cs = (uint16_t)DosTraceStack(1);
     const std::string name = DosTraceName();
     DosTraceRow("E N=%llu T=%.6f M=%c CS=%04X IP=%04X PSP=%04X AX=%04X BX=%04X CX=%04X DX=%04X SI=%04X DI=%04X DS=%04X ES=%04X NAME=%s\n",
@@ -3335,7 +3338,7 @@ static Bitu DOS_21HandlerTraced(void) {
         reg_dx, reg_si, reg_di, SegValue(ds), SegValue(es), name.c_str());
     dostrace_open.push_back({n, SegValue(ss), reg_esp});
     const Bitu ret = DOS_21Handler();
-    if (dostrace_file == NULL) return ret;
+    if (dostrace_file == NULL || generation != dostrace_generation) return ret;
     DosTraceEntry entry = {0, 0, 0};
     if (!dostrace_open.empty()) { entry = dostrace_open.back(); dostrace_open.pop_back(); }
     const bool switched = entry.n != n || SegValue(ss) != entry.ss || reg_esp != entry.sp;
@@ -3359,6 +3362,7 @@ int DOS_TraceCommand(const char *path, std::vector<std::string> &lines) {
     if (path != NULL && *path == 0) {
         if (dostrace_file != NULL) { fclose(dostrace_file); dostrace_file = NULL; }
         dostrace_open.clear();
+        dostrace_generation++;
         DosTraceStatus(lines);
         return 1;
     }
@@ -3375,6 +3379,7 @@ int DOS_TraceCommand(const char *path, std::vector<std::string> &lines) {
         dostrace_path = path;
         dostrace_calls = dostrace_rows = dostrace_dropped = 0;
         dostrace_open.clear();
+        dostrace_generation++;
     }
     DosTraceStatus(lines);
     return 1;
