@@ -2711,7 +2711,8 @@ static bool TapCommand(const char *typed, char *found) {
 	else if (kind == 'C') consumed = 0;
 	if (consumed && kind == 'W' && sscanf(rest, "%lx:%lx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
 	const bool shape = consumed && (kind == 'W' || kind == 'R' || kind == 'C') && *rest != 0
-		&& seg <= 0xffffu && length >= 1 && length <= 1024 && blen <= 128 && bseg <= 0xffffu;
+		&& seg <= 0xffffu && off <= 0xfffffffful && length >= 1 && length <= 1024 && blen <= 128
+		&& bseg <= 0xffffu && boff <= 0xfffffffful;
 	if (!shape) {
 		DEBUG_ShowMsg("DEBUG: TAP usage: TAP W seg:off [bseg:boff blen] file | TAP R seg:off file | TAP C seg:off len file (hex; len at most 400, blen at most 80)\n");
 		return false;
