@@ -739,6 +739,8 @@ private:
 public:
 	/* That row's place in BPLIST's numbering, or -1 when the machine was not stopped by one. */
 	static int				FiredConditionIndex		(void);
+	/* A step runs the machine too, so the row that stopped it no longer names the stop. */
+	static void				ForgetFiredCondition	(void) { firedCondition = nullptr; }
 private:
 #if C_HEAVY_DEBUG
 	friend bool DEBUG_HeavyIsBreakpoint(void);
@@ -3668,6 +3670,7 @@ bool ParseCommand(char* str) {
 		}
 		exitLoop = false;
 		mustCompleteInstruction = true;
+		CBreakpoint::ForgetFiredCondition();
 		int32_t ret = DEBUG_Run(1,true);
 		mustCompleteInstruction = false;
 		DEBUG_RunSteppedCallback(ret);
