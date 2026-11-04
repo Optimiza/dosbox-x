@@ -2702,19 +2702,20 @@ static std::string OriginalCaseTail(const char *typed, const char *upper_tail) {
 static bool TapCommand(const char *typed, char *found) {
 	char kind = 0;
 	unsigned int seg = 0;
-	unsigned long off = 0, length = 1, bseg = 0, boff = 0, blen = 0;
+	unsigned long long off = 0, boff = 0;	// wide enough to see an offset past 32 bits where long is 32 bits
+	unsigned long length = 1, bseg = 0, blen = 0;
 	int consumed = 0;
 	char k[2] = {0};
-	if (sscanf(found, "%1s %x:%lx %n", k, &seg, &off, &consumed) != 3) consumed = 0;
+	if (sscanf(found, "%1s %x:%llx %n", k, &seg, &off, &consumed) != 3) consumed = 0;
 	kind = k[0];
 	char *rest = found + consumed;
 	int more = 0;
 	if (consumed && kind == 'C' && sscanf(rest, "%lx %n", &length, &more) == 1) rest += more;
 	else if (kind == 'C') consumed = 0;
-	if (consumed && kind == 'W' && sscanf(rest, "%lx:%lx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
+	if (consumed && kind == 'W' && sscanf(rest, "%lx:%llx %lx %n", &bseg, &boff, &blen, &more) == 3) rest += more;
 	const bool shape = consumed && (kind == 'W' || kind == 'R' || kind == 'C') && *rest != 0
-		&& seg <= 0xffffu && off <= 0xfffffffful && length >= 1 && length <= 1024 && blen <= 128
-		&& bseg <= 0xffffu && boff <= 0xfffffffful;
+		&& seg <= 0xffffu && off <= 0xffffffffull && length >= 1 && length <= 1024 && blen <= 128
+		&& bseg <= 0xffffu && boff <= 0xffffffffull;
 	if (!shape) {
 		DEBUG_ShowMsg("DEBUG: TAP usage: TAP W seg:off [bseg:boff blen] file | TAP R seg:off file | TAP C seg:off len file (hex; len at most 400, blen at most 80)\n");
 		return false;
@@ -2735,7 +2736,7 @@ static bool TapCommand(const char *typed, char *found) {
 		if (i == 0) phys = p;
 		if (!mapped || p != phys + i || !TapPageAllowed(p >> 12u)) {
 			DEBUG_ShowMsg("DEBUG: TAP %04X:%08lX+%lX is not one run of RAM pages a tap can hold (unmapped, split by paging, or in the HMA's A20 alias)\n",
-				seg, off, (unsigned long)i);
+				seg, (unsigned long)off, (unsigned long)i);
 			return false;
 		}
 	}
