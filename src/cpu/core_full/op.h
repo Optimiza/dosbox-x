@@ -375,7 +375,11 @@ switch (inst.code.op) {
 		else if (DEBUG_IntBreakpoint(inst_op1_b)) 
 			return (Bits)debugCallback;
 #endif
-		CPU_SW_Interrupt(inst_op1_b,GetIP());
+		/* INT3 (CCh) and INTO (CEh) are not IOPL sensitive in virtual 8086 mode, INT n (CDh) is */
+		if ((inst.entry & 0xFF) == 0xcd)
+			CPU_SW_Interrupt(inst_op1_b,GetIP());
+		else
+			CPU_SW_Interrupt_NoIOPLCheck(inst_op1_b,GetIP());
 		continue;
 	case O_INb:
 		if (CPU_IO_Exception(inst_op1_d,1)) RunException();
@@ -655,6 +659,11 @@ switch (inst.code.op) {
 		case 0x0d:	FPU_ESC5_Normal(inst.rm);break;
 		case 0x0e:	FPU_ESC6_Normal(inst.rm);break;
 		case 0x0f:	FPU_ESC7_Normal(inst.rm);break;
+		}
+		if (FPU_UnmaskedExceptionPending()) {
+			FPU_RecordExceptionContext(inst.code.save, inst.rm,
+			                           inst.rm < 0xc0, inst.rm_eaa);
+			if (FPU_NumericExceptionPending()) EXCEPTION(EXCEPTION_MF);
 		}
 		goto nextopcode;
 #else

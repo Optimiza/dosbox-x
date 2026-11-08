@@ -189,14 +189,14 @@ l_M_Ed:
 			goto l_MODRMswitch;
 		case M_SHIFT_Ib:
 			inst_op2_d = Fetchb() & 0x1f;
-			if (!inst_op2_d)
-				break;
+			if (!inst_op2_d)		/* count 0: no operation, flags unchanged */
+				goto nextopcode;
 			inst.code=Groups[inst.code.op][inst.rm_index];
 			goto l_MODRMswitch;
 		case M_SHIFT_CL:
 			inst_op2_d = reg_cl & 0x1f;
-			if (!inst_op2_d)
-				break;
+			if (!inst_op2_d)		/* count 0: no operation, flags unchanged */
+				goto nextopcode;
 			inst.code=Groups[inst.code.op][inst.rm_index];
 			goto l_MODRMswitch;
 		case M_SHIFT_1:
@@ -276,8 +276,10 @@ l_M_Ed:
 		}
 		if (inst.prefix & PREFIX_SEG) {
 			inst.rm_eaa+=inst.seg.base;
+			inst.rm_seg=inst.seg.idx;
 		} else {
 			inst.rm_eaa+=SegBase(ds);
+			inst.rm_seg=(uint8_t)ds;
 		}
 		break;
 	/* Special cases */
@@ -287,6 +289,7 @@ l_M_Ed:
 	case L_PRESEG:
 		inst.prefix|=PREFIX_SEG;
 		inst.seg.base=SegBase((SegNames)inst.code.extra);
+		inst.seg.idx=(uint8_t)inst.code.extra;
 		goto restartopcode;
 	case L_PREREPNE:
 		inst.prefix|=PREFIX_REP;

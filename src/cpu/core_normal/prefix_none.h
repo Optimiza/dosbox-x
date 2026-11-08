@@ -957,8 +957,10 @@
 #else
 			GetEAaN;
 #endif
-			if (CPU_SetSegGeneral(es,LoadMw(eaa+2))) RUNEXCEPTION();
-			*rmrw=LoadMw(eaa);
+			/* read both words first: the operand may be addressed through the segment being loaded */
+			{ const uint16_t lxs_off=LoadMw(eaa); const uint16_t lxs_sel=LoadMw(eaa+2);
+			if (CPU_SetSegGeneral(es,lxs_sel)) RUNEXCEPTION();
+			*rmrw=lxs_off; }
 			break;
 		}
 	CASE_W(0xc5)												/* LDS */
@@ -982,8 +984,10 @@
 #else
 			GetEAaN;
 #endif
-			if (CPU_SetSegGeneral(ds,LoadMw(eaa+2))) RUNEXCEPTION();
-			*rmrw=LoadMw(eaa);
+			/* read both words first: the operand may be addressed through the segment being loaded */
+			{ const uint16_t lxs_off=LoadMw(eaa); const uint16_t lxs_sel=LoadMw(eaa+2);
+			if (CPU_SetSegGeneral(ds,lxs_sel)) RUNEXCEPTION();
+			*rmrw=lxs_off; }
 			break;
 		}
 	CASE_B(0xc6)												/* MOV Eb,Ib */
@@ -1088,7 +1092,8 @@
 		}
 	CASE_B(0xce)												/* INTO */
 		if (get_OF()) {
-			CPU_SW_Interrupt(4,GETIP);
+			/* like INT3, INTO is not IOPL sensitive in virtual 8086 mode */
+			CPU_SW_Interrupt_NoIOPLCheck(4,GETIP);
 #if CPU_TRAP_CHECK
 			cpu.trap_skip=true;
 #endif

@@ -227,6 +227,10 @@ struct MEM_PageInfo {
 	PageHandler*	handler;
 };
 MEM_PageInfo MEM_ClassifyPage(Bitu phys_page);
+/* Whether the handler of a page is known without asking the devices: the handler table starts
+ * out empty above RAM and the ROMs, and the first access to a page asks every device which one
+ * claims it (MEM_SlowPath()), which is slow for all 4GB at once */
+bool MEM_PageHandlerKnown(Bitu phys_page);
 
 /* Some other functions */
 void PAGING_Enable(bool enabled);
@@ -234,10 +238,18 @@ bool PAGING_Enabled(void);
 void PAGING_SetWP(bool wp);
 void PAGING_SwitchCPL(bool isUser);
 
+/* linear pages that hold an enabled DR0-DR3 data breakpoint (at most 4) */
+void PAGING_DebugSetPages(const uint32_t *pages,unsigned int count);
+
 Bitu PAGING_GetDirBase(void);
 void PAGING_SetDirBase(Bitu cr3);
 void PAGING_InitTLB(void);
 void PAGING_ClearTLB(void);
+
+/* DOSBox-X changed the guest's page tables itself (its EMM386 mapping EMS pages): the TLB is
+ * cleared, DOSBox-X's and, through the hook, that of a CPU core that keeps its own (KVM) */
+void PAGING_GuestPageTablesChanged(void);
+extern void (*PAGING_GuestPageTablesHook)(void);
 
 void PAGING_LinkPage(PageNum lin_page,PageNum phys_page);
 void PAGING_UnlinkPages(PageNum lin_page,PageNum pages);

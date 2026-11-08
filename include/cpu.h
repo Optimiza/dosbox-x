@@ -111,6 +111,11 @@ static INLINE bool CPU_InterruptFlag(void) {
 	return GETFLAG(IF) != 0;
 }
 
+/* The time stamp counter for RDTSC from a hook, if it sets one and returns true: the KVM core
+ * while it runs the guest on an emulated core for a while, so that the TSC the guest sees goes
+ * on at KVM's rate (the host's) instead of the emulated one */
+extern bool (*CPU_RDTSCHook)(int64_t &tsc);
+
 Bits CPU_Core_Normal_Run(void);
 Bits CPU_Core_Normal_Trap_Run(void);
 Bits CPU_Core_Simple_Run(void);
@@ -133,10 +138,12 @@ Bits CPU_Core286_Prefetch_Run(void);
 
 Bits CPU_Core8086_Prefetch_Run(void);
 
-#if defined(C_HAVE_LINUX_KVM_X86)
-Bits CPU_Core_KVM_Run(void);
-Bits CPU_Core_KVM_Trap_Run(void);
-#endif
+/* DR0-DR3 hardware breakpoints (cpu.cpp): while DR7 enables any, the main
+ * loop runs CPU_Debug_Run instead of the decoder */
+extern bool cpu_dbg_active;
+Bits CPU_Debug_Run(void);
+void CPU_DebugRegsChanged(void);
+void CPU_DebugDataAccess(const LinearPt addr,const uint32_t size,const bool write);
 
 void CPU_Enable_SkipAutoAdjust(void);
 void CPU_Disable_SkipAutoAdjust(void);
@@ -227,6 +234,7 @@ void CPU_Exception(Bitu which,Bitu error=0);
 void CPU_DebugException(uint32_t triggers,Bitu oldeip);
 
 bool CPU_SetSegGeneral(SegNames seg,uint16_t value);
+void CPU_SetSegV86Hidden(SegNames seg);
 bool CPU_PopSeg(SegNames seg,bool use32);
 
 bool CPU_CPUID(void);
@@ -239,6 +247,8 @@ void CPU_SetFlags(Bitu word,Bitu mask);
 
 bool FPU_CoprocessorException(void);
 bool FPU_NumericException(void);
+bool FPU_NumericExceptionWithContext(uint32_t instruction_pointer_offset,
+                                     uint16_t opcode);
 bool MMX_CoprocessorException(void);
 
 #define EXCEPTION_DB            1
@@ -438,6 +448,16 @@ public:
 					((LinearPt)saved.seg.base_16_23 << (LinearPt)16U) |
 					(LinearPt)saved.seg.base_0_15);
 		}
+	}
+	/* The access rights of a segment register loaded from this descriptor (Segments::ar), with
+	 * the accessed bit set, as the CPU sets it when it loads a code or data segment */
+	uint32_t GetAccessRights (void) const {
+		uint32_t ar = (uint32_t)saved.seg.type | ((uint32_t)saved.seg.dpl << 5u) | ((uint32_t)saved.seg.p << 7u);
+		if (CPU_ArchitectureType >= CPU_ARCHTYPE_386)
+			ar |= ((uint32_t)saved.seg.avl << 12u) | ((uint32_t)saved.seg.r << 13u) |
+				((uint32_t)saved.seg.big << 14u) | ((uint32_t)saved.seg.g << 15u);
+		if (ar & 0x10u) ar |= 1u;
+		return ar;
 	}
     bool GetExpandDown (void) {
 #if 0

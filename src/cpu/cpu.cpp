@@ -77,6 +77,14 @@ bool CPU_NMI_gate = true;
 bool CPU_NMI_active = false;
 bool CPU_NMI_pending = false;
 bool do_seg_limits = false;
+
+/* Virtual 8086 mode: a segment register load sets the hidden part as for a real mode segment,
+ * with a 64KB limit (unless segment limits are off), and access rights F3h */
+void CPU_SetSegV86Hidden(SegNames seg) {
+	Segs.limit[seg] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL));
+	Segs.expanddown[seg] = false;
+	Segs.ar[seg] = SEG_AR_V86;
+}
 bool do_lds_wraparound = true;
 
 bool do_pse = false;
@@ -128,8 +136,15 @@ Segments Segs;
 
 uint64_t CPU_fixed_RDTSC_rate = 0;
 
+bool (*CPU_RDTSCHook)(int64_t &tsc) = NULL;
+
 int64_t CPU_RDTSC() {
 	pic_tickindex_t rate;
+
+	if (GCC_UNLIKELY(CPU_RDTSCHook != NULL)) {
+		int64_t tsc;
+		if (CPU_RDTSCHook(tsc)) return tsc;
+	}
 
 	if (CPU_fixed_RDTSC_rate > (uint64_t)0)
 		rate = (pic_tickindex_t)CPU_fixed_RDTSC_rate;
@@ -501,6 +516,18 @@ void menu_update_core(void) {
                (cpudecoder != &CPU_Core8086_Prefetch_Run) &&
                (cpudecoder != &CPU_Core286_Normal_Run) &&
                (cpudecoder != &CPU_Core8086_Normal_Run)).
+        refresh_item(mainMenu);
+#endif
+
+#if C_KVM
+    /* The KVM core needs callback instructions with the INT3 prefix, which are written once at
+     * startup (see CALLBACK_ChooseInt3Prefix()), and a 386 or later without prefetch emulation */
+    CALLBACK_ChooseInt3Prefix();
+    mainMenu.get_item("mapper_kvm").
+        check(cpudecoder == &CPU_Core_KVM_Run).
+        enable(CALLBACK_Int3Prefix &&
+               CPU_ArchitectureType >= CPU_ARCHTYPE_386 &&
+               strstr(cpu_sec_type.c_str(),"_prefetch") == NULL).
         refresh_item(mainMenu);
 #endif
 
@@ -1104,6 +1131,7 @@ bool CPU_SwitchTask(Bitu new_tss_selector,TSwitchType tstype,uint32_t old_eip) {
 	/* Load the new selectors */
 	if (reg_flags & FLAG_VM) {
 		SegSet16(cs,new_cs);
+		CPU_SetSegV86Hidden(cs);
 		cpu.code.big=false;
 		CPU_SetCPL(3);			//We don't have segment caches so this will do
 	} else {
@@ -1126,6 +1154,7 @@ bool CPU_SwitchTask(Bitu new_tss_selector,TSwitchType tstype,uint32_t old_eip) {
 			if (cpu.cpl < cs_desc.DPL()) E_Exit("Task CS RPL < DPL");
 doconforming:
 			Segs.expanddown[cs]=cs_desc.GetExpandDown();
+			Segs.ar[cs]=cs_desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)cs_desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=cs_desc.GetBase();
 			cpu.code.big=cs_desc.Big()>0;
@@ -1176,18 +1205,161 @@ void CPU_DebugException(uint32_t triggers,Bitu oldeip) {
   CPU_Interrupt(EXCEPTION_DB,CPU_INT_EXCEPTION,(uint32_t)oldeip);
 }
 
-#include <stack>
+/* DR0-DR3 hardware breakpoints.
+ *
+ * Nothing here costs anything while DR7 enables no breakpoint. When it does
+ * (only through CPU_WRITE_DRX, the MOV DRx of the emulated cores):
+ *   - the main loop calls CPU_Debug_Run instead of the decoder. It executes
+ *     one instruction at a time with the normal core, checks instruction
+ *     breakpoints before each (fault, EFLAGS.RF suppresses one check) and
+ *     raises the data breakpoint traps after it.
+ *   - the paging code routes the pages that hold a data breakpoint through a
+ *     page handler that reports reads/writes to CPU_DebugDataAccess. All other
+ *     pages keep their direct TLB pointers.
+ * Under the KVM core the breakpoints are real hardware ones and DOSBox-X's
+ * copy of the debug registers is not used here. */
+bool cpu_dbg_active = false;
+static bool cpu_dbg_in_step = false;
+static uint32_t cpu_dbg_pending = 0;
 
-int CPU_Exception_Level[0x20] = {0};
-std::stack<int> CPU_Exception_In_Progress;
+static struct CPU_DebugBP {
+	bool		on;
+	uint8_t		rw;		/* 0 = execute, 1 = write, 3 = read/write (2 = I/O, not emulated) */
+	uint32_t	addr,len;
+} cpu_dbg_bp[4];
 
-void CPU_Exception_Level_Reset() {
-	int i;
+void CPU_DebugRegsChanged(void) {
+	static const uint32_t lens[4] = { 1,2,8,4 };
+	uint32_t pages[4];
+	unsigned int npages = 0;
+	bool active = false;
 
-	for (i=0;i < 0x20;i++)
-		CPU_Exception_Level[i] = 0;
-	while (!CPU_Exception_In_Progress.empty())
-		CPU_Exception_In_Progress.pop();
+	for (unsigned int i=0;i < 4;i++) {
+		CPU_DebugBP &bp = cpu_dbg_bp[i];
+
+		bp.on = ((cpu.drx[7] >> (i * 2u)) & 3u) != 0;
+		bp.rw = (uint8_t)((cpu.drx[7] >> (16u + i * 4u)) & 3u);
+		bp.len = lens[(cpu.drx[7] >> (18u + i * 4u)) & 3u];
+		bp.addr = cpu.drx[i] & ~(bp.len - 1u);
+		if (bp.on && bp.rw == 2) bp.on = false;
+		if (bp.on) {
+			active = true;
+			if (bp.rw != 0) pages[npages++] = bp.addr >> 12u;
+		}
+	}
+
+	cpu_dbg_active = active;
+	PAGING_DebugSetPages(pages,npages);
+
+	/* end the decoder's time slice after this instruction, so that the main loop
+	 * picks CPU_Debug_Run (or the decoder again) before the next one */
+	CPU_CycleLeft += CPU_Cycles;
+	CPU_Cycles = 0;
+}
+
+/* called by the debug breakpoint page handler for a read or write of a watched page */
+void CPU_DebugDataAccess(const LinearPt addr,const uint32_t size,const bool write) {
+	if (!cpu_dbg_in_step) return;
+	for (unsigned int i=0;i < 4;i++) {
+		const CPU_DebugBP &bp = cpu_dbg_bp[i];
+
+		if (bp.on && (bp.rw == 3 || (bp.rw == 1 && write)) &&
+			addr < bp.addr + bp.len && addr + size > bp.addr)
+			cpu_dbg_pending |= 1u << i;
+	}
+}
+
+static bool CPU_IsTrapDecoder(void) {
+	return cpudecoder == &CPU_Core_Normal_Trap_Run || cpudecoder == &CPU_Core_Simple_Trap_Run
+#if C_DYNAMIC_X86
+		|| cpudecoder == &CPU_Core_Dyn_X86_Trap_Run
+#endif
+#if C_DYNREC
+		|| cpudecoder == &CPU_Core_Dynrec_Trap_Run
+#endif
+		|| cpudecoder == &CPU_Core_Prefetch_Trap_Run;
+}
+
+Bits CPU_Debug_Run(void) {
+#if C_KVM
+	if (cpudecoder == &CPU_Core_KVM_Run)
+		return (*cpudecoder)();
+#endif
+
+	while (CPU_Cycles > 0 && cpu_dbg_active) {
+		const bool rf = (reg_flags & FLAG_RF) != 0;
+
+		/* instruction breakpoints fault before the instruction */
+		if (!rf) {
+			const LinearPt lin = (LinearPt)(SegPhys(cs) + reg_eip);
+			uint32_t hit = 0;
+
+			for (unsigned int i=0;i < 4;i++) {
+				if (cpu_dbg_bp[i].on && cpu_dbg_bp[i].rw == 0 && cpu_dbg_bp[i].addr == lin)
+					hit |= 1u << i;
+			}
+			if (hit) {
+				FillFlags();
+				CPU_DebugException(hit,reg_eip);
+				CPU_Cycles--;
+				continue;
+			}
+		}
+
+		/* one instruction. A trap flag decoder runs exactly one instruction too */
+		const bool trap = CPU_IsTrapDecoder();
+		const Bits old_cycles = CPU_Cycles;
+		Bits ret;
+
+		CPU_Cycles = 1;
+		cpu.trap_skip = true;
+		cpu_dbg_pending = 0;
+		cpu_dbg_in_step = true;
+		try {
+			ret = trap ? (*cpudecoder)() : CPU_Core_Normal_Run();
+		}
+		catch (...) {
+			cpu_dbg_in_step = false;
+			throw;
+		}
+		cpu_dbg_in_step = false;
+		CPU_Cycles = old_cycles - 1;
+
+		if (rf) reg_flags &= ~FLAG_RF;
+
+		/* data breakpoints trap after the instruction. If the trap flag decoder
+		 * already raised the single step #DB, report them in the same DR6 */
+		if (cpu_dbg_pending) {
+			if (trap && !cpu.trap_skip) {
+				cpu.drx[6] |= cpu_dbg_pending;
+			}
+			else {
+				FillFlags();
+				CPU_DebugException(cpu_dbg_pending,reg_eip);
+			}
+			cpu_dbg_pending = 0;
+		}
+
+		if (ret != CBRET_NONE) return ret;
+	}
+	return CBRET_NONE;
+}
+
+// Track entry into an exception handler, not execution of the handler.
+static int cpu_exception_delivery = -1;
+
+void CPU_Exception_Level_Reset()
+{
+    cpu_exception_delivery = -1;
+}
+
+static bool CPU_Exception_Contributory(const int vector)
+{
+    if (vector == 0)
+        return true;
+    if (vector >= (int)EXCEPTION_TS && vector <= (int)EXCEPTION_GP)
+        return true;
+    return vector == 9 && CPU_ArchitectureType == CPU_ARCHTYPE_386;
 }
 
 bool has_printed_double_fault = false;
@@ -1197,66 +1369,82 @@ bool always_report_triple_fault = false;
 
 void On_Software_CPU_Reset();
 
-void CPU_Exception(Bitu which,Bitu error ) {
-	assert(which < 0x20);
-//	LOG_MSG("Exception %d error %x",which,error);
+void CPU_Exception(Bitu which, Bitu error)
+{
+    assert(which < 0x20);
+//  LOG_MSG("Exception %d error %x", which, error);
 
-	if(which >= 0x20)
-		E_Exit("CPU_Exception: Exception %d is out of range.", (int)which);
+    if (which >= 0x20)
+        E_Exit("CPU_Exception: Exception %d is out of range.", (int)which);
 
-	if (CPU_Exception_Level[which] != 0) {
-		if (CPU_Exception_Level[EXCEPTION_DF] != 0 && cpu_triple_fault_reset) {
-			if (always_report_triple_fault || !has_printed_triple_fault) {
-				LOG_MSG("CPU_Exception: Double fault already in progress == Triple Fault. Resetting CPU.");
-				has_printed_triple_fault = true;
-			}
+    const bool track_delivery = cpu_double_fault_enable && cpu.pmode && CPU_ArchitectureType >= CPU_ARCHTYPE_286;
+    const int first = cpu_exception_delivery;
+    const bool first_contributes = CPU_Exception_Contributory(first);
+    const bool second_contributes = CPU_Exception_Contributory((int)which);
+    bool double_fault;
 
-			// Triple fault -> special shutdown cycle -> reset signal -> reset.
-			// Sickening, I know, but that's how IBM wired things a long long time ago.
-			On_Software_CPU_Reset();
-			E_Exit("Triple fault reset call unexpectedly returned");
-		}
+    if (first == EXCEPTION_DF)
+    {
+        double_fault = true;
+    }
+    else if (CPU_ArchitectureType == CPU_ARCHTYPE_286)
+    {
+        double_fault = first_contributes;
+    }
+    else if (first == EXCEPTION_PF)
+    {
+        double_fault = second_contributes || which == EXCEPTION_PF;
+    }
+    else
+    {
+        double_fault = first_contributes && second_contributes;
+    }
 
-		if (always_report_double_fault || !has_printed_double_fault) {
-			LOG_MSG("CPU_Exception: Exception %d already in progress, triggering double fault instead",(int)which);
-			has_printed_double_fault = true;
-		}
-		which = EXCEPTION_DF;
-		error = 0;
-	}
+    if (track_delivery && double_fault)
+    {
+        if (first == EXCEPTION_DF && cpu_triple_fault_reset)
+        {
+            if (always_report_triple_fault || !has_printed_triple_fault)
+            {
+                LOG_MSG("CPU_Exception: Double fault already in progress == Triple Fault. Resetting CPU.");
+                has_printed_triple_fault = true;
+            }
 
-	if (cpu_double_fault_enable) {
-		/* NTS: Putting some thought into it, I don't think divide by zero counts as something to throw a double fault
-		 *      over. I may be wrong. The behavior of Intel processors will ultimately decide.
-		 *
-		 *      Until then, don't count Divide Overflow exceptions, so that the "EFP loader" can do its disgusting
-		 *      anti-debugger hackery when loading parts of a demo. --J.C. */
-		if (!(which == 0/*divide by zero/overflow*/)) {
-			/* CPU_Interrupt() could cause another fault during memory access. This needs to happen here */
-			CPU_Exception_Level[which]++;
-			CPU_Exception_In_Progress.push((int)which);
-		}
-	}
+            // Triple fault -> special shutdown cycle -> reset signal -> reset.
+            // Sickening, I know, but that's how IBM wired things a long long time ago.
+            On_Software_CPU_Reset();
+            E_Exit("Triple fault reset call unexpectedly returned");
+        }
 
-	const auto has_error_code = which == EXCEPTION_DF ||
-	                            (which >= EXCEPTION_TS && which <= EXCEPTION_PF);
-	cpu.exception.error=error;
-	CPU_Interrupt(which, CPU_INT_EXCEPTION | (has_error_code ? CPU_INT_HAS_ERROR : 0), reg_eip);
+        if (always_report_double_fault || !has_printed_double_fault)
+        {
+            LOG_MSG("CPU_Exception: Exception %d during delivery of exception %d, triggering double fault",
+                    (int)which, first);
+            has_printed_double_fault = true;
+        }
+        which = EXCEPTION_DF;
+        error = 0;
+    }
 
-	/* allow recursive page faults. required for multitasking OSes like Windows 95.
-	 * we set this AFTER CPU_Interrupt so that if CPU_Interrupt faults while starting
-	 * a page fault we still trigger double fault. */
-	if (which == EXCEPTION_PF || which == EXCEPTION_GP) {
-		if (CPU_Exception_Level[which] > 0)
-			CPU_Exception_Level[which]--;
+    cpu_exception_delivery = track_delivery ? (int)which : -1;
 
-		if (!CPU_Exception_In_Progress.empty()) {
-			if ((Bitu)CPU_Exception_In_Progress.top() == which)
-				CPU_Exception_In_Progress.pop();
-			else
-				LOG_MSG("Top of fault stack not the same as what I'm handling");
-		}
-	}
+    const bool has_error_code = which == EXCEPTION_DF || (which >= EXCEPTION_TS && which <= EXCEPTION_PF);
+    cpu.exception.error = error;
+    try
+    {
+        CPU_Interrupt(which, CPU_INT_EXCEPTION | (has_error_code ? CPU_INT_HAS_ERROR : 0), reg_eip);
+    }
+    catch (const GuestPageFaultException&)
+    {
+        // The main loop will deliver #PF; retain the interrupted exception.
+        throw;
+    }
+    catch (...)
+    {
+        CPU_Exception_Level_Reset();
+        throw;
+    }
+    CPU_Exception_Level_Reset();
 }
 
 uint8_t lastint;
@@ -1374,10 +1562,20 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 			}
 		} 
 
+        Bitu ext = 0;
+        if (!(type & CPU_INT_SOFTWARE))
+        {
+            // Later processors may also need this, but need physical testing.
+            if (CPU_ArchitectureType == CPU_ARCHTYPE_286 && (type & CPU_INT_EXCEPTION))
+                ext = num == EXCEPTION_DB || num == EXCEPTION_NM || num == 9 || num == EXCEPTION_MF;
+            else
+                ext = 1;
+        }
+
 		Descriptor gate;
 		if (!cpu.idt.GetDescriptor(num<<3,gate)) {
 			// zone66
-			CPU_Exception(EXCEPTION_GP,num*8+2+((type&CPU_INT_SOFTWARE)?0:1));
+			CPU_Exception(EXCEPTION_GP,num*8+2+ext);
 			return;
 		}
 
@@ -1402,22 +1600,22 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 			{
 				CPU_CHECK_COND(!gate.saved.seg.p,
 					"INT:Gate segment not present",
-					EXCEPTION_NP,num*8+2+((type&CPU_INT_SOFTWARE)?0:1))
+					EXCEPTION_NP,num*8+2+ext)
 
 				Descriptor cs_desc;
 				Bitu gate_sel=gate.GetSelector();
 				Bitu gate_off=gate.GetOffset();
 				CPU_CHECK_COND((gate_sel & 0xfffc)==0,
 					"INT:Gate with CS zero selector",
-					EXCEPTION_GP,(type&CPU_INT_SOFTWARE)?0:1)
+					EXCEPTION_GP,ext)
 				CPU_CHECK_COND(!cpu.gdt.GetDescriptor(gate_sel,cs_desc),
 					"INT:Gate with CS beyond limit",
-					EXCEPTION_GP,(gate_sel & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+					EXCEPTION_GP,(gate_sel & 0xfffc)+ext)
 
 				Bitu cs_dpl=cs_desc.DPL();
 				CPU_CHECK_COND(cs_dpl>cpu.cpl,
 					"Interrupt to higher privilege",
-					EXCEPTION_GP,(gate_sel & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+					EXCEPTION_GP,(gate_sel & 0xfffc)+ext)
 				switch (cs_desc.Type()) {
 				case DESC_CODE_N_NC_A:	case DESC_CODE_N_NC_NA:
 				case DESC_CODE_R_NC_A:	case DESC_CODE_R_NC_NA:
@@ -1425,7 +1623,7 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 						/* Prepare for gate to inner level */
 						CPU_CHECK_COND(!cs_desc.saved.seg.p,
 							"INT:Inner level:CS segment not present",
-							EXCEPTION_NP,(gate_sel & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+							EXCEPTION_NP,(gate_sel & 0xfffc)+ext)
 						CPU_CHECK_COND((reg_flags & FLAG_VM) && (cs_dpl!=0),
 							"V86 interrupt calling codesegment with DPL>0",
 							EXCEPTION_GP,gate_sel & 0xfffc)
@@ -1439,14 +1637,14 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 						cpu_tss.Get_SSx_ESPx(cs_dpl,n_ss,n_esp);
 						CPU_CHECK_COND((n_ss & 0xfffc)==0,
 							"INT:Gate with SS zero selector",
-							EXCEPTION_TS,(type&CPU_INT_SOFTWARE)?0:1)
+							EXCEPTION_TS,ext)
 						Descriptor n_ss_desc;
 						CPU_CHECK_COND(!cpu.gdt.GetDescriptor(n_ss,n_ss_desc),
 							"INT:Gate with SS beyond limit",
-							EXCEPTION_TS,(n_ss & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+							EXCEPTION_TS,(n_ss & 0xfffc)+ext)
 						CPU_CHECK_COND(((n_ss & 3)!=cs_dpl) || (n_ss_desc.DPL()!=cs_dpl),
 							"INT:Inner level with CS_DPL!=SS_DPL and SS_RPL",
-							EXCEPTION_TS,(n_ss & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+							EXCEPTION_TS,(n_ss & 0xfffc)+ext)
 
 						// check if stack segment is a writable data segment
 						switch (n_ss_desc.Type()) {
@@ -1458,10 +1656,11 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 						}
 						CPU_CHECK_COND(!n_ss_desc.saved.seg.p,
 							"INT:Inner level with nonpresent SS",
-							EXCEPTION_SS,(n_ss & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+							EXCEPTION_SS,(n_ss & 0xfffc)+ext)
 
 						// commit point
 						Segs.expanddown[ss]=n_ss_desc.GetExpandDown();
+						Segs.ar[ss]=n_ss_desc.GetAccessRights();
 						Segs.limit[ss]=do_seg_limits? (PhysPt)n_ss_desc.GetLimit():((PhysPt)(~0UL));
 						Segs.phys[ss]=n_ss_desc.GetBase();
 						Segs.val[ss]=n_ss;
@@ -1480,10 +1679,10 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 						CPU_SetCPL(cs_dpl);
 						if (gate.Type() & 0x8) {	/* 32-bit Gate */
 							if (reg_flags & FLAG_VM) {
-								CPU_Push32(SegValue(gs));SegSet16(gs,0x0);
-								CPU_Push32(SegValue(fs));SegSet16(fs,0x0);
-								CPU_Push32(SegValue(ds));SegSet16(ds,0x0);
-								CPU_Push32(SegValue(es));SegSet16(es,0x0);
+								CPU_Push32(SegValue(gs));SegSet16(gs,0x0);Segs.ar[gs]=SEG_AR_UNUSABLE;
+								CPU_Push32(SegValue(fs));SegSet16(fs,0x0);Segs.ar[fs]=SEG_AR_UNUSABLE;
+								CPU_Push32(SegValue(ds));SegSet16(ds,0x0);Segs.ar[ds]=SEG_AR_UNUSABLE;
+								CPU_Push32(SegValue(es));SegSet16(es,0x0);Segs.ar[es]=SEG_AR_UNUSABLE;
 							}
 							CPU_Push32(o_ss);
 							CPU_Push32(o_esp);
@@ -1502,7 +1701,7 @@ void CPU_Interrupt(Bitu num,Bitu type,uint32_t oldeip) {
 					/* Prepare stack for gate to same privilege */
 					CPU_CHECK_COND(!cs_desc.saved.seg.p,
 							"INT:Same level:CS segment not present",
-						EXCEPTION_NP,(gate_sel & 0xfffc)+((type&CPU_INT_SOFTWARE)?0:1))
+						EXCEPTION_NP,(gate_sel & 0xfffc)+ext)
 					if ((reg_flags & FLAG_VM) && (cs_dpl<cpu.cpl))
 						E_Exit("V86 interrupt doesn't change to pl0");	// or #GP(cs_sel)
 
@@ -1528,6 +1727,7 @@ do_interrupt:
 				Segs.phys[cs]=cs_desc.GetBase();
 				Segs.limit[cs]=do_seg_limits? (PhysPt)cs_desc.GetLimit():((PhysPt)(~0UL));
 				Segs.expanddown[cs]=cs_desc.GetExpandDown();
+				Segs.ar[cs]=cs_desc.GetAccessRights();
 				cpu.code.big=cs_desc.Big()>0;
 				reg_eip=(uint32_t)gate_off;
 
@@ -1543,7 +1743,7 @@ do_interrupt:
 		case DESC_TASK_GATE:
 			CPU_CHECK_COND(!gate.saved.seg.p,
 				"INT:Gate segment not present",
-				EXCEPTION_NP,num*8+2+((type&CPU_INT_SOFTWARE)?0:1))
+				EXCEPTION_NP,num*8+2+ext)
 
 			CPU_SwitchTask(gate.GetSelector(),TSwitch_CALL_INT,oldeip);
 			if (type & CPU_INT_HAS_ERROR) {
@@ -1580,18 +1780,6 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 	/* FIXME: If the IRET causes an exception, is it still considered the end of the NMI? */
 	CPU_NMI_active = false;
 
-	/* Fault emulation */
-	if (!CPU_Exception_In_Progress.empty()) {
-		int which = CPU_Exception_In_Progress.top();
-		CPU_Exception_In_Progress.pop();
-		assert(which < 0x20);
-
-		if (CPU_Exception_Level[which] > 0)
-			CPU_Exception_Level[which]--;
-
-//		LOG_MSG("Leaving CPU exception %d",which);
-	}
-
 	if (!cpu.pmode) {					/* RealMode IRET */
 		if (use32) {
 			reg_eip=CPU_Pop32();
@@ -1623,6 +1811,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 
 					reg_eip=new_eip;
 					SegSet16(cs,(uint16_t)(new_cs&0xffff));
+					CPU_SetSegV86Hidden(cs);
 					/* IOPL can not be modified in v86 mode by IRET */
 					CPU_SetFlags(new_flags,FMASK_NORMAL|FLAG_NT);
 				} else {
@@ -1635,6 +1824,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 
 					reg_eip=(uint32_t)new_eip;
 					SegSet16(cs,new_cs);
+					CPU_SetSegV86Hidden(cs);
 					/* IOPL can not be modified in v86 mode by IRET */
 					CPU_SetFlags(new_flags,FMASK_NORMAL|FLAG_NT);
 				}
@@ -1698,6 +1888,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 				reg_esp=n_esp;
 				cpu.code.big=false;
 				SegSet16(cs,(uint16_t)n_cs_sel);
+				CPU_SetSegV86Hidden(cs);
 				LOG(LOG_CPU,LOG_NORMAL)("IRET:Back to V86: CS:%X IP %X SS:%X SP %X FLAGS:%X",SegValue(cs),reg_eip,SegValue(ss),reg_esp,reg_flags);	
 				return;
 				}
@@ -1758,6 +1949,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 			// commit point
 			reg_esp=tempesp;
 			Segs.expanddown[cs]=n_cs_desc.GetExpandDown();
+			Segs.ar[cs]=n_cs_desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)n_cs_desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=n_cs_desc.GetBase();
 			cpu.code.big=n_cs_desc.Big()>0;
@@ -1810,6 +2002,8 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 			// commit point
 
 			Segs.expanddown[cs]=n_cs_desc.GetExpandDown();
+
+			Segs.ar[cs]=n_cs_desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)n_cs_desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=n_cs_desc.GetBase();
 			cpu.code.big=n_cs_desc.Big()>0;
@@ -1827,6 +2021,7 @@ void CPU_IRET(bool use32,uint32_t oldeip) {
 			Segs.phys[ss]=n_ss_desc.GetBase();
 			Segs.limit[ss]=do_seg_limits? (PhysPt)n_ss_desc.GetLimit():((PhysPt)(~0UL));
 			Segs.expanddown[ss]=n_ss_desc.GetExpandDown();
+			Segs.ar[ss]=n_ss_desc.GetAccessRights();
 			if (n_ss_desc.Big()) {
 				cpu.stack.big=true;
 				cpu.stack.mask=0xffffffff;
@@ -1857,6 +2052,7 @@ void CPU_JMP(bool use32,Bitu selector,Bitu offset,uint32_t oldeip) {
 			reg_eip=(uint32_t)offset;
 		}
 		SegSet16(cs,(uint16_t)selector);
+		if (reg_flags & FLAG_VM) CPU_SetSegV86Hidden(cs);
 		if (!cpu_allow_big16) cpu.code.big=false;
 		return;
 	} else {
@@ -1891,9 +2087,14 @@ CODE_jmp:
 				CPU_Exception(EXCEPTION_NP,selector & 0xfffc);
 				return;
 			}
+			/* the new EIP must be within the limit of the code segment */
+			CPU_CHECK_COND(do_seg_limits && (uint32_t)offset > (uint32_t)desc.GetLimit(),
+				"JMP:EIP beyond the code segment limit",
+				EXCEPTION_GP,0)
 
 			/* Normal jump to another selector:offset */
 			Segs.expanddown[cs]=desc.GetExpandDown();
+			Segs.ar[cs]=desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=desc.GetBase();
 			cpu.code.big=desc.Big()>0;
@@ -1971,6 +2172,7 @@ CODE_jmp:
 
 					/* Switch to new CS:EIP */
 					Segs.expanddown[cs]=n_cs_desc.GetExpandDown();
+					Segs.ar[cs]=n_cs_desc.GetAccessRights();
 					Segs.limit[cs]  = do_seg_limits? (PhysPt)n_cs_desc.GetLimit():((PhysPt)(~0UL));
 					Segs.phys[cs]	= n_cs_desc.GetBase();
 					Segs.val[cs]	= (uint16_t)((n_cs_sel & 0xfffc) | cpu.cpl);
@@ -2015,6 +2217,7 @@ void CPU_CALL(bool use32,Bitu selector,Bitu offset,uint32_t oldeip) {
 		}
 		if (!cpu_allow_big16) cpu.code.big=false;
 		SegSet16(cs,(uint16_t)selector);
+		if (reg_flags & FLAG_VM) CPU_SetSegV86Hidden(cs);
 		return;
 	} else {
 		CPU_CHECK_COND((selector & 0xfffc)==0,
@@ -2049,6 +2252,10 @@ call_code:
 				CPU_Exception(EXCEPTION_NP,selector & 0xfffc);
 				return;
 			}
+			/* the new EIP must be within the limit of the code segment */
+			CPU_CHECK_COND(do_seg_limits && (uint32_t)(use32 ? offset : (offset & 0xffff)) > (uint32_t)call.GetLimit(),
+				"CALL:EIP beyond the code segment limit",
+				EXCEPTION_GP,0)
 			// commit point
 			try {
 			if (!use32) {
@@ -2069,6 +2276,8 @@ call_code:
 			}
 
 			Segs.expanddown[cs]=call.GetExpandDown();
+
+			Segs.ar[cs]=call.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)call.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=call.GetBase();
 			cpu.code.big=call.Big()>0;
@@ -2176,6 +2385,7 @@ call_code:
 						Segs.phys[ss]=n_ss_desc.GetBase();
 						Segs.limit[ss]=do_seg_limits? (PhysPt)n_ss_desc.GetLimit():((PhysPt)(~0UL));
 						Segs.expanddown[ss]=n_ss_desc.GetExpandDown();
+						Segs.ar[ss]=n_ss_desc.GetAccessRights();
 						if (n_ss_desc.Big()) {
 							cpu.stack.big=true;
 							cpu.stack.mask=0xffffffff;
@@ -2192,6 +2402,7 @@ call_code:
 						uint16_t oldcs    = SegValue(cs);
 						/* Switch to new CS:EIP */
 						Segs.expanddown[cs]=n_cs_desc.GetExpandDown();
+						Segs.ar[cs]=n_cs_desc.GetAccessRights();
 						Segs.limit[cs]  = do_seg_limits? (PhysPt)n_cs_desc.GetLimit():((PhysPt)(~0UL));
 						Segs.phys[cs]	= n_cs_desc.GetBase();
 						Segs.val[cs]	= (uint16_t)((n_cs_sel & 0xfffc) | cpu.cpl);
@@ -2243,6 +2454,7 @@ call_code:
 
 					/* Switch to new CS:EIP */
 					Segs.expanddown[cs]=n_cs_desc.GetExpandDown();
+					Segs.ar[cs]=n_cs_desc.GetAccessRights();
 					Segs.limit[cs]  = do_seg_limits? (PhysPt)n_cs_desc.GetLimit():((PhysPt)(~0UL));
 					Segs.phys[cs]	= n_cs_desc.GetBase();
 					Segs.val[cs]	= (uint16_t)((n_cs_sel & 0xfffc) | cpu.cpl);
@@ -2312,6 +2524,7 @@ void CPU_RET(bool use32,Bitu bytes,uint32_t oldeip) {
 			 *      pointer instead of subtracting. --Jonathan C. */
 			reg_esp=(reg_esp&cpu.stack.notmask)|((reg_esp+(uint32_t)bytes)&cpu.stack.mask);
 			SegSet16(cs,new_cs);
+			if (reg_flags & FLAG_VM) CPU_SetSegV86Hidden(cs);
 			reg_eip=new_ip;
 			if (!cpu_allow_big16) cpu.code.big=false;
 			return;
@@ -2387,6 +2600,8 @@ RET_same_level:
 			}
 
 			Segs.expanddown[cs]=desc.GetExpandDown();
+
+			Segs.ar[cs]=desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=desc.GetBase();
 			cpu.code.big=desc.Big()>0;
@@ -2473,6 +2688,7 @@ RET_same_level:
 
 			CPU_SetCPL(rpl);
 			Segs.expanddown[cs]=desc.GetExpandDown();
+			Segs.ar[cs]=desc.GetAccessRights();
 			Segs.limit[cs]=do_seg_limits? (PhysPt)desc.GetLimit():((PhysPt)(~0UL));
 			Segs.phys[cs]=desc.GetBase();
 			cpu.code.big=desc.Big()>0;
@@ -2483,6 +2699,7 @@ RET_same_level:
 			Segs.phys[ss]=n_ss_desc.GetBase();
 			Segs.limit[ss]=do_seg_limits? (PhysPt)n_ss_desc.GetLimit():((PhysPt)(~0UL));
 			Segs.expanddown[ss]=n_ss_desc.GetExpandDown();
+			Segs.ar[ss]=n_ss_desc.GetAccessRights();
 			if (n_ss_desc.Big()) {
 				cpu.stack.big=true;
 				cpu.stack.mask=0xffffffff;
@@ -2800,6 +3017,9 @@ bool CPU_WRITE_DRX(Bitu dr,Bitu value) {
 		LOG(LOG_CPU,LOG_ERROR)("Unhandled MOV DR%d,%X",dr,value);
 		break;
 	}
+	/* breakpoint addresses or enables changed. Only the emulated cores get here
+	 * (the KVM core runs MOV DRx in the guest, see CPU_Debug_Run) */
+	if (dr <= 3 || dr == 5 || dr == 7) CPU_DebugRegsChanged();
 	return false;
 }
 
@@ -3064,10 +3284,10 @@ bool CPU_SetSegGeneral(SegNames seg,uint16_t value) {
 			cpu.stack.notmask=0xffff0000;
 		}
 
-		/* real mode: loads do not change the limit. "Flat real mode" would not be possible otherwise.
-		 * vm86: loads are fixed at 64KB (right?) */
+		/* real mode: loads do not change the limit or the access rights. "Flat real mode" would
+		 * not be possible otherwise. vm86: loads set them, the limit to 64KB */
 		if (reg_flags & FLAG_VM)
-			Segs.limit[seg] = 0xFFFF;
+			CPU_SetSegV86Hidden(seg);
 
 		return false;
 	} else {
@@ -3105,6 +3325,7 @@ bool CPU_SetSegGeneral(SegNames seg,uint16_t value) {
 			Segs.phys[seg]=desc.GetBase();
 			Segs.limit[seg]=do_seg_limits? (PhysPt)desc.GetLimit():((PhysPt)(~0UL));
 			Segs.expanddown[seg]=desc.GetExpandDown();
+			Segs.ar[seg]=desc.GetAccessRights();
 			if (desc.Big()) {
 				cpu.stack.big=true;
 				cpu.stack.mask=0xffffffff;
@@ -3118,6 +3339,7 @@ bool CPU_SetSegGeneral(SegNames seg,uint16_t value) {
 			if ((value & 0xfffc)==0) {
 				Segs.val[seg]=value;
 				Segs.phys[seg]=0;	// ??
+				Segs.ar[seg]=SEG_AR_UNUSABLE;
 				return false;
 			}
 			Descriptor desc;
@@ -3151,6 +3373,7 @@ bool CPU_SetSegGeneral(SegNames seg,uint16_t value) {
 			Segs.phys[seg]=desc.GetBase();
 			Segs.limit[seg]=do_seg_limits?(PhysPt)desc.GetLimit():((PhysPt)(~0UL));
 			Segs.expanddown[seg]=desc.GetExpandDown();
+			Segs.ar[seg]=desc.GetAccessRights();
 		}
 
 		return false;
@@ -3512,6 +3735,17 @@ static void CPU_ToggleNormalCore(bool pressed) {
     }
 }
 
+#if C_KVM
+static void CPU_ToggleKVMCore(bool pressed) {
+    if (!pressed) return;
+    Section* sec=control->GetSection("cpu");
+    if(sec) {
+	std::string tmp="core=kvm";
+	sec->HandleInputline(tmp);
+    }
+}
+#endif
+
 #if (C_DYNAMIC_X86) || (C_DYNREC)
 static void CPU_ToggleDynamicCore(bool pressed) {
     if (!pressed) return;
@@ -3686,12 +3920,12 @@ public:
 		do_lds_wraparound = section->Get_bool("lds wraparound");
 		do_seg_limits = section->Get_bool("segment limits");
 	
-		SegSet16(cs,0); Segs.limit[cs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[cs] = false;
-		SegSet16(ds,0); Segs.limit[ds] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[ds] = false;
-		SegSet16(es,0); Segs.limit[es] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[es] = false;
-		SegSet16(fs,0); Segs.limit[fs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[fs] = false;
-		SegSet16(gs,0); Segs.limit[gs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[gs] = false;
-		SegSet16(ss,0); Segs.limit[ss] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[ss] = false;
+		SegSet16(cs,0); Segs.limit[cs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[cs] = false; Segs.ar[cs] = SEG_AR_REAL_CODE;
+		SegSet16(ds,0); Segs.limit[ds] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[ds] = false; Segs.ar[ds] = SEG_AR_REAL_DATA;
+		SegSet16(es,0); Segs.limit[es] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[es] = false; Segs.ar[es] = SEG_AR_REAL_DATA;
+		SegSet16(fs,0); Segs.limit[fs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[fs] = false; Segs.ar[fs] = SEG_AR_REAL_DATA;
+		SegSet16(gs,0); Segs.limit[gs] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[gs] = false; Segs.ar[gs] = SEG_AR_REAL_DATA;
+		SegSet16(ss,0); Segs.limit[ss] = do_seg_limits ? 0xFFFF : ((PhysPt)(~0UL)); Segs.expanddown[ss] = false; Segs.ar[ss] = SEG_AR_REAL_DATA;
 	
 		CPU_SetFlags(FLAG_IF,FMASK_ALL);		//Enable interrupts
 		fpu.mxcsr=0x1F80; // The default MXCSR value is... [https://www.felixcloutier.com/x86/ldmxcsr]
@@ -3753,6 +3987,13 @@ public:
 		item->set_text("Simple core");
 		MAPPER_AddHandler(CPU_ToggleFullCore,MK_nothing,0,"full","CPU: full core",&item);
 		item->set_text("Full core");
+#endif
+#if C_KVM
+		MAPPER_AddHandler(CPU_ToggleKVMCore,MK_nothing,0,"kvm","CPU: KVM core",&item);
+		item->set_text("KVM core (experimental)");
+		item->set_description("Run the guest with hardware virtualization (Linux KVM) instead of an emulated CPU. "
+			"Needs cputype 386 or later, and callback instructions with the INT3 prefix: [cpu] callback int3 prefix=true, "
+			"or auto with core=kvm when DOSBox-X starts.");
 #endif
 
 		/* these are not mapper shortcuts, and probably should not be mapper shortcuts */
@@ -4359,7 +4600,7 @@ public:
 			CALLBACK_ChooseInt3Prefix(); /* the CPU is set up before the callbacks */
 			if (!CALLBACK_Int3Prefix)
 				reason = "callback instructions are written without the INT3 prefix "
-					"(set [cpu] callback int3 prefix to auto or true and restart DOSBox-X)";
+					"(set [cpu] callback int3 prefix=true, or start DOSBox-X with core=kvm)";
 			else if (CPU_ArchitectureType < CPU_ARCHTYPE_386)
 				reason = "it needs cputype 386 or later";
 			else if (KVM_CoreInit(reason)) {
@@ -4390,6 +4631,8 @@ public:
 					cpudecoder == &CPU_Core_Normal_Run ? "normal" : "emulated");
 				strcpy(core_mode,"normal");
 			}
+
+			menu_update_core(); /* the core is chosen after the menu was updated above */
 		}
 #endif
 
@@ -4419,6 +4662,7 @@ void CPU_ShutDown(Section* sec) {
 void CPU_OnReset(Section* sec) {
     (void)sec;//UNUSED
 	CPU_SyncState();
+	CPU_Exception_Level_Reset();
 
 	LOG(LOG_CPU,LOG_DEBUG)("CPU reset");
 
@@ -4433,6 +4677,8 @@ void CPU_OnReset(Section* sec) {
 
 	Segs.limit[cs]=0xFFFF;
 	Segs.expanddown[cs]=false;
+	Segs.ar[cs]=SEG_AR_REAL_CODE;
+	Segs.ar[ds]=Segs.ar[es]=Segs.ar[fs]=Segs.ar[gs]=Segs.ar[ss]=SEG_AR_REAL_DATA;
 	if (CPU_ArchitectureType >= CPU_ARCHTYPE_386) {
 		/* 386 and later start at F000:FFF0 with CS base set to FFFF0000 (really?) */
 		SegSet16(cs,0xF000);
@@ -4744,12 +4990,14 @@ bool CPU_SYSENTER() {
 	Segs.phys[cs] = 0;
 	Segs.limit[cs] = 0xFFFFFFFF;
 	Segs.expanddown[cs] = false;
+	Segs.ar[cs] = 0xC09Bu; /* 4GB, 32-bit, present, DPL 0, execute/read, accessed */
 	cpu.code.big = true;
 
 	Segs.val[ss] = (cpu_sep_cs & 0xFFFC) + 0x8; /* Yes, really. Look it up in Intel's documentation */
 	Segs.phys[ss] = 0;
 	Segs.limit[ss] = 0xFFFFFFFF;
 	Segs.expanddown[ss] = false;
+	Segs.ar[ss] = 0xC093u; /* 4GB, 32-bit, present, DPL 0, read/write, accessed */
 	cpu.stack.big = true;
 	cpu.stack.mask = 0xffffffff;
 	cpu.stack.notmask = 0x00000000;
@@ -4781,12 +5029,14 @@ bool CPU_SYSEXIT() {
 	Segs.phys[cs] = 0;
 	Segs.limit[cs] = 0xFFFFFFFF;
 	Segs.expanddown[cs] = false;
+	Segs.ar[cs] = 0xC0FBu; /* 4GB, 32-bit, present, DPL 3, execute/read, accessed */
 	cpu.code.big = true;
 
 	Segs.val[ss] = (cpu_sep_cs & 0xFFFC) + 0x18 + 3/*RPL*/; /* Yes, really. Look it up in Intel's documentation */
 	Segs.phys[ss] = 0;
 	Segs.limit[ss] = 0xFFFFFFFF;
 	Segs.expanddown[ss] = false;
+	Segs.ar[ss] = 0xC0F3u; /* 4GB, 32-bit, present, DPL 3, read/write, accessed */
 	cpu.stack.big = true;
 	cpu.stack.mask = 0xffffffff;
 	cpu.stack.notmask = 0x00000000;
@@ -5044,6 +5294,18 @@ bool FPU_NumericException(void)
 	return true;
 }
 
+bool FPU_NumericExceptionWithContext(uint32_t instruction_pointer_offset,
+                                     uint16_t opcode)
+{
+	if (!FPU_UnmaskedExceptionPending()) return false;
+
+	FPU_RecordExceptionContextFromDynCPU(instruction_pointer_offset, opcode);
+	if (!FPU_NumericExceptionPending()) return false;
+	cpu.exception.which = EXCEPTION_MF;
+	cpu.exception.error = 0;
+	return true;
+}
+
 bool MMX_CoprocessorException(void) {
 	/* If EM bit set, undefined code.
 	 * Else if TS set, exception 7 */
@@ -5239,6 +5501,9 @@ void setBytes(std::istream& stream) override
 #if (C_DYNREC)
     CPU_Core_Dynrec_Cache_Reset();
 #endif
+
+    // the DR0-DR3 breakpoints of the loaded debug registers (with paging loaded, for the watched pages)
+    CPU_DebugRegsChanged();
 }
 } dummy;
 }

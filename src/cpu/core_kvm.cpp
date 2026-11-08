@@ -33,12 +33,14 @@
 #include <time.h>
 #include <unistd.h>
 #include <linux/kvm.h>
+#include <x86intrin.h>
 
 #include <algorithm>
 #include <string>
 #include <vector>
 
 #include "callback.h"
+#include "control.h"
 #include "core_kvm.h"
 #include "cpu.h"
 #include "cpu_state.h"
@@ -51,6 +53,7 @@
 #include "pic.h"
 #include "regs.h"
 #include "setup.h"
+#include "vga.h"
 
 #ifndef sigev_notify_thread_id
 #define sigev_notify_thread_id _sigev_un._tid
@@ -82,18 +85,28 @@ static struct {
 	bool		in_kvm = false;
 	bool		rest_in_kvm = false;
 	bool		sync_regs = false;	/* registers through kvm_run (KVM_CAP_SYNC_REGS) */
-	bool		sync_events = false;	/* and the vCPU events (see KVM_DropEvent()) */
+	bool		exit_on_emulation_failure = false;	/* KVM_CAP_EXIT_ON_EMULATION_FAILURE is on */
+	bool		emulate_one = false;	/* KVM could not emulate an instruction: the normal core runs it */
+	bool		flush_tlb = false;	/* DOSBox-X changed the guest's page tables (PAGING_GuestPageTablesChanged()) */
 
 	/* Coalesced MMIO: writes to the video memory window are queued in this ring instead of
 	 * each exiting, and applied when KVM_RUN returns (see KVM_FlushWrites()) */
 	struct kvm_coalesced_mmio_ring*	ring = NULL;
 	uint32_t	ring_max = 0;
+	bool		pio_queue = false;	/* port writes are queued too (KVM_CAP_COALESCED_PIO) */
+	bool		vga_data_queued = false;	/* also the VGA sequencer and graphics controller data ports */
 
 	/* An I/O or MMIO exit is the middle of an instruction: KVM finishes it (with the data the
 	 * handler put in kvm_run) at the next KVM_RUN, and until then the vCPU state is not
 	 * consistent. See KVM_CompletePending(). */
 	bool		pending = false;
 	bool		guest_if = false;	/* the guest's IF as of the last exit */
+
+	/* KVM may still be delivering an event (see KVM_DropEvent()): only after a KVM_RUN that a
+	 * signal ended (an exit for I/O, MMIO, a callback or HLT happens between instructions,
+	 * and an interrupt window opens only when nothing is being delivered), and after a full
+	 * state fetch, whose state DOSBox-X may replace entirely (save states, the debugger) */
+	bool		event_in_flight = true;
 
 	/* KVM host time, nanoseconds: what going into the guest and out again costs, which is not
 	 * charged to the guest (see KVM_Overhead()): for port I/O, MMIO, callback (debug) and HLT
@@ -105,8 +118,47 @@ static struct {
 	uint64_t	last_exit_cost = 0;	/* the estimate for the last exit, 0 for a signal */
 
 	/* statistics, logged when DOSBox-X exits */
-	uint64_t	runs = 0,io = 0,mmio = 0,coalesced = 0,callbacks = 0,int3 = 0,hlt = 0,windows = 0,slices = 0,puts = 0,gets = 0;
+	uint64_t	runs = 0,io = 0,mmio = 0,coalesced = 0,callbacks = 0,int3 = 0,hlt = 0,windows = 0,slices = 0,puts = 0,gets = 0,emulated = 0;
 } kvm;
+
+/* Planar and unchained VGA on an emulated core (KVM-TODO.md, step 26). In those modes every
+ * guest access to video memory is an exit (a queued write still exits inside the kernel), and
+ * a game drawing in them runs many times slower than on the dynamic core. While such exits
+ * take a large share of the guest's time, CPU_Core_KVM_Run() runs the guest on an emulated
+ * core instead, and goes back to KVM when its video memory accesses would no longer cost much
+ * under KVM. */
+static struct {
+	CPU_Decoder*	core = NULL;	/* the emulated core, NULL: always KVM ([cpu] kvm vga core) */
+	CPU_Decoder*	trap = NULL;	/* its trap flag decoder */
+	int		dyn = 0;	/* 1: dynamic_x86, 2: dynamic_rec, whose code cache is reset when going back */
+	bool		active = false;	/* the emulated core runs the guest */
+
+	/* KVM host time, nanoseconds: how long the guest ran in KVM since the last check, and the
+	 * estimate of how much of that was exits for video memory (A0000-BFFFF) */
+	uint64_t	win_ns = 0,vga_ns = 0;
+
+	/* on the emulated core: the emulated time (ms) of the last check, and the video memory
+	 * accesses through the memory handlers then */
+	pic_tickindex_t	check = 0,since = 0;
+	uint32_t	writes = 0,reads = 0;
+
+	/* with auto-adjusted cycles, KVM's (nanoseconds) and the emulated core's (instructions),
+	 * swapped when switching */
+	cpu_cycles_count_t	kvm_cyclemax = 0,emu_cyclemax = 0;
+
+	int64_t		tsc_offset = 0;	/* the guest's TSC less the host's, as KVM runs it */
+
+	uint64_t	stretches = 0;
+	pic_tickindex_t	emulated_ms = 0;	/* emulated time on the emulated core, for the statistics */
+} kvm_vga;
+
+/* KVM host time, nanoseconds: how long the guest has to run in KVM before checking, how much of
+ * that video memory exits must take to switch, and what share they would take on the emulated
+ * core (estimated from its accesses per emulated millisecond) to stay there. How long the
+ * emulated core runs between checks: emulated milliseconds. */
+static const uint64_t kvm_vga_window_ns = 20000000u;
+static const unsigned int kvm_vga_switch_percent = 40,kvm_vga_stay_percent = 25;
+static const pic_tickindex_t kvm_vga_period_ms = 50;
 
 /* Guest physical memory as KVM memory slots (see KVM-TODO.md, step 8). A slot maps a run of
  * pages that are host memory to KVM (read-only for MEM_PAGE_READONLY); other pages have no slot,
@@ -116,6 +168,7 @@ struct KVM_Slot {
 	Bitu		page,pages;
 	HostPt		host;
 	bool		readonly;
+	bool		dirtylog;	/* KVM logs the pages the guest writes (the mode 13h shadow) */
 };
 
 static struct {
@@ -126,6 +179,10 @@ static struct {
 	bool			dirty = true;	/* pages [dirty_lo,dirty_hi] need reclassifying */
 	Bitu			dirty_lo = 0,dirty_hi = ~(Bitu)0;
 	bool			paging = false;	/* guest paging state the first MB layout is for */
+
+	/* pages left as MMIO because their handler was not known yet (see KVM_ApplyMapChanges()),
+	 * one bit per page of the 4GB */
+	std::vector<uint64_t>	deferred = std::vector<uint64_t>(0x100000u / 64u,0);
 } kvm_mem;
 
 /* KVM's own pages (identity map and TSS, see kvm_tss_addr) */
@@ -157,17 +214,79 @@ static void KVM_MapChange(MEM_MapChangeKind kind,Bitu page,Bitu pages) {
 
 /* What guest physical page 'page' is in KVM's view. Without paging, DOSBox-X remaps the first
  * MB+64KB through paging.firstmb[] (EMS), which KVM's guest physical address space must show. */
+/* Chained 256-colour memory (mode 13h) through the memory handler makes every guest write an
+ * exit that KVM handles itself, since chain 4 does not map linearly onto VGA memory. While the
+ * plain chained handler covers A0000-AFFFF (VGA_ChainedShadowable()), a 64KB shadow in the
+ * guest's byte order is mapped there instead, with dirty logging: the pages the guest wrote go
+ * to VGA memory when the core returns (and before the memory map changes), so that drawing,
+ * callbacks and everything else in DOSBox-X see them, and the shadow is loaded again before
+ * the guest runs when DOSBox-X wrote video memory through the memory handlers. */
+static struct {
+	HostPt			mem = NULL;	/* 64KB, page-aligned */
+	bool			active = false;	/* mapped at A0000-AFFFF */
+	VGA_ChainedShadowMap	map;		/* where its bytes are in VGA memory */
+	uint32_t		writes = 0;	/* VGA_MemWriteCount when it was last loaded */
+} kvm_shadow;
+
 static MEM_PageInfo KVM_PageAt(Bitu page) {
 	if (page < LINK_START && !kvm_mem.paging)
 		page = paging.firstmb[page];
+	if (kvm_shadow.active && page >= 0xA0u && page < 0xB0u) {
+		MEM_PageInfo info = MEM_ClassifyPage(page);
+		info.kind = MEM_PAGE_RAM;
+		info.host = kvm_shadow.mem + (page - 0xA0u) * 4096u;
+		return info;
+	}
 	return MEM_ClassifyPage(page);
 }
 
-static bool KVM_SetSlot(uint32_t id,Bitu page,Bitu pages,HostPt host,bool readonly) {
+/* The pages of the shadow the guest wrote since the last time, to VGA memory */
+static void KVM_ShadowStore(void) {
+	if (!kvm_shadow.active) return;
+	for (const auto &sl : kvm_mem.slots) {
+		if (!sl.dirtylog) continue;
+		uint64_t bitmap[1] = {0};	/* one bit per page, at most 16 */
+		struct kvm_dirty_log log;
+		memset(&log,0,sizeof(log));
+		log.slot = sl.id;
+		log.dirty_bitmap = bitmap;
+		if (ioctl(kvm.vm,KVM_GET_DIRTY_LOG,&log) < 0) return;
+		for (Bitu i=0;i < sl.pages && i < 64u;i++) {
+			if (bitmap[0] & ((uint64_t)1u << i))
+				VGA_ChainedShadowStore(kvm_shadow.map,kvm_shadow.mem + (sl.page + i - 0xA0u) * 4096u,(unsigned int)(sl.page + i - 0xA0u));
+		}
+	}
+}
+
+/* All of the shadow from VGA memory */
+static void KVM_ShadowLoad(void) {
+	for (unsigned int page=0;page < 16u;page++)
+		VGA_ChainedShadowLoad(kvm_shadow.map,kvm_shadow.mem + page * 4096u,page);
+	kvm_shadow.writes = VGA_MemWriteCount;
+}
+
+/* The map changed at A0000-AFFFF: store what the guest wrote with the old mapping, then
+ * decide again whether to map the shadow, and load it */
+static void KVM_ShadowUpdate(void) {
+	KVM_ShadowStore();
+	kvm_shadow.active = false;
+	VGA_ChainedShadowMap m;
+	if (!VGA_ChainedShadowable(m)) return;
+	if (kvm_shadow.mem == NULL) {
+		void *p = mmap(NULL,0x10000,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+		if (p == MAP_FAILED) return;
+		kvm_shadow.mem = (HostPt)p;
+	}
+	kvm_shadow.map = m;
+	kvm_shadow.active = true;
+	KVM_ShadowLoad();
+}
+
+static bool KVM_SetSlot(uint32_t id,Bitu page,Bitu pages,HostPt host,bool readonly,bool dirtylog) {
 	struct kvm_userspace_memory_region r;
 	memset(&r,0,sizeof(r));
 	r.slot = id;
-	r.flags = readonly ? KVM_MEM_READONLY : 0;
+	r.flags = (readonly ? KVM_MEM_READONLY : 0) | (dirtylog ? KVM_MEM_LOG_DIRTY_PAGES : 0);
 	r.guest_phys_addr = (uint64_t)page << 12u;
 	r.memory_size = (uint64_t)pages << 12u;	/* 0 deletes the slot */
 	r.userspace_addr = (uint64_t)(uintptr_t)host;
@@ -180,6 +299,28 @@ static bool KVM_SetSlot(uint32_t id,Bitu page,Bitu pages,HostPt host,bool readon
 }
 
 /* Bring the memory slots up to date with the memory map. Called before each KVM_RUN. */
+/* The VGA sequencer and graphics controller data ports (3C5h, 3CFh: map mask, bit mask,
+ * set/reset, write mode, read map select, ...) are queued as well while no page of A0000-BFFFF
+ * is mapped directly (planar 16-colour modes, mode X, text modes). All video memory accesses
+ * then exit or are queued, so they are applied in order with the port writes, also when a
+ * port write changes the memory map; the slots follow at the next KVM_RUN. While pages are
+ * mapped directly (the mode 13h shadow, the SVGA bank map), a data port write has to take
+ * effect before the guest's next access, and only the index ports are queued. */
+static void KVM_QueueVGAData(bool on) {
+	if (!kvm.pio_queue || on == kvm.vga_data_queued) return;
+	for (const uint16_t port : {(uint16_t)0x3C4,(uint16_t)0x3CE}) {
+		struct kvm_coalesced_mmio_zone zone;
+		memset(&zone,0,sizeof(zone));
+		zone.addr = port;
+		zone.size = 2;
+		zone.pio = 1;
+		ioctl(kvm.vm,KVM_UNREGISTER_COALESCED_MMIO,&zone); /* the zones within: index, or index and data */
+		zone.size = on ? 2 : 1;
+		ioctl(kvm.vm,KVM_REGISTER_COALESCED_MMIO,&zone);
+	}
+	kvm.vga_data_queued = on;
+}
+
 static bool KVM_ApplyMapChanges(void) {
 	/* everything the address lines reach, up to 4GB */
 	Bitu pages = MEM_PageMask() + 1u;
@@ -200,6 +341,13 @@ static bool KVM_ApplyMapChanges(void) {
 	if (hi >= kvm_mem.pages) hi = kvm_mem.pages - 1u;
 	if (lo > hi) return true;
 
+	/* the mode 13h shadow: all of A0000-AFFFF again */
+	if (lo <= 0xAFu && hi >= 0xA0u) {
+		if (lo > 0xA0u) lo = 0xA0u;
+		if (hi < 0xAFu) hi = 0xAFu;
+		KVM_ShadowUpdate();
+	}
+
 	/* slots that overlap the range are rebuilt whole */
 	for (const auto &sl : kvm_mem.slots) {
 		if (sl.page <= hi && (sl.page+sl.pages-1u) >= lo) {
@@ -210,14 +358,38 @@ static bool KVM_ApplyMapChanges(void) {
 
 	/* the runs of host memory in [lo,hi] */
 	std::vector<KVM_Slot> runs;
-	KVM_Slot run = {0,0,0,NULL,false};
+	KVM_Slot run = {0,0,0,NULL,false,false};
+	/* Above the first MB: a page whose handler is not known yet (MEM_PageHandlerKnown()) is not
+	 * looked up, which would ask every device about it and makes the first build of all 4GB
+	 * slow; it is MMIO until the guest touches it (see KVM_HandleMMIO()). Most of the rest is one
+	 * handler that has no memory behind it (nothing there, or a device that is all I/O): a page
+	 * whose handler is the last one seen that is not readable is not looked at further. */
+	PageHandler *no_memory = NULL;
 	for (Bitu page = lo;page <= hi;page++) {
+		if (page >= LINK_START) {
+			const uint64_t bit = (uint64_t)1u << (page & 63u);
+			if (!MEM_PageHandlerKnown(page)) {
+				kvm_mem.deferred[page >> 6u] |= bit;
+				if (run.pages != 0) runs.push_back(run);
+				run.pages = 0;
+				continue;
+			}
+			kvm_mem.deferred[page >> 6u] &= ~bit;
+		}
+		if (page >= LINK_START && no_memory != NULL && MEM_GetPageHandler(page) == no_memory) {
+			if (run.pages != 0) runs.push_back(run);
+			run.pages = 0;
+			continue;
+		}
 		const MEM_PageInfo info = KVM_PageAt(page);
+		if (page >= LINK_START && !(info.handler->getFlags() & PFLAG_READABLE)) no_memory = info.handler;
 		const bool mappable = info.kind != MEM_PAGE_DEVICE && info.host != NULL &&
 			((uintptr_t)info.host & 0xFFFu) == 0 && !KVM_ReservedPage(page);
 		const bool readonly = info.kind == MEM_PAGE_READONLY;
 
-		if (run.pages != 0 && mappable && readonly == run.readonly &&
+		const bool dirtylog = kvm_shadow.active && info.host >= kvm_shadow.mem && info.host < kvm_shadow.mem + 0x10000u;
+
+		if (run.pages != 0 && mappable && readonly == run.readonly && dirtylog == run.dirtylog &&
 			info.host == run.host + (page - run.page) * 4096u) {
 			run.pages++;
 			continue;
@@ -229,6 +401,7 @@ static bool KVM_ApplyMapChanges(void) {
 			run.pages = 1;
 			run.host = info.host;
 			run.readonly = readonly;
+			run.dirtylog = dirtylog;
 		}
 	}
 	if (run.pages != 0) runs.push_back(run);
@@ -240,7 +413,8 @@ static bool KVM_ApplyMapChanges(void) {
 		bool same = !in_range;
 		if (in_range) {
 			for (auto r = runs.begin();r != runs.end();++r) {
-				if (r->page == sl.page && r->pages == sl.pages && r->host == sl.host && r->readonly == sl.readonly) {
+				if (r->page == sl.page && r->pages == sl.pages && r->host == sl.host && r->readonly == sl.readonly &&
+					r->dirtylog == sl.dirtylog) {
 					runs.erase(r);
 					same = true;
 					break;
@@ -251,7 +425,7 @@ static bool KVM_ApplyMapChanges(void) {
 			kept.push_back(sl);
 		}
 		else {
-			if (!KVM_SetSlot(sl.id,sl.page,0,sl.host,sl.readonly)) return false;
+			if (!KVM_SetSlot(sl.id,sl.page,0,sl.host,sl.readonly,false)) return false;
 			kvm_mem.free_ids.push_back(sl.id);
 		}
 	}
@@ -267,11 +441,17 @@ static bool KVM_ApplyMapChanges(void) {
 			}
 			r.id = kvm_mem.next_id++;
 		}
-		if (!KVM_SetSlot(r.id,r.page,r.pages,r.host,r.readonly)) return false;
+		if (!KVM_SetSlot(r.id,r.page,r.pages,r.host,r.readonly,r.dirtylog)) return false;
 		kept.push_back(r);
 	}
 	std::sort(kept.begin(),kept.end(),[](const KVM_Slot &a,const KVM_Slot &b) { return a.page < b.page; });
 	kvm_mem.slots.swap(kept);
+
+	bool vga_direct = false;
+	for (const auto &sl : kvm_mem.slots) {
+		if (sl.page <= 0xBFu && (sl.page+sl.pages-1u) >= 0xA0u) vga_direct = true;
+	}
+	KVM_QueueVGAData(!vga_direct);
 	return true;
 }
 
@@ -360,8 +540,7 @@ static bool KVM_WriteRegs(const struct kvm_regs &r,const struct kvm_sregs &sr) {
  * written back here, with nothing being delivered. */
 static bool KVM_DropEvent(void) {
 	struct kvm_vcpu_events ev;
-	if (kvm.sync_events) ev = kvm.run->s.regs.events;
-	else if (ioctl(kvm.vcpu,KVM_GET_VCPU_EVENTS,&ev) < 0) return false;
+	if (ioctl(kvm.vcpu,KVM_GET_VCPU_EVENTS,&ev) < 0) return false;
 
 	ev.exception.injected = 0;
 	ev.interrupt.injected = 0;
@@ -371,11 +550,6 @@ static bool KVM_DropEvent(void) {
 		ev.flags |= KVM_VCPUEVENT_VALID_NMI_PENDING;
 	}
 
-	if (kvm.sync_events) {
-		kvm.run->s.regs.events = ev;
-		kvm.run->kvm_dirty_regs |= KVM_SYNC_X86_EVENTS;
-		return true;
-	}
 	return ioctl(kvm.vcpu,KVM_SET_VCPU_EVENTS,&ev) >= 0;
 }
 
@@ -439,7 +613,10 @@ static bool KVM_PutState(bool regs,bool rest) {
 		r.rsp = st.esp; r.rbp = st.ebp; r.rsi = st.esi; r.rdi = st.edi;
 		r.rip = st.eip;
 		r.rflags = st.eflags | 2u;
-		if ((memcmp(&r,&old_r,sizeof(r)) != 0 || memcmp(&sr,&old_sr,sizeof(sr)) != 0) && !KVM_DropEvent()) return false;
+		if (kvm.event_in_flight && (memcmp(&r,&old_r,sizeof(r)) != 0 || memcmp(&sr,&old_sr,sizeof(sr)) != 0)) {
+			if (!KVM_DropEvent()) return false;
+			kvm.event_in_flight = false;
+		}
 		if (!KVM_WriteRegs(r,sr)) return false;
 	}
 
@@ -540,10 +717,12 @@ static struct {
 	bool		created = false;
 	timer_t		timer;
 	uint64_t	deadline = 0;	/* KVM host time: when it fires, nanoseconds (PIC_HostTimeNow()), 0 = disarmed */
+	volatile sig_atomic_t fired = 0;	/* it fired, maybe outside KVM_RUN (see KVM_Run()) */
 } kvm_timer;
 
 static void KVM_TimerSignal(int sig) {
 	(void)sig;
+	kvm_timer.fired = 1;
 	if (kvm.run != NULL) kvm.run->immediate_exit = 1;
 }
 
@@ -592,6 +771,7 @@ static void KVM_TimerDisarm(void) {
 	memset(&its,0,sizeof(its));
 	timer_settime(kvm_timer.timer,0,&its,NULL);
 	kvm_timer.deadline = 0;
+	kvm_timer.fired = 0;
 	if (kvm.run != NULL) kvm.run->immediate_exit = 0;
 }
 
@@ -635,6 +815,7 @@ static void KVM_SyncHook(bool full) {
 	if (!kvm.in_kvm) CPU_StateIFHook = NULL;
 	if (!kvm.in_kvm && !kvm.rest_in_kvm) CPU_StateSyncHook = NULL;
 	kvm.gets++;
+	if (rest) kvm.event_in_flight = true;
 	if (!KVM_GetState(regs,rest)) {
 		LOG_MSG("KVM: cannot read the vCPU state: %s",strerror(errno));
 		kvm.failed = true;
@@ -644,6 +825,25 @@ static void KVM_SyncHook(bool full) {
 /* The guest's interrupt flag while the registers are in the vCPU (see CPU_InterruptFlag()) */
 static bool KVM_IFHook(void) {
 	return kvm.guest_if;
+}
+
+/* DOSBox-X changed the guest's page tables itself (its EMM386 mapping EMS pages): the vCPU's
+ * TLB may still hold the old translations, and nothing the guest does flushes it. Setting the
+ * special registers with another CR3 makes KVM reset the vCPU's MMU context and flush the
+ * guest's TLB; then they are set as they are. */
+static void KVM_GuestPageTablesHook(void) {
+	kvm.flush_tlb = true;
+}
+
+static bool KVM_FlushGuestTLB(void) {
+	struct kvm_sregs sr;
+	if (kvm.sync_regs) sr = kvm.run->s.regs.sregs; /* the vCPU's, or what goes into it next */
+	else if (ioctl(kvm.vcpu,KVM_GET_SREGS,&sr) < 0) return false;
+	struct kvm_sregs other = sr;
+	other.cr3 ^= 0x1000u;
+	if (ioctl(kvm.vcpu,KVM_SET_SREGS,&other) < 0 || ioctl(kvm.vcpu,KVM_SET_SREGS,&sr) < 0) return false;
+	if (kvm.sync_regs) kvm.run->kvm_dirty_regs &= ~(uint64_t)KVM_SYNC_X86_SREGS;
+	return true;
 }
 
 /* Make the vCPU's copy of the state the one that counts */
@@ -674,12 +874,16 @@ static Bits KVM_Fail(const std::string &why) {
 		LOG_MSG("KVM: at %04x:%08x (linear %08x) CR0=%08x EFLAGS=%08x code %s",(unsigned int)SegValue(cs),
 			(unsigned int)reg_eip,(unsigned int)(SegPhys(cs)+reg_eip),(unsigned int)cpu.cr0,(unsigned int)reg_flags,code);
 	}
+	KVM_ShadowStore(); /* the normal core uses VGA memory through the memory handlers */
+	kvm_shadow.active = false;
 	kvm.failed = true;
 	kvm.in_kvm = false;
 	kvm.rest_in_kvm = false;
 	CPU_StateSyncHook = NULL;
 	CPU_StateIFHook = NULL;
 	cpudecoder = &CPU_Core_Normal_Run;
+	void menu_update_core(void);
+	menu_update_core(); /* the CPU core menu shows the normal core now */
 	return CBRET_NONE;
 }
 
@@ -693,14 +897,28 @@ static uint32_t KVM_QueuedWrites(void) {
 /* Apply the writes KVM queued (coalesced MMIO) since the last time, in order. Called as soon as
  * KVM_RUN returns, before anything else: the guest's later accesses (reads exit) and anything
  * DOSBox-X does with the device then see them. */
+/* Port I/O exits per port, reads [0] and writes [1], for the statistics logged at exit: the
+ * ports a guest polls or writes most are where port I/O exits cost the most time */
+static uint32_t kvm_port_exits[2][0x10000];
+
 static void KVM_FlushWrites(void) {
 	struct kvm_coalesced_mmio_ring *ring = kvm.ring;
 	if (ring == NULL) return;
 
+	uint64_t vga_writes = 0;
 	while (ring->first != ring->last) {
 		const struct kvm_coalesced_mmio &w = ring->coalesced_mmio[ring->first];
 		const PhysPt64 a = (PhysPt64)w.phys_addr;
-		switch (w.len) {
+		if (!w.pio && a >= 0xA0000u && a < 0xC0000u) vga_writes++;
+		if (w.pio) { /* a port write (coalesced PIO) */
+			const Bitu port = (Bitu)w.phys_addr;
+			switch (w.len) {
+				case 1: IO_WriteB_Checked(port,w.data[0]); break;
+				case 2: IO_WriteW_Checked(port,host_readw((HostPt)w.data)); break;
+				case 4: IO_WriteD_Checked(port,host_readd((HostPt)w.data)); break;
+			}
+		}
+		else switch (w.len) {
 			case 1: physdev_writeb(a,w.data[0]); break;
 			case 2: physdev_writew(a,host_readw((HostPt)w.data)); break;
 			case 4: physdev_writed(a,host_readd((HostPt)w.data)); break;
@@ -711,11 +929,17 @@ static void KVM_FlushWrites(void) {
 		ring->first = (ring->first + 1u) % kvm.ring_max;
 		kvm.coalesced++;
 	}
+
+	/* KVM host time: nanoseconds, a write of a string instruction or of one instruction each */
+	if (vga_writes != 0)
+		kvm_vga.vga_ns += vga_writes * std::max(vga_writes >= 64 ? kvm.burst_cost.avg : kvm.write_cost.avg,(uint64_t)300u);
 }
 
 static void KVM_HandleIO(void) {
 	struct kvm_run *run = kvm.run;
 	uint8_t *data = (uint8_t*)run + run->io.data_offset;
+
+	kvm_port_exits[run->io.direction == KVM_EXIT_IO_OUT ? 1 : 0][run->io.port]++;
 
 	for (uint32_t n=0;n < run->io.count;n++,data += run->io.size) {
 		if (run->io.direction == KVM_EXIT_IO_OUT) {
@@ -742,6 +966,14 @@ static void KVM_HandleMMIO(void) {
 	const PhysPt64 a = (PhysPt64)run->mmio.phys_addr;
 	uint8_t *data = run->mmio.data;
 
+	/* a page whose handler was not known when the slots were built: the access below finds
+	 * it, and then it may turn out to be memory that can be mapped (a PCI LFB, for example) */
+	const Bitu page = (Bitu)(a >> 12u);
+	const bool deferred = page < 0x100000u && (kvm_mem.deferred[page >> 6u] & ((uint64_t)1u << (page & 63u)));
+
+	if (a >= 0xA0000u && a < 0xC0000u)
+		kvm_vga.vga_ns += std::max(kvm.exit_cost[1].avg,(uint64_t)1000u); /* KVM host time: nanoseconds */
+
 	if (run->mmio.is_write) {
 		switch (run->mmio.len) {
 			case 1: physdev_writeb(a,data[0]); break;
@@ -759,6 +991,11 @@ static void KVM_HandleMMIO(void) {
 			case 8: host_writed(data,physdev_readd(a)); host_writed(data+4,physdev_readd(a+4u)); break;
 			default: for (uint32_t i=0;i < run->mmio.len;i++) data[i] = physdev_readb(a+i); break;
 		}
+	}
+
+	if (deferred && MEM_PageHandlerKnown(page)) {
+		kvm_mem.deferred[page >> 6u] &= ~((uint64_t)1u << (page & 63u));
+		KVM_MarkDirty(page,page);
 	}
 }
 
@@ -833,6 +1070,10 @@ static uint64_t KVM_Overhead(int r,uint64_t elapsed) {
 			case KVM_EXIT_MMIO:	i = 1; break;
 			case KVM_EXIT_DEBUG:	i = 2; break;
 			case KVM_EXIT_HLT:	i = 3; break;
+			/* an MMIO access that KVM failed to emulate costs about what an MMIO exit does */
+			case KVM_EXIT_INTERNAL_ERROR:
+				i = (kvm.run->internal.suberror == KVM_INTERNAL_ERROR_EMULATION) ? 1 : -1;
+				break;
 			default:		i = -1; break;
 		}
 		if (i >= 0) {
@@ -852,9 +1093,246 @@ static uint64_t KVM_Overhead(int r,uint64_t elapsed) {
 	return overhead;
 }
 
+/* Run the instruction that KVM could not emulate on the normal core, which accesses MMIO
+ * through the page handlers, then go on in KVM. Without KVM_CAP_EXIT_ON_EMULATION_FAILURE, KVM
+ * has queued a #UD for the guest, which is taken back first. (Without the capability KVM exits
+ * to DOSBox-X only at CPL 0; at CPL 3 the guest gets the #UD.) */
+static Bits KVM_EmulateOne(void) {
+	if (!kvm.exit_on_emulation_failure) {
+		struct kvm_vcpu_events ev;
+		if (ioctl(kvm.vcpu,KVM_GET_VCPU_EVENTS,&ev) < 0)
+			return KVM_Fail(std::string("KVM_GET_VCPU_EVENTS: ") + strerror(errno));
+		if (ev.exception.nr == EXCEPTION_UD && (ev.exception.injected || ev.exception.pending)) {
+			ev.exception.injected = 0;
+			ev.exception.pending = 0;
+			if (ioctl(kvm.vcpu,KVM_SET_VCPU_EVENTS,&ev) < 0)
+				return KVM_Fail(std::string("KVM_SET_VCPU_EVENTS: ") + strerror(errno));
+		}
+	}
+	CPU_SyncState();
+	if (kvm.failed) return KVM_Fail("cannot read the vCPU state");
+	kvm.emulated++;
+
+	/* one instruction, and the single step trap after it if TF is set. The normal core may
+	 * change cpudecoder (the trap decoder after a POPF that sets TF), which KVM does itself. */
+	CPU_Decoder * const old_decoder = cpudecoder;
+	const Bits old_cycles = CPU_Cycles;
+	Bits ret;
+	try {
+		if (reg_flags & FLAG_TF) {
+			ret = CPU_Core_Normal_Trap_Run();
+		}
+		else {
+			CPU_Cycles = 1;
+			ret = CPU_Core_Normal_Run();
+			CPU_Cycles = old_cycles - 1;
+		}
+	}
+	catch (...) {
+		/* a guest page fault, handled by the main loop */
+		CPU_Cycles = old_cycles - 1;
+		if (cpudecoder == &CPU_Core_Normal_Run || cpudecoder == &CPU_Core_Normal_Trap_Run)
+			cpudecoder = old_decoder;
+		throw;
+	}
+	if (cpudecoder == &CPU_Core_Normal_Run || cpudecoder == &CPU_Core_Normal_Trap_Run)
+		cpudecoder = old_decoder;
+	return ret;
+}
+
+/* Planar and unchained VGA on an emulated core (see kvm_vga) */
+void CPU_Core_Dyn_X86_Cache_Init(bool enable_cache);
+void CPU_Core_Dyn_X86_Cache_Reset(void);
+void CPU_Core_Dynrec_Cache_Init(bool enable_cache);
+void CPU_Core_Dynrec_Cache_Reset(void);
+int GetDynamicType();
+extern int32_t ticksDone;
+extern uint32_t ticksScheduled;
+
+/* [cpu] kvm vga core */
+static void KVM_VGASetup(void) {
+	const Section_prop *section = static_cast<Section_prop*>(control->GetSection("cpu"));
+	const std::string which = section != NULL ? section->Get_string("kvm vga core") : "auto";
+
+	kvm_vga.core = NULL;
+	kvm_vga.trap = NULL;
+	kvm_vga.dyn = 0;
+	if (which == "off") return;
+	if (which == "auto" || which == "dynamic") {
+#if C_DYNAMIC_X86
+		if (GetDynamicType() == 1) {
+			kvm_vga.core = &CPU_Core_Dyn_X86_Run;
+			kvm_vga.trap = &CPU_Core_Dyn_X86_Trap_Run;
+			kvm_vga.dyn = 1;
+		}
+#endif
+#if C_DYNREC
+		if (kvm_vga.core == NULL && GetDynamicType() == 2) {
+			kvm_vga.core = &CPU_Core_Dynrec_Run;
+			kvm_vga.trap = &CPU_Core_Dynrec_Trap_Run;
+			kvm_vga.dyn = 2;
+		}
+#endif
+	}
+	if (kvm_vga.core == NULL) {
+		kvm_vga.core = &CPU_Core_Normal_Run;
+		kvm_vga.trap = &CPU_Core_Normal_Trap_Run;
+	}
+}
+
+/* The guest's TSC goes on at KVM's rate (the host's) on the emulated core too */
+static bool KVM_VGA_RDTSC(int64_t &tsc) {
+	if (!kvm_vga.active || cpudecoder != &CPU_Core_KVM_Run) return false;
+	tsc = (int64_t)__rdtsc() + kvm_vga.tsc_offset;
+	return true;
+}
+
+/* With auto-adjusted cycles, the cycles per millisecond are KVM host time (nanoseconds) under
+ * KVM and instructions on the emulated core: each keeps its own, and the cycles left in the
+ * current millisecond are scaled. The auto-adjustment starts over. */
+static void KVM_VGASwapCycles(cpu_cycles_count_t &save,cpu_cycles_count_t to) {
+	if (!CPU_CycleAutoAdjust) return;
+	save = CPU_CycleMax;
+	if (to <= 0) to = CPU_CycleMax;
+	if (CPU_CycleMax > 0) {
+		CPU_Cycles = (cpu_cycles_count_t)(((int64_t)CPU_Cycles * (int64_t)to) / (int64_t)CPU_CycleMax);
+		CPU_CycleLeft = (cpu_cycles_count_t)(((int64_t)CPU_CycleLeft * (int64_t)to) / (int64_t)CPU_CycleMax);
+	}
+	CPU_CycleMax = to;
+	ticksDone = 0;
+	ticksScheduled = 0;
+	CPU_IODelayRemoved = 0;
+}
+
+static void KVM_VGAStart(void) {
+	CPU_SyncState();
+	if (kvm.failed) return;
+	/* the trap flag single steps natively under KVM */
+	if (reg_flags & FLAG_TF) return;
+
+	/* the guest's TSC: KVM's, read with the host's */
+	alignas(8) uint8_t buf[sizeof(struct kvm_msrs) + sizeof(struct kvm_msr_entry)];
+	memset(buf,0,sizeof(buf));
+	struct kvm_msrs *msrs = (struct kvm_msrs*)buf;
+	struct kvm_msr_entry *tsc = (struct kvm_msr_entry*)(buf + sizeof(struct kvm_msrs));
+	msrs->nmsrs = 1;
+	tsc->index = 0x10; /* IA32_TIME_STAMP_COUNTER */
+	if (ioctl(kvm.vcpu,KVM_GET_MSRS,msrs) != 1) return;
+	kvm_vga.tsc_offset = (int64_t)tsc->data - (int64_t)__rdtsc();
+
+#if C_DYNAMIC_X86
+	if (kvm_vga.dyn == 1) CPU_Core_Dyn_X86_Cache_Init(true);
+#endif
+#if C_DYNREC
+	if (kvm_vga.dyn == 2) CPU_Core_Dynrec_Cache_Init(true);
+#endif
+	/* the emulated core starts at a guess the first time; the auto-adjustment takes it from there */
+	KVM_VGASwapCycles(kvm_vga.kvm_cyclemax,kvm_vga.emu_cyclemax > 0 ? kvm_vga.emu_cyclemax : 200000);
+	CPU_RDTSCHook = KVM_VGA_RDTSC;
+
+	kvm_vga.active = true;
+	kvm_vga.check = kvm_vga.since = PIC_FullIndex();
+	kvm_vga.writes = VGA_MemWriteCount;
+	kvm_vga.reads = VGA_MemReadCount;
+	kvm_vga.stretches++;
+}
+
+static void KVM_VGAEnd(void) {
+	if (!kvm_vga.active) return;
+	kvm_vga.active = false;
+	kvm_vga.emulated_ms += PIC_FullIndex() - kvm_vga.since;
+	CPU_RDTSCHook = NULL;
+
+	/* The guest changes code under KVM without DOSBox-X seeing it, and the dynamic core's code
+	 * pages have page handlers of their own, which would be MMIO under KVM: the code cache is
+	 * reset, which puts the page handlers back (the memory slots follow at the next KVM_RUN). */
+#if C_DYNAMIC_X86
+	if (kvm_vga.dyn == 1) CPU_Core_Dyn_X86_Cache_Reset();
+#endif
+#if C_DYNREC
+	if (kvm_vga.dyn == 2) CPU_Core_Dynrec_Cache_Reset();
+#endif
+	KVM_VGASwapCycles(kvm_vga.emu_cyclemax,kvm_vga.kvm_cyclemax);
+	kvm_vga.win_ns = 0;
+	kvm_vga.vga_ns = 0;
+}
+
+/* The emulated core may set cpudecoder to itself or to its trap decoder (a POPF or IRET that
+ * sets TF): the KVM core stays the decoder, and goes back to KVM for the trap flag. Anything
+ * else (HLT) it leaves, which comes back to the KVM core afterwards. */
+static void KVM_VGAFixDecoder(void) {
+	if (cpudecoder == kvm_vga.trap) {
+		cpudecoder = &CPU_Core_KVM_Run;
+		KVM_VGAEnd();
+	}
+	else if (cpudecoder == kvm_vga.core) {
+		cpudecoder = &CPU_Core_KVM_Run;
+	}
+}
+
+static Bits KVM_VGARun(void) {
+	Bits ret;
+	try {
+		ret = (*kvm_vga.core)();
+	}
+	catch (...) {
+		/* a guest page fault, handled by the main loop */
+		KVM_VGAFixDecoder();
+		throw;
+	}
+	KVM_VGAFixDecoder();
+	if (!kvm_vga.active) return ret;
+
+	/* mode 13h runs better under KVM, with the shadow */
+	VGA_ChainedShadowMap m;
+	if (VGA_ChainedShadowable(m)) {
+		KVM_VGAEnd();
+		return ret;
+	}
+
+	const pic_tickindex_t now = PIC_FullIndex();
+	if (now - kvm_vga.check >= kvm_vga_period_ms) {
+		/* KVM host time, nanoseconds: what this period's video memory accesses would have
+		 * cost in exits, against the emulated time it took */
+		const uint64_t writes = (uint32_t)(VGA_MemWriteCount - kvm_vga.writes);
+		const uint64_t reads = (uint32_t)(VGA_MemReadCount - kvm_vga.reads);
+		const uint64_t cost = writes * std::max(kvm.write_cost.avg,(uint64_t)300u) +
+			reads * std::max(kvm.exit_cost[1].avg,(uint64_t)1000u);
+		const uint64_t period = (uint64_t)((now - kvm_vga.check) * 1000000.0);
+		if (cost * 100u < period * kvm_vga_stay_percent) {
+			KVM_VGAEnd();
+		}
+		else {
+			kvm_vga.check = now;
+			kvm_vga.writes = VGA_MemWriteCount;
+			kvm_vga.reads = VGA_MemReadCount;
+		}
+	}
+	return ret;
+}
+
+/* After a run under KVM: switch to the emulated core when video memory exits took a large share
+ * of the guest's time */
+static void KVM_VGACheck(void) {
+	if (kvm_vga.core == NULL || kvm.failed || kvm_vga.win_ns < kvm_vga_window_ns) return;
+	if (kvm_vga.vga_ns * 100u >= kvm_vga.win_ns * kvm_vga_switch_percent) KVM_VGAStart();
+	kvm_vga.win_ns = 0;
+	kvm_vga.vga_ns = 0;
+}
+
 Bits CPU_Core_KVM_Run(void) {
-	const Bits r = KVM_Run();
-	KVM_TimerDisarm(); /* the slice is over */
+	if (kvm_vga.active) return KVM_VGARun();
+	Bits r = KVM_Run();
+	KVM_ShadowStore(); /* what the guest wrote to mode 13h memory, for DOSBox-X */
+	if (kvm.emulate_one) {
+		kvm.emulate_one = false;
+		if (r == CBRET_NONE) r = KVM_EmulateOne();
+	}
+	if (r == CBRET_NONE) KVM_VGACheck();
+	/* The slice timer stays armed: the core is mostly called again within microseconds (a
+	 * callback, an interrupt), usually with about the same deadline, and arming and disarming
+	 * it are two system calls per call. If it fires in between, the next KVM_RUN returns at
+	 * once (see KVM_Run()). */
 	/* An instruction of an I/O or MMIO exit may still be unfinished: the next KVM_RUN finishes
 	 * it, and whatever needs the state before that syncs it, which finishes it first. */
 	return r;
@@ -892,8 +1370,18 @@ static Bits KVM_Run(void) {
 		 * also from the exit handlers below, and then it is put back here */
 		if (!KVM_EnterState())
 			return KVM_Fail(std::string("cannot set the vCPU state: ") + strerror(errno));
+		if (kvm.flush_tlb) {
+			kvm.flush_tlb = false;
+			if (!KVM_FlushGuestTLB())
+				return KVM_Fail(std::string("cannot flush the guest's TLB: ") + strerror(errno));
+		}
 		if (!KVM_ApplyMapChanges())
 			return KVM_Fail("cannot set up the guest memory");
+		/* DOSBox-X wrote to video memory through the memory handlers: load the shadow again */
+		if (kvm_shadow.active && kvm_shadow.writes != VGA_MemWriteCount) {
+			KVM_ShadowStore();
+			KVM_ShadowLoad();
+		}
 
 		/* an IRQ the guest cannot take yet: come back as soon as it can (DOSBox-X delivers it) */
 		run->request_interrupt_window = (PIC_IRQCheck && !kvm.guest_if) ? 1 : 0;
@@ -904,14 +1392,24 @@ static Bits KVM_Run(void) {
 		if (budget == 0) break;
 		if (budget < 2000) budget = 2000;
 
+		/* the timer fired outside KVM_RUN (between core calls, or while KVM_CompletePending()
+		 * used immediate_exit itself): it is no longer armed */
+		if (kvm_timer.fired) {
+			kvm_timer.fired = 0;
+			kvm_timer.deadline = 0;
+			run->immediate_exit = 0;
+		}
 		KVM_TimerArm(budget);
 		const uint64_t mark = PIC_HostTimeMark(); /* KVM host time: nanoseconds */
 		const int r = ioctl(kvm.vcpu,KVM_RUN,0);
 		const int err = errno;
 		kvm.runs++;
 		kvm.pending = false;
+		kvm.event_in_flight = r < 0 || run->exit_reason == KVM_EXIT_INTR;
 		/* KVM host time: nanoseconds since PIC_HostTimeMark(), less the cost of the exit */
-		PIC_HostTimeAccount(KVM_Overhead(r,PIC_HostTimeNow() - mark));
+		const uint64_t elapsed = PIC_HostTimeNow() - mark; /* KVM host time: nanoseconds */
+		kvm_vga.win_ns += elapsed;
+		PIC_HostTimeAccount(KVM_Overhead(r,elapsed));
 		KVM_FlushWrites();
 		kvm.guest_if = run->if_flag != 0;
 
@@ -919,9 +1417,10 @@ static Bits KVM_Run(void) {
 			if (err == EINTR || err == EAGAIN) {
 				/* the timer (or another signal): the timer has fired, arm it again if the
 				 * slice is not over */
-				if (run->immediate_exit) {
+				if (run->immediate_exit || kvm_timer.fired) {
 					run->immediate_exit = 0;
 					kvm_timer.deadline = 0;
+					kvm_timer.fired = 0;
 				}
 				if (CPU_Cycles <= 0) break;
 				continue;
@@ -972,6 +1471,13 @@ static Bits KVM_Run(void) {
 				return KVM_Fail("the vCPU state was refused (KVM_EXIT_FAIL_ENTRY, reason 0x" +
 					std::to_string((unsigned long long)run->fail_entry.hardware_entry_failure_reason) + ")");
 			case KVM_EXIT_INTERNAL_ERROR: {
+				/* An instruction that KVM's instruction emulator cannot do on MMIO, an x87 store
+				 * for example (Glide writes floats to the Voodoo registers with FSTP): the normal
+				 * core runs it (see CPU_Core_KVM_Run()) */
+				if (run->internal.suberror == KVM_INTERNAL_ERROR_EMULATION) {
+					kvm.emulate_one = true;
+					return CBRET_NONE;
+				}
 				std::string why = "KVM internal error, suberror " + std::to_string(run->internal.suberror);
 				for (uint32_t i=0;i < run->internal.ndata && i < 16;i++) {
 					char tmp[32];
@@ -1021,13 +1527,39 @@ static void KVM_CoreShutdownSection(Section *sec) {
 }
 
 void KVM_CoreShutdown(void) {
+	if (kvm_vga.active) kvm_vga.emulated_ms += PIC_FullIndex() - kvm_vga.since;
+	kvm_vga.active = false;
+	CPU_RDTSCHook = NULL;
 	if (kvm.runs != 0)
-		LOG_MSG("KVM: %llu KVM_RUN calls: %llu port I/O, %llu MMIO (and %llu queued writes), %llu callbacks, %llu guest INT3, %llu HLT, %llu interrupt windows, %llu slices ended; state put %llu times, fetched %llu times; exit cost %llu/%llu/%llu/%llu/%llu/%llu ns (I/O, MMIO, callback, HLT, queued write, string write)",
+		LOG_MSG("KVM: %llu KVM_RUN calls: %llu port I/O, %llu MMIO (and %llu queued writes), %llu callbacks, %llu guest INT3, %llu HLT, %llu interrupt windows, %llu slices ended, %llu instructions emulated, %llu times on the emulated core for video memory (%.0f ms); state put %llu times, fetched %llu times; exit cost %llu/%llu/%llu/%llu/%llu/%llu ns (I/O, MMIO, callback, HLT, queued write, string write)",
 			(unsigned long long)kvm.runs,(unsigned long long)kvm.io,(unsigned long long)kvm.mmio,(unsigned long long)kvm.coalesced,(unsigned long long)kvm.callbacks,
 			(unsigned long long)kvm.int3,(unsigned long long)kvm.hlt,(unsigned long long)kvm.windows,(unsigned long long)kvm.slices,
-			(unsigned long long)kvm.puts,(unsigned long long)kvm.gets,
+			(unsigned long long)kvm.emulated,(unsigned long long)kvm_vga.stretches,(double)kvm_vga.emulated_ms,(unsigned long long)kvm.puts,(unsigned long long)kvm.gets,
 			(unsigned long long)kvm.exit_cost[0].avg,(unsigned long long)kvm.exit_cost[1].avg,(unsigned long long)kvm.exit_cost[2].avg,
 			(unsigned long long)kvm.exit_cost[3].avg,(unsigned long long)kvm.write_cost.avg,(unsigned long long)kvm.burst_cost.avg);
+	if (kvm.io != 0) {
+		/* the busiest ports */
+		std::string busy;
+		for (unsigned int n=0;n < 8;n++) {
+			unsigned int best_dir = 0,best_port = 0;
+			uint32_t best = 0;
+			for (unsigned int dir=0;dir < 2;dir++) {
+				for (unsigned int port=0;port < 0x10000u;port++) {
+					if (kvm_port_exits[dir][port] > best) {
+						best = kvm_port_exits[dir][port];
+						best_dir = dir;
+						best_port = port;
+					}
+				}
+			}
+			if (best == 0) break;
+			char tmp[48];
+			sprintf(tmp,"%s%s %03xh %lu",busy.empty() ? "" : ", ",best_dir ? "out" : "in",best_port,(unsigned long)best);
+			busy += tmp;
+			kvm_port_exits[best_dir][best_port] = 0;
+		}
+		LOG_MSG("KVM: port I/O exits: %s",busy.c_str());
+	}
 	if (kvm.run != NULL) {
 		munmap(kvm.run,kvm.run_size);
 		kvm.run = NULL;
@@ -1166,6 +1698,9 @@ static bool KVM_SetCPUID(std::string &reason) {
 }
 
 bool KVM_CoreInit(std::string &reason) {
+	KVM_VGAEnd();
+	KVM_VGASetup();
+
 	/* already created: only the CPU settings may have changed */
 	if (kvm.vcpu >= 0)
 		return KVM_SetCPUID(reason);
@@ -1223,16 +1758,16 @@ bool KVM_CoreInit(std::string &reason) {
 		ioctl(kvm.vcpu,KVM_GET_REGS,&kvm.run->s.regs.regs) >= 0 && ioctl(kvm.vcpu,KVM_GET_SREGS,&kvm.run->s.regs.sregs) >= 0) {
 		kvm.run->kvm_valid_regs = KVM_SYNC_X86_REGS | KVM_SYNC_X86_SREGS;
 		kvm.sync_regs = true;
-		if ((sync & KVM_SYNC_X86_EVENTS) && ioctl(kvm.vcpu,KVM_GET_VCPU_EVENTS,&kvm.run->s.regs.events) >= 0) {
-			kvm.run->kvm_valid_regs |= KVM_SYNC_X86_EVENTS;
-			kvm.sync_events = true;
-		}
+		/* not the vCPU events (KVM_SYNC_X86_EVENTS): KVM would fetch them at every exit, and
+		 * they are needed only after a KVM_RUN that a signal ended (KVM_DropEvent()) */
 	}
 
 	/* Writes to the VGA memory window (A0000-BFFFF) are queued instead of exiting one by one.
 	 * Reads still exit, after the queued writes are applied, so the order is kept. On PC-98 the
 	 * same goes for the fourth graphics plane (E0000-E7FFF). */
 	const int ring_page = ioctl(kvm.dev,KVM_CHECK_EXTENSION,KVM_CAP_COALESCED_MMIO);
+	kvm.pio_queue = false;
+	kvm.vga_data_queued = false;
 	if (ring_page > 0) {
 		struct kvm_coalesced_mmio_zone zone;
 		memset(&zone,0,sizeof(zone));
@@ -1247,8 +1782,60 @@ bool KVM_CoreInit(std::string &reason) {
 				zone.size = 0x8000;
 				ioctl(kvm.vm,KVM_REGISTER_COALESCED_MMIO,&zone);
 			}
+
+			/* Writes to ports with no effect that the guest could see before its next exit are
+			 * queued too (coalesced PIO), in the same ring and so in order with the video memory
+			 * writes; reads still exit, after the queued writes are applied. The I/O delay ports
+			 * 80h and EDh; the VGA DAC (3C6h-3C9h, palette loads); the PIT command port 43h
+			 * (a counter latch takes effect at the read that follows); the DMA flip-flop resets
+			 * (0Ch, D8h) that come before reading a DMA address or count; and the VGA index
+			 * registers (3B4h, 3C4h, 3CEh, 3D4h), which only select the register that the data
+			 * port that follows reads or writes. Not the VGA data registers: they can change the
+			 * memory map (an SVGA bank, the memory window), which has to take effect before the
+			 * guest's next access to directly mapped video memory (the sequencer and graphics
+			 * controller ones are queued while there is none). The IDE data port and the
+			 * taskfile registers after it (1F0h-1F3h, 170h-173h): writing a sector is one exit
+			 * per word otherwise, since KVM emulates REP OUTSW one element at a time (REP INSW
+			 * it does in batches); a write takes effect at the command register (1F7h, 177h),
+			 * or the guest reads the status, and both exit. Only the IRQ at the end of a sector
+			 * comes at the next exit instead, at most a time slice later. Ports polled most, by kind
+			 * of program: PIT channel 0 reads for timing (games, Linux), the MPU-401 status
+			 * port, DMA address/count reads (sound), the PIC, the RTC (see the log at exit). */
+			if (!IS_PC98_ARCH && ioctl(kvm.dev,KVM_CHECK_EXTENSION,KVM_CAP_COALESCED_PIO) > 0) {
+				static const struct { uint16_t port,count; } ports[] = {
+					{0x80,1},{0xED,1},{0x3C6,4},{0x43,1},{0x0C,1},{0xD8,1},
+					{0x3B4,1},{0x3C4,1},{0x3CE,1},{0x3D4,1},{0x1F0,4},{0x170,4}};
+				for (const auto &pr : ports) {
+					memset(&zone,0,sizeof(zone));
+					zone.addr = pr.port;
+					zone.size = pr.count;
+					zone.pio = 1;
+					ioctl(kvm.vm,KVM_REGISTER_COALESCED_MMIO,&zone);
+				}
+				/* and the sequencer and graphics controller data ports while no video memory
+				 * is mapped directly (see KVM_QueueVGAData()) */
+				kvm.pio_queue = true;
+				kvm.vga_data_queued = false;
+			}
 		}
 	}
+
+	/* An instruction that KVM cannot emulate (on MMIO) exits to DOSBox-X at any CPL, without a
+	 * #UD for the guest (see KVM_EmulateOne()) */
+	kvm.exit_on_emulation_failure = false;
+#ifdef KVM_CAP_EXIT_ON_EMULATION_FAILURE
+	if (ioctl(kvm.dev,KVM_CHECK_EXTENSION,KVM_CAP_EXIT_ON_EMULATION_FAILURE) > 0) {
+		struct kvm_enable_cap cap;
+		memset(&cap,0,sizeof(cap));
+		cap.cap = KVM_CAP_EXIT_ON_EMULATION_FAILURE;
+		cap.args[0] = 1;
+		kvm.exit_on_emulation_failure = ioctl(kvm.vm,KVM_ENABLE_CAP,&cap) >= 0;
+	}
+#endif
+	if (!kvm.exit_on_emulation_failure)
+		LOG_MSG("KVM: the host KVM cannot report instructions it fails to emulate at CPL 3 (KVM_CAP_EXIT_ON_EMULATION_FAILURE): a guest program that uses x87 instructions on device memory gets an invalid opcode exception");
+
+	PAGING_GuestPageTablesHook = KVM_GuestPageTablesHook;
 
 	/* INT3 exits to DOSBox-X (callback instructions, see callback.h) */
 	struct kvm_guest_debug dbg;

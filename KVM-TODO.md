@@ -270,6 +270,185 @@ throttles the guest by duty cycle.
     access is an MMIO exit.
   - **Glide**: the Glide port handler takes guest linear addresses, so it now calls
     `CPU_SyncRegisters()` first (the paging state). Not tested: no Glide program headless.
+- **Step 18: port I/O.** `KVM_CAP_COALESCED_PIO`: writes to ports with no effect the guest
+  could see before its next exit are queued in the coalesced MMIO ring, in order with the
+  video memory writes, and applied (`IO_Write*_Checked()`) as soon as `KVM_RUN` returns; reads
+  still exit, after the queue is applied. Ports: 80h and EDh (I/O delay), the VGA DAC
+  (3C6h-3C9h), the PIT command port 43h (a latch takes effect at the read that follows), the
+  DMA flip-flop resets 0Ch and D8h, and the VGA index registers 3B4h, 3C4h, 3CEh and 3D4h (a
+  word OUT to an index register also writes the data register, falls outside the one-port
+  zone, and exits). Not the VGA data registers, which can change the memory map. A palette
+  benchmark (768 single OUTs to 3C9h per frame, 200 frames, then 200000 OUTs to 80h) went
+  from 4.2 s to 1.7 s (dynamic core 0.8 s); a palette test reads the palette back through
+  3C7h/3C9h after every load and passes. The log line at exit lists the busiest ports.
+  Ports polled most:
+  - Quake (DJGPP, CWSDPMI or HDPMI32): PIT channel 0 (latch at 43h, two reads of 40h) for
+    its clock, the SB16 DMA count (C6h, after a D8h flip-flop reset), 201h (joystick), the
+    SB16 IRQ acknowledge (22Fh). 412000 exits in the timedemo, 237000 with the queued writes.
+  - Spycraft (DOS/4GW): the MPU-401 status port 331h, the RTC (70h/71h), the PIC, the DMA count.
+  - Linux (booting an install CD): PIT, the CRTC (cursor updates, 3D4h/3D5h), the PIC.
+  - These are reads, or writes whose effect is immediate (PIC EOI, RTC data); they have to
+    exit.
+- **Step 19: callback round trips.** Profiled with CBBENCH (100000 INT 21h calls): per call
+  about 5.5 us in `KVM_RUN` (VM exit and entry, KVM's FPU and vCPU switching, the same for
+  every userspace exit), about 3 us in DOSBox-X (the callback itself and the main loop, as
+  on an emulated core), and under 1 us of the KVM core's own work. Cut:
+  - the slice timer is no longer disarmed when the core returns (two system calls per call):
+    it stays armed, and if it fires outside `KVM_RUN` (its handler also sets a `fired` flag,
+    since `KVM_CompletePending()` uses `immediate_exit` too) the next `KVM_RUN` returns at once;
+  - the vCPU events are written back only when one can be in flight (after a `KVM_RUN` that a
+    signal ended, or a full state fetch), not after every callback;
+  - the vCPU events are no longer synced through `kvm_run` at every exit.
+  CBBENCH stays at about 1.4-1.5 s: the exit itself is what is left. The 0.19 s that a
+  start-up spends classifying all 4 GB six times is the "first slot build" open issue.
+- **Step 20: more guests** (first pass).
+  - **Quake 1.06** (`timedemo demo1`, 320x200): 969 frames under CWSDPMI (its own paging)
+    and under HDPMI32, the same as the emulated cores, but at 45 fps against 173-194 fps on
+    the dynamic core (27 fps on the normal core). 44 of 60 s are in `KVM_RUN`: every write
+    to mode 13h video memory is an exit that KVM handles in the kernel (100 million queued
+    writes). See the next steps.
+  - **Spycraft** (DOS/4GW, SVGA, SB16, MPU-401): runs for a minute with the same video modes
+    and BIOS calls as on the normal core.
+  - **Linux** (an install CD, `boot -el-torito`): the kernel boots, prints to the text
+    console and idles with HLT; the log is the same as on the dynamic core.
+  - **OS/2 Warp 3 and 4** installers: boot from the installation diskette and stop at the
+    same point as on the dynamic core (waiting with the next diskette prompt). The floppy
+    controller emulation is incomplete, so OS/2 cannot be tested further yet; changing disks
+    from a headless test would also need AUTOTYPE to trigger mapper handlers (`swapimg`).
+  - **Windows 98** (the image stalls on the dynamic core too with the test configuration),
+    **REAL/32** (installer floppies only), **Windows NT/2000**, a Glide game and **DOS/32A,
+    PMODE/W**: not tested yet. RDTSC timing: Windows 95's performance counter and Quake agree
+    with the emulated cores.
+- **Step 21: mode 13h shadow.** While all of A0000-AFFFF is the plain chained 256-colour
+  handler (`vgaph.cvga`: chain 4, no raster op, bit mask or the like, not Tseng), the KVM core
+  maps a 64KB shadow there instead, in the guest's byte order, with dirty logging
+  (`KVM_MEM_LOG_DIRTY_PAGES`). Each aligned dword of the shadow is one dword of VGA memory
+  (`VGA_ChainedShadowable()`, `VGA_ChainedShadowLoad()`/`Store()` in vga_memory.cpp).
+  - The pages the guest wrote (`KVM_GET_DIRTY_LOG`) go to VGA memory whenever the core
+    returns, so drawing, callbacks, save states and the other cores always see them, and
+    before the map changes at A0000 (a mode set, a bank switch, a raster op), with the bank
+    and mask the shadow was loaded with.
+  - `VGA_MemWriteCount` counts the writes through the VGA memory handlers (BIOS text and
+    pixel output, the other cores): when it changed, the shadow is loaded again before the
+    guest runs.
+  - Switching to the normal core stores the shadow and drops it.
+  - Quake's timedemo: 45 fps -> 203-225 fps (dynamic core 173). VGABENCH 0.66 s -> 0.34 s.
+    The VGA test at `cycles=30000` 1.5 s -> 0.56 s. A test that mixes direct writes with BIOS
+    pixel writes and reads (VGA13) gives a byte-identical dump to the normal core.
+- **Step 22: the first slot build.** It took 162 ms: most of the handler table above RAM is
+  empty at first, and looking a page up asks every device (`MEM_SlowPath()`). Pages above the
+  first MB whose handler is not known yet (`MEM_PageHandlerKnown()`) are now left as MMIO and
+  marked deferred; an MMIO exit on a deferred page whose handler the access made known marks
+  it for the next build, so that a PCI LFB, for example, gets its slot at the first access.
+  Also, a page whose handler is the last one seen without memory behind it (not readable) is
+  not looked at further. The first build now takes a few ms, and every program starts about
+  0.25 s sooner (CBBENCH 1.5 s -> 1.25 s); rebuilds of the whole range (A20) take about 2 ms.
+- **Step 23: more guests.**
+  - **DOS/32A, PMODE/W and CauseWay** (Open Watcom's DOS extenders, the LFB and Voodoo
+    tests linked for each): the same results as the normal core. (Testing them found a bug in
+    the emulated cores' new segment limit checks, `LSS ESP,[ESP]`, since fixed.)
+  - **Windows 95** boots and runs its test on the step 21-22 build, from a fresh copy of the
+    image. (A copy that had been booted and cut off several times stopped before the test
+    program on every core: Windows may show a dialog about the daylight saving time change, for
+    example. Use a fresh copy for each run.)
+  - Not available here: Windows NT/2000 install media, a Glide program. Windows 98 and the
+    OS/2 installers wait on the dynamic core too (see step 20).
+- **Step 24: more guests.**
+  - **Windows 98** (`~/emu/win98`, with its own `dosbox.conf`: Pentium II, 128 MB, ISA PnP
+    BIOS, APM, IDE `pio32`/`int13fakev86io`; without the NE2000 and MT-32): the image has
+    `BootGUI=0` in `MSDOS.SYS`, so it stops at the DOS prompt and Windows is started with
+    `WIN`. That was the "stall" of steps 14, 20 and 23. With `WIN` in `AUTOEXEC.BAT` of the
+    test copy, the Win32 test passes on the dynamic core and on KVM (16 MB checked, the FPU,
+    `Sleep(2000)` measures 2001-2006 ms by both clocks, two threads), and Windows powers off
+    (APM), which ends DOSBox-X: 51 s on the dynamic core, 81 s on KVM.
+  - **Windows 2000 Professional** (`~/emu/dostest/win95/win2k.iso`, retail, no product key
+    here): `WINNT` run from the DOSBox-X shell with an answer file copies the local source to
+    a copy of the 1 GB DOS disk (31 s), then the disk boots through IDE: text-mode setup (the
+    NT kernel, `atapi.sys`) copies the files, restarts, and GUI setup detects and installs the
+    devices and stops where the answer file has no product key ("Unattended Setup is unable to
+    continue because a Setup parameter ... is missing"), which is as far as it can get here.
+    Text-mode setup first took more than 30 minutes: KVM's instruction emulator does `REP
+    OUTSW` one word per exit (it batches `REP INSW`), 133 million exits to the IDE data port at
+    8.5 us. The IDE data port and taskfile writes are queued now (see step 18; 1F0h-1F3h,
+    170h-173h), and text-mode setup takes about 7 minutes.
+  - **Glide**: TRIP (Kosmic, The Party 97; DOS/4GW, Glide 2.43 with its own `glide2x.ovl`)
+    on the emulated Voodoo (`voodoo_card=software`), answers to its menu redirected from a
+    file (AUTOTYPE does not reach it). The KVM core gave up at once: "KVM internal error,
+    suberror 1" at `FSTP dword [edi+4]`. Glide writes floats to the Voodoo registers with x87
+    stores, and KVM's instruction emulator cannot do x87 instructions on MMIO. Such an
+    instruction now runs on the normal core (`KVM_EmulateOne()`), and the core goes on in
+    KVM: TRIP renders its parts on KVM, about 27000 instructions emulated per second. Without
+    `KVM_CAP_EXIT_ON_EMULATION_FAILURE` (kernel 5.17+), KVM would exit only at CPL 0 and give
+    the guest a #UD at CPL 3, so the core turns it on; checked at CPL 3 with a real mode
+    program in V86 mode (EMM386 active) that does x87 loads and stores on mode 12h memory:
+    the same results as the normal core. TRIP shows only a black screen on the emulated
+    cores unless `enable msr=true`: it reads MSRs, which KVM answers whatever DOSBox-X's
+    setting is (see the findings). It does not end by itself, so its own statistics file is
+    only written when it is left with Esc.
+  - **OS/2**: still waits for the floppy controller emulation (no change since step 20).
+  - **DOSBox-X did not quit** (SIGTERM, `-time-limit`, closing the window) while a protected
+    mode program ran on the KVM core with its output redirected to a file: closing the file,
+    `LocalFile::UpdateLocalDateTime()` asks the DOS date and time with `CALLBACK_RunRealInt()`,
+    which DOSBox-X's own INT 21h answers only in real or V86 mode; in protected mode it went
+    to DOS/4GW's handler and never came back. It now uses the host's time unless the CPU is
+    in real or V86 mode (the emulated cores could hit this too, depending on where the guest
+    was), and the `CALLBACK_RunReal*()` functions call `CPU_SyncState()` first.
+- **Step 25: planar VGA.** Measured, and the answer is yes, 16-colour and unchained games are
+  slow on KVM. FastDoom 0.9.1, `-timedemo demo1 -nosound`, AMD Ryzen 9 7940HS, `cycles=max`:
+
+  | Renderer | normal | dynamic | KVM |
+  |---|---|---|---|
+  | mode 13h (`FDOOM13H`, the step 21 shadow) | 143 fps | 217 fps | 1725 fps |
+  | EGA 16-colour planar (`FDOOMEGA`) | 54 fps | 187 fps | 19.4 fps |
+  | mode Y, unchained 256 colours (`FDOOM`) | 103 fps | 339 fps | 4.5 fps |
+
+  In planar and unchained modes all of A0000-AFFFF is MMIO: every read exits, and every write
+  is queued but still an exit inside the kernel (about 4 us each in mode Y: 264 million of
+  them in the timedemo). A planar benchmark (PLANBNCH, wall seconds including about 1.2 s of
+  start-up; normal, dynamic, KVM before and after the change below): 200000 PutPixels (bit
+  mask OUT, latch load, write) 1.43 / 1.48 / 8.81 / 5.27; 768000 plane reads 1.16 / 1.18 /
+  3.27 / 3.25; mode X fills 1.20 / 1.23 / 1.98 / 2.11.
+  - **Done:** the sequencer and graphics controller data ports (3C5h, 3CFh) are queued as
+    well while no page of A0000-BFFFF is mapped directly (`KVM_QueueVGAData()`, switched at
+    each slot rebuild): map mask, bit mask, set/reset, write mode and the like were an exit
+    each. All video memory accesses are MMIO then, so they are applied in order with the port
+    writes, also when a port write changes the memory map. PutPixel 7.6 s -> 4.0 s above
+    start-up, FastDoom EGA 17.2 -> 19.4 fps. PLANTEST (map mask, set/reset, bit mask, write
+    modes 0-3, XOR, latch copies, read mode 1, a memory map switch to B8000 written right
+    after, chain 4 off and on in mode 13h/mode X with writes right after) dumps the same
+    219600 bytes on the normal, dynamic and KVM cores.
+  - **Not done here:** what is left is the exits themselves, and a shadow like mode 13h's
+    cannot take reads (they load the latches) or the four planes behind one address. Step 26
+    runs those stretches on an emulated core instead.
+- **Step 26: planar and unchained VGA on an emulated core.** `[cpu] kvm vga core` (auto,
+  dynamic, normal, off; auto is the dynamic core, or the normal core in builds without one).
+  - **Switching:** the KVM core estimates how much of the guest's time in KVM goes to exits
+    for A0000-BFFFF (MMIO exits and queued writes, at the measured exit costs); when that is
+    40% or more over 20 ms of guest time, it fetches the full state and runs the guest on the
+    emulated core, from `CPU_Core_KVM_Run()`, which stays the `cpudecoder`. Every 50 emulated
+    ms it prices the period's video memory accesses through the memory handlers
+    (`VGA_MemWriteCount`, the new `VGA_MemReadCount`: they do not count host memory mapped
+    directly, such as the SVGA bank map or the LFB) at KVM's exit costs, and goes back to KVM
+    when they would take less than 25% of the time, when the mode 13h shadow applies, or when
+    the guest sets the trap flag (KVM single steps natively).
+  - **Going back:** the dynamic core's code cache is reset. The guest changes code under KVM
+    without DOSBox-X seeing it, and the dynamic core's code pages have page handlers of their
+    own (`MEM_SetPageHandler()`), which would be MMIO under KVM; the reset puts the old ones
+    back and the slots follow.
+  - **TSC:** on the emulated core, `CPU_RDTSC()` gives the host's TSC plus KVM's offset for the
+    guest (`CPU_RDTSCHook`), so it goes on at the same rate and never goes back.
+  - **Cycles:** with auto-adjusted cycles, KVM's (nanoseconds) and the emulated core's
+    (instructions) are kept apart and swapped at each switch; the cycles left in the current
+    millisecond are scaled and the auto-adjustment starts over. The emulated core starts at
+    200000. Fixed cycles stay as they are.
+  - **Measured:** FastDoom EGA 19.4 -> 217 fps (dynamic core 187), mode Y 4.5 -> 330 fps
+    (dynamic 339), mode 13h unchanged (about 1650 fps, no switches). HYBTEST (8 rounds of
+    planar PutPixels and CPU-only work, which switches every round) gives the normal core's
+    checksum, RDTSC never goes back and runs at the same rate in both phases. Windows 3.1 with
+    the 16-colour VGA driver (`win /3` and `win /s`) passes its test, switching twice;
+    Windows 98 passes and boots faster (72 s; four switches at its VGA boot screens); PLANTEST,
+    VGA13, LFB, Voodoo and FSTPTEST dumps are the same as the normal core's; TRIP does not
+    switch (the Voodoo is not in A0000-BFFFF).
 - **Debugger tools for all of the above.**
   - `MEMMAP [start [end]]` lists the physical map as `MEM_ClassifyPage` sees it (coalesced
     runs with kind, host pointer relative to `MemBase`, and handler class), plus the map
@@ -282,25 +461,34 @@ throttles the guest by duty cycle.
 
 ## Findings to keep in mind
 
-- **Segment access rights are not kept by DOSBox-X.** Only base, limit, expand-down, and the
-  code/stack size are cached when a segment is loaded. `CPU_GetFullState()` rebuilds the access
-  rights from those, the CPL, and (in protected mode) the descriptor tables. A guest that
-  changes a descriptor after loading the segment gets slightly different type/DPL/AVL bits,
-  and around a mode switch the result can be a not present segment. The KVM core works around
-  it by keeping the vCPU's cache for segments DOSBox-X did not load (step 14). The fully
-  correct fix is to store the access rights in `Segs` at every load (about 25 places in
-  `cpu.cpp` set `Segs.expanddown[]`).
+- **Segment access rights** are kept in `Segs.ar[]` now (VMX format, `include/regs.h`): a
+  protected mode load takes them from the descriptor (accessed bit set), a virtual 8086 mode
+  load sets F3h, a real mode load leaves them, a null selector is `SEG_AR_UNUSABLE`, and
+  SYSENTER/SYSEXIT set their fixed ones. `CPU_GetFullState()` uses them in protected mode instead
+  of reading the descriptor tables, so a descriptor changed after the load, or the real mode
+  segments still loaded right after setting CR0.PE, come out as the CPU has them. (Real and
+  virtual 8086 mode keep the fixed access rights VM entry needs.) The emulated cores do not use
+  them for access checks. The KVM core still keeps the vCPU's own cache for segments DOSBox-X
+  did not load (step 14), which is no longer needed for this.
 - **V86 segments must be normalised for KVM.** VM entry requires base = selector << 4, limit
-  = FFFFh and access rights F3h for every segment in virtual 8086 mode. DOSBox-X does not
-  reset the limit on real-mode or V86 segment loads (`SegSet16`), so a V86 segment can keep a
-  protected-mode limit (seen: `CS limit=FFFFFFFF` under EMM386).
+  = FFFFh and access rights F3h for every segment in virtual 8086 mode. DOSBox-X now sets all
+  of that at every virtual 8086 mode segment load (`CPU_SetSegV86Hidden()`), including CS
+  (IRET, task switch, far JMP/CALL/RET) and the reloads when DOSBox-X's EMM386 enters virtual
+  8086 mode again for Windows (`WinVM86Ctl()`, which loaded CS/DS/ES/SS before setting VM and
+  left FS/GS alone); with `segment limits=false` the limit is ~0 like everywhere else. The KVM
+  core still normalises on the way in, which covers `segment limits=false`.
 - **`segment limits=false`** stores `~0` limits (unreal everywhere). KVM always enforces
   limits, so under KVM that option has no effect. It is on by default.
-- **EMM386 V86 runs without paging** (`CR0=00000011`), so the `firstmb` remap is in effect in V86
-  mode too. The kvm core's slot layout for the first MB+64KB must apply `firstmb` while
-  `CR0.PG=0` and must not while `CR0.PG=1`. That means a slot rebuild on every PG transition
-  (rare). Pages whose `firstmb` entry is not the identity need their own slots (the EMS
-  frame is 16KB granular: 4 pages per mapping).
+- **EMM386 V86 runs with paging now**, as EMM386.EXE does (`CR0=80000011`): DOSBox-X's
+  EMM386 builds page tables that map all of RAM to itself (the CPU reaches its GDT, IDT and TSS
+  above 1MB through them, and DOSBox-X copies extended memory by linear address) and maps the
+  EMS pages into the first MB (`EMM_SetPTE()`), at a cost of a page directory and one page
+  table per 4MB of RAM. VCPI DE01 hands clients those entries, and DE0C from protected mode
+  reads the V86 frame through the client's paging before switching to EMM386's. The
+  `firstmb` remap stays for EMS without virtual 8086 mode (`ems=true`) and is not applied
+  while paging is on. When DOSBox-X changes the guest's page tables itself,
+  `PAGING_GuestPageTablesChanged()` tells the KVM core, which flushes the vCPU's TLB (setting
+  the special registers with another CR3 and back).
 - **Host pointers must be page-aligned for KVM slots.** `MemBase` is page-aligned when it
   comes from mmap (normal Linux build, memory file). It is not page-aligned from `malloc`
   (GameLink) or from `new[]` (the non-mmap fallback). VGA memory (`vga.mem.linear`) is
@@ -330,6 +518,14 @@ throttles the guest by duty cycle.
 - **CPU types without CPUID** (386, 486old): under KVM the CPUID instruction still runs (it
   returns zeros) and the EFLAGS ID bit can still be toggled, so CPUID detection finds a CPUID.
   Likewise `fpu=false` cannot remove the FPU. These are limits of running on real hardware.
+- **MSRs**: KVM answers RDMSR and WRMSR itself, so `enable msr=false` does not take them away
+  under KVM (TRIP needs `enable msr=true` on the emulated cores and runs on KVM without it).
+- **KVM's instruction emulator** (used for MMIO) cannot do x87 instructions (Glide's FSTP to
+  the Voodoo registers): the KVM core runs such an instruction on the normal core (step 24).
+  It does `REP OUTSW`/`OUTSD` one element per exit (it batches `REP INSW`), which is why the
+  IDE data port writes are queued.
+- **Windows 98 image** (`~/emu/win98`): `BootGUI=0`, it boots to the DOS prompt. A test copy
+  needs `WIN` in `AUTOEXEC.BAT` (step 24).
 - **Changing the CPU type at run time** calls `KVM_CoreInit()` again, which sets the CPUID
   again. Newer kernels refuse `KVM_SET_CPUID2` with different values after the vCPU has run,
   so once the core runs, a CPU type change needs a new vCPU (keeping the state through
@@ -341,23 +537,22 @@ throttles the guest by duty cycle.
 
 ## Open issues of the KVM core
 
-- **Callback round trips** cost about 12 us (an emulated core: about 1 us), most of it the
-  exit and entry themselves. `CALLBACK_Idle()` is a round trip per call in DOSBox-X's own wait
-  loops. Ideas: handle the hottest callbacks (INT 21h, INT 16h polling) with fewer state
-  transfers, e.g. without putting the segment registers back when they did not change (done)
-  and without fetching the state for callbacks that only read a few registers.
+- **Callback round trips** cost about 10 us (an emulated core: about 2.5 us including the
+  callback), most of it KVM's exit and entry. `CALLBACK_Idle()` is a round trip per call in
+  DOSBox-X's own wait loops.
 - **Port I/O exits** cost 5-7 us each in the kernel, so a guest that polls a port (a PIT or
   status port in a tight loop) runs at a fraction of the emulated cores' speed (IOBENCH).
-  Ideas: coalesced PIO (`KVM_CAP_COALESCED_PIO`) for write-only ports whose writes have no
-  immediate effect. Port reads always exit to userspace.
-- **Exit-heavy guests at low fixed cycle counts** still run slower than on an emulated core
-  (the VGA test at `cycles=30000`: 1.5 s against 0.3 s): exit costs vary, and the estimate
-  (`KVM_Overhead()`) errs towards charging the guest, so that it never gets free time.
-- **Short slices** (exit-bound guests at `cycles=max`) spend a noticeable part of their time
-  arming and disarming the slice timer (two syscalls per slice).
-- **The first slot build** classifies every page up to 4 GB (165 ms), and an A20 change
-  reclassifies all of them (4-6 ms). Limit it to where something is mapped, or reclassify only
-  pages whose handler could change.
+  Port reads always exit; writes that can be queued are (step 18).
+- **Exit-heavy guests at low fixed cycle counts** can still run slower than on an emulated
+  core: exit costs vary, and the estimate (`KVM_Overhead()`) errs towards charging the guest,
+  so that it never gets free time. (Mode 13h no longer exits, step 21.)
+- **Planar and unchained VGA modes** (16 colours, mode X/Y) exit for every video memory
+  access under KVM; the guest runs on an emulated core while that dominates (step 26). The
+  thresholds (40% to switch, 25% to stay, 20 ms and 50 ms) are first guesses, tuned on FastDoom
+  only. A guest whose VGA use comes in short bursts may switch often, and each switch back
+  resets the dynamic core's code cache.
+- **Short slices** (exit-bound guests at `cycles=max`) still spend part of their time
+  re-arming the slice timer.
 - **Paging changes inside the guest are not noticed** until the state is fetched: the first MB
   layout (`firstmb`, EMS) follows the paging state DOSBox-X last saw. With
   `KVM_CAP_SYNC_REGS` the core can check CR0 after every exit.
@@ -375,12 +570,18 @@ throttles the guest by duty cycle.
   then finishes). The event being delivered is not known yet; the log line now includes
   the vCPU events and the IDT.
 - **NMI** is not passed on.
+- **Windows 3.1 standard mode (`win /s`) under EMM386 on the dynamic core** ends with "Ran out
+  of CacheBlocks" partway through the test, also with the build from before this session; the
+  normal core and KVM run it. A dynamic core problem, not investigated.
+- **Windows 95 with 16 MB** (`~/emu/win95/dosbox.conf`, `memsize=16`): under KVM the desktop
+  came up but the Win32 test program started from `WIN.INI` did not run in 400 s; the dynamic
+  core ran it, and so did KVM with 32 MB, and the build from before steps 24-26 behaved the
+  same. Probably Windows waiting on something rather than the KVM core: a prompt about the
+  daylight saving time change, the NE2000 card not working (the test configuration leaves it
+  out; AUTOTYPE's Enter dismissed one such dialog), or reinstalling the IDE driver and asking
+  to restart. Not investigated yet.
 
 ## Next steps
 
-18. **Port I/O**: coalesced PIO for write-only ports, and see which ports games poll.
-19. **Callbacks**: profile a round trip and cut what is not the exit itself.
-20. **More guests**: OS/2, Windows NT/2000 (needs `cputype` with the right CPUID), Linux,
-    DOS extenders with their own paging (CWSDPMI, DOS/32A, PMODE/W), a Glide game, games that
-    use RDTSC for timing.
-21. **The open issues above.**
+27. **OS/2** once the floppy controller emulation is complete.
+28. **The other open issues above.**
