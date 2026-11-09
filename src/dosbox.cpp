@@ -4544,8 +4544,15 @@ void DOSBOX_SetupConfigSections(void) {
         "    openerror:<program>: start a program to open the output file if an error had occurred.\n"
         "    multiplier:<x>: Actual baud rate is the programmed rate times X to allow rates higher than 115200.\n"
         "Example: serial1=file file:output1.txt timeout:1000 openwith:notepad\n"
-        "for directserial: realport (required), rxdelay (optional).\n"
+        "for directserial: realport (required), rxdelay, lowlatency, rib (optional).\n"
         "                 (realport:COM1 realport:ttyS0).\n"
+        "                 lowlatency:1 asks the host driver to pass data and line changes\n"
+        "                 on at once (Linux: USB adapters such as FTDI drop from 16 ms to 1 ms).\n"
+        "                 rib:1 is for Motorola RIB cables (SB9600 bus, Motorola RSS):\n"
+        "                 echoes sent bytes locally, reports the BUSY line (DTR) on CTS/RI,\n"
+        "                 sends each 5-byte message in one burst, and defaults to\n"
+        "                 rxdelay:50 lowlatency:1. Also ribholdoff:<ms> (default 30), ribecho:0,\n"
+        "                 ribburst:0 (send each byte at once).\n"
         "for modem: listenport (optional).\n"
         "for nullmodem: server, rxdelay, txdelay, telnet, usedtr,\n"
         "               transparent, port, inhsocket, sock, pipe, nonlocal (all optional).\n"
@@ -4879,6 +4886,9 @@ void DOSBOX_SetupConfigSections(void) {
     Pint = secprop->Add_int("hard drive data rate limit",Property::Changeable::WhenIdle,-1);
     Pint->Set_help("Slow down (limit) hard disk throughput. This setting controls the limit in bytes/second.\n"
                    "Set to 0 to disable the limit, or -1 (default) to use a reasonable limit.\n"
+                   "For hard disks attached to the IDE emulation it is the rate the data comes off the disk, for direct\n"
+                   "IDE access and for BIOS disk access (INT 13h, PC-98 INT 1Bh) alike, which also take the seek and\n"
+                   "rotation time of the drive (see \"hard disk instant mode\" in the [ide] sections).\n"
                    "The disk I/O performance as in DOSBox SVN can be achieved by setting this to 0.");
     Pint->SetBasic(true);
 
@@ -5508,6 +5518,36 @@ void DOSBOX_SetupConfigSections(void) {
                 "In this way, you can have DOSBox-X emulate one of the strange quirks of 1995-1997 era\n"
                 "laptop hardware");
 
+        {
+            const char *ata_choices[] = { "auto", "ata1", "ata2", "ata3", "ata4", "ata5", "ata6", "ata7", "ata8", 0 };
+            Pstring = secprop->Add_string("ata standard",Property::Changeable::WhenIdle,"auto");
+            Pstring->Set_values(ata_choices);
+            if (i == 0) Pstring->Set_help("The ATA standard the emulated IDE devices on this controller follow, for the ATA hard disk and\n"
+                    "the ATAPI CD-ROM alike: the commands, SET FEATURES subcommands and feature sets the standard\n"
+                    "defines (and those it lists as obsolete, which drives kept for compatibility), the IDENTIFY data\n"
+                    "and the transfer modes. Commands the standard does not have, or has retired, are aborted.\n"
+                    "  ata1: ATA-1 (1994)      ata2: ATA-2 (1996)      ata3: ATA-3 (1997, SMART, security)\n"
+                    "  ata4: ATA/ATAPI-4 (1998, Ultra DMA 33, HPA, TCQ)  ata5: ATA/ATAPI-5 (2000, Ultra DMA 66, self-tests)\n"
+                    "  ata6: ATA/ATAPI-6 (2002, 48-bit LBA, DCO, Ultra DMA 100)  ata7: ATA/ATAPI-7 (2004, streaming, FUA)\n"
+                    "  ata8: ATA8-ACS (2006, SCT, NV Cache, trusted computing)\n"
+                    "  auto: ata8 if the PCI bus is enabled, ata3 otherwise.\n"
+                    "The ATAPI packet commands are there in any case.");
+        }
+
+        {
+            const char *bm_choices[] = { "none", "piix3", "piix4", 0 };
+            Pstring = secprop->Add_string("pci bus master",Property::Changeable::OnlyAtStart,"none");
+            Pstring->Set_values(bm_choices);
+            if (i == 0) Pstring->Set_help("PCI bus master IDE function for DMA transfers (set in the [ide, primary] section, it serves\n"
+                    "the primary and secondary controllers at their standard ports). Needs the PCI bus.\n"
+                    "  none:  no DMA, as in DOSBox-X before (DMA commands are aborted, IDENTIFY reports no DMA)\n"
+                    "  piix3: Intel PIIX3 IDE (8086:7010), multiword DMA mode 2\n"
+                    "  piix4: Intel PIIX4 IDE (8086:7111), Ultra DMA mode 2 (33MB/s)\n"
+                    "Operating systems with a driver for these load it and may use DMA (Windows 98 and later,\n"
+                    "Windows NT, Linux). The \"pnp\" setting does not apply to these channels (the PCI function\n"
+                    "reports them, not ISA PnP). Not available in PC-98 mode.");
+        }
+
         Pint = secprop->Add_int("cd-rom spinup time",Property::Changeable::WhenIdle,0/*use IDE or CD-ROM default*/);
         if (i == 0) Pint->Set_help("Emulated CD-ROM time in ms to spin up if CD is stationary.\n"
                 "Set to 0 to use controller or CD-ROM drive-specific default.");
@@ -5523,6 +5563,38 @@ void DOSBOX_SetupConfigSections(void) {
                 "When running Windows 95 or higher a delay of 4000ms is recommended to ensure that\n"
                 "auto-insert notification triggers properly.\n"
                 "Set to 0 to use controller or CD-ROM drive-specific default.");
+
+        Pbool = secprop->Add_bool("cd-rom instant mode",Property::Changeable::WhenIdle,false);
+        if (i == 0) Pbool->Set_help("If set, the emulated CD-ROM drive carries out seeks, reads, spin up, spin down,\n"
+                "tray open/close and disc insertion without delay.\n"
+                "Otherwise it takes as long as a real drive of the \"cd-rom max speed\" would: the optical pickup has to\n"
+                "seek to the sectors, the disc has to turn them past it at the read speed, the disc has to spin up\n"
+                "after a stop or a change of disc, and the tray takes \"cd-rom tray time\" to move.");
+
+        Pint = secprop->Add_int("cd-rom max speed",Property::Changeable::WhenIdle,0/*default*/);
+        if (i == 0) Pint->Set_help("Maximum read speed of the emulated CD-ROM drive, as a multiple of 150KB/s (1x).\n"
+                "Drives up to 12x read at a constant linear velocity, faster drives at a constant angular velocity\n"
+                "(faster towards the edge of the disc). The guest can ask for a lower speed (SET CD SPEED).\n"
+                "Set to 0 for the default (8x).");
+
+        Pint = secprop->Add_int("cd-rom tray time",Property::Changeable::WhenIdle,0/*default*/);
+        if (i == 0) Pint->Set_help("Emulated CD-ROM time in ms for the tray to open or close when the guest ejects or loads\n"
+                "the disc. Set to 0 for the default (1500ms).");
+
+        Pbool = secprop->Add_bool("hard disk instant mode",Property::Changeable::WhenIdle,false);
+        if (i == 0) Pbool->Set_help("If set, the emulated IDE hard disk carries out seeks, reads and writes without delay.\n"
+                "Otherwise it takes as long as a real hard disk would: the heads have to seek to the cylinder, the\n"
+                "sectors have to turn past the heads at the \"hard drive data rate limit\" ([dos] section), and a\n"
+                "disk that was spun down (power management) has to spin up again. Like a real drive it reads ahead\n"
+                "and caches writes. BIOS disk access (INT 13h, PC-98 INT 1Bh) to the disk takes the same time as the\n"
+                "BIOS carrying it out with ATA commands on the same drive would, so both see the same drive state.");
+
+        Pint = secprop->Add_int("hard disk rpm",Property::Changeable::WhenIdle,0/*default*/);
+        if (i == 0) Pint->Set_help("Rotational speed of the emulated IDE hard disk. Set to 0 for the default (5400).");
+
+        Pint = secprop->Add_int("hard disk spinup time",Property::Changeable::WhenIdle,0/*default*/);
+        if (i == 0) Pint->Set_help("Emulated IDE hard disk time in ms to spin up after it was spun down by power management.\n"
+                "Set to 0 for the default (4000ms).");
     }
 
     /* floppy controller emulation options and setup */

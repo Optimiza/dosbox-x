@@ -3363,6 +3363,20 @@ public:
             LOG_MSG("Booting guest OS stack_seg=0x%04x load_seg=0x%04x\n",(int)stack_seg,(int)load_seg);
             RunningProgram = "Guest OS";
 
+            /* the guest OS sees exactly the hard disk images that are attached */
+            BIOS_UpdateHardDiskCount(true);
+
+            /* The POST of a real BIOS seeks each floppy drive (to track 1 and back) to test it, and
+             * a step pulse with a disk in the drive resets the disk change line. So when the guest
+             * OS starts, a drive with a disk in it does not report a disk change, also when booting
+             * from the hard disk. OS/2 2.0 booted from the hard disk otherwise saw a pending disk
+             * change on every access to A: and gave up with "drive not ready". A drive with no disk
+             * (or the "empty" swap entry) keeps reporting it, as on real hardware. */
+            for (unsigned int fd = 0; fd < 2; fd++) {
+                if (imageDiskList[fd] != NULL && imageDiskList[fd]->class_id != imageDisk::ID_EMPTY_DRIVE)
+                    imageDiskChange[fd] = false;
+            }
+
             if (drive == 'A' || drive == 'B') {
                 FDC_AssignINT13Disk(drive - 'A');
                 if (!IS_PC98_ARCH) {
@@ -6389,7 +6403,7 @@ class IMGMOUNT : public Program {
 		bool ParseFiles(std::string &commandLine, std::vector<std::string> &paths, bool nodef) {
 			char drive=commandLine[0];
 			bool nocont=false;
-            if(!isalpha(drive) && !isdigit(drive)) return false;
+            if(!isalpha(drive) && !isdigit(drive) && drive != ':'/*device spec such as ":ide:2m"*/) return false;
 
 			while (!nocont) {
 				bool usedef=false;
@@ -6447,6 +6461,7 @@ class IMGMOUNT : public Program {
 #endif
 
 				if (!strcasecmp(commandLine.c_str(), "-u")) {
+					if (drive == ':') return false; /* device spec: unmounting is handled by the caller */
 					bool exist = toupper(drive) - 'A' == DOS_GetDefaultDrive();
 					Unmount(drive);
 					return exist && drive - 'A' != DOS_GetDefaultDrive();

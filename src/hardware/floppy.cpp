@@ -641,9 +641,16 @@ void FloppyDevice::motor_step(int dir) {
 		imageDiskChange[int13_disk] = false;
 }
 
+/* the disk in the drive, as the controller sees it. The "empty" swap list entry is an image object
+ * that stands for a drive with no disk in it, so it is no disk here: the disk change line stays
+ * active and a step pulse does not reset it, reads find no address mark, and on the uPD765 the drive
+ * is not ready. */
 imageDisk *FloppyDevice::getImage() {
-	if (int13_disk >= 0)
-		return GetINT13FloppyDrive((unsigned char)int13_disk);
+	if (int13_disk >= 0) {
+		imageDisk *image = GetINT13FloppyDrive((unsigned char)int13_disk);
+		if (image != NULL && image->class_id == imageDisk::ID_EMPTY_DRIVE) return NULL;
+		return image;
+	}
 
 	return NULL;
 }
@@ -2831,8 +2838,7 @@ void FLOPPY_INT13_Reset(void) {
 		floppycontroller[0]->int13_reset();
 }
 
-void FLOPPY_BIOS_MotorTimeout(void) {
-	const uint8_t running = mem_readb(BIOS_DRIVE_RUNNING);
+void FLOPPY_BIOS_MotorTimeout(uint8_t running) {
 
 	for (unsigned char d=0;d < 2;d++) {
 		if (!(running & (1u << d))) continue;
@@ -2889,7 +2895,7 @@ uint8_t FLOPPY_PC98_BIOS_Access(FloppyPC98BiosRequest &rq) {
 	if (drive >= 2) return 0x60;
 
 	imageDisk *image = GetINT13FloppyDrive(drive);
-	if (image == NULL) return 0x60; /* not ready: no disk */
+	if (image == NULL || image->class_id == imageDisk::ID_EMPTY_DRIVE) return 0x60; /* not ready: no disk */
 
 	FloppyController *fdc = floppycontroller[0];
 	FloppyMechanics &m = floppy_mech[drive];

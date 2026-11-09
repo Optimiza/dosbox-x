@@ -1,4 +1,80 @@
 Next version:
+  - [AI] CPU: a far CALL or JMP through a 386 call gate keeps the gate's
+    32-bit target offset when the instruction itself is 16-bit (only a 286
+    gate truncates it to 16 bits). A page fault on the new stack while a
+    call gate switches privilege now aborts the CALL with the old CS:EIP and
+    SS:ESP, so the guest restarts it, as on real hardware. Fixes OS/2 2.0
+    setup crashing with TRAP 000E, and then with a stack fault in a ring 2
+    routine. (joncampbell123)
+  - [AI] CPU: the CMOS shutdown 09h return (INT 15h block move, the 286
+    reset trick) pops DS before ES, as the IBM PC/AT BIOS frame has them.
+    Fixes OS/2 1.0 leaving the keyboard interrupt masked during boot, so
+    that Enter could not be pressed at the installation prompt.
+    (joncampbell123)
+  - [AI] BIOS: the number of hard disks at 40:75h follows the attached hard
+    disk images instead of always being 2 (the DOS shell keeps 2 when no
+    hard disk image is attached). Fixes OS/2 2.0 FDISK crashing with a
+    divide error on a phantom second disk. (joncampbell123)
+  - [AI] BIOS: a jump to the INT 1Ah handler at F000:FE6E, the fixed IBM
+    PC/AT entry point. The IRQ 0 handler reaches the BIOS data area through
+    segment/selector 40h, as BIOS code does, so a protected mode OS can call
+    it. Fixes OS/2 Warp 3 hanging at startup in an STI/JMP loop after
+    calling the PCI BIOS through that entry point. (joncampbell123)
+  - [AI] Floppy: the "empty" swap list entry is a drive with no disk for
+    the floppy controller too (the disk change line stays active, reads
+    fail). BOOT clears the disk change line of floppy drives with a disk in
+    them, as the BIOS POST seek does, also when booting from the hard disk.
+    Fixes OS/2 2.0 not reading the floppy drive after booting from the hard
+    disk. (joncampbell123)
+  - [AI] CD-ROM images: multisession CUE sheets (REM SESSION) and CloneCD
+    images (data discs with added sessions, Enhanced CDs). The ISO drive and
+    MSCDEX use the last session's file system, and ATAPI READ TOC returns
+    the real last session (format 1) and the full TOC (format 2). Fixed the
+    CloneCD lead-out position and Mode 2 tracks. (joncampbell123)
+  - [AI] DOS: the Swappable Data Area is where programs written for the
+    reported DOS version expect it. While DOS reports 3.10 to 3.39 it is at
+    offset 02CEh of the List of Lists segment (current PSP at 02DEh) as in
+    MS-DOS 3.1-3.3, otherwise at the DOS 4+ location (current PSP at 0330h).
+    Fixes Windows/286 2.11 crashing at startup with memory corruption
+    ("Corrupt MCB chain") when DOS reports version 3.x, e.g. "ver set 3 30".
+    (joncampbell123)
+  - [AI] IDE: the ATA and ATAPI commands up to ATA8-ACS. The hard disk has
+    SMART (attributes, self-tests, error and self-test logs), General Purpose
+    Logging, SCT Command Transport, Host Protected Area, Device Configuration
+    Overlay, Security (SECURITY ERASE UNIT erases the disk image), Streaming,
+    NV Cache, Trusted Computing, DOWNLOAD MICROCODE, WRITE UNCORRECTABLE,
+    READ/WRITE LONG, APM, AAM and the SET FEATURES subcommands of every ATA
+    standard. Long fills such as a security erase run in the background at
+    the drive's speed. The CD-ROM has more MMC commands (PLAY AUDIO(12), PLAY
+    AUDIO TRACK/INDEX, SCAN, READ HEADER, GET PERFORMANCE, SET STREAMING,
+    VERIFY, LOAD/UNLOAD MEDIUM and others) and GET MEDIA STATUS.
+    (joncampbell123)
+  - [AI] IDE: added [ide, primary] "pci bus master" (none, piix3, piix4): a
+    PCI bus master IDE function (Intel PIIX3 or PIIX4) for DMA transfers,
+    with the ATA DMA commands and ATAPI PACKET with DMA. The BIOS sets up
+    the drives for DMA as Windows 9x expects, and the channels are not also
+    listed as ISA PnP devices. Default none (needs the PCI bus).
+    (joncampbell123)
+  - [AI] IDE: added [ide, *] "ata standard" (auto, ata1 ... ata8): the IDE
+    devices follow that ATA standard's commands, features, IDENTIFY data and
+    transfer modes. auto is ata8 with the PCI bus, ata3 without.
+    (joncampbell123)
+  - [AI] IDE: the hard disk takes the time a real drive takes to seek, wait
+    for the sectors to come around and read or write them, with read-ahead,
+    a write cache and spin up/down for the power management commands. The
+    CD-ROM has tray, spin up/down, seek and read times (CLV/CAV), Media
+    Change Notification and tray locking, and READ CD returns every sector
+    format and field. INT 13h and PC-98 INT 1Bh hard disk access go through
+    the same drive model. Added [ide, *] options "hard disk instant mode",
+    "hard disk rpm", "hard disk spinup time", "cd-rom instant mode",
+    "cd-rom max speed" and "cd-rom tray time". Fixed IMGMOUNT to an IDE
+    device spec (":ide:2m"), which never got the image file.
+    (joncampbell123)
+  - [AI] Floppy: the drive takes the time a real one takes (motor start,
+    seek, head settle, sectors turning past the head) for the FDC and INT 13h
+    alike, with [fdc, primary] "instant mode" to turn the delays off. PC-98:
+    uPD765 floppy interface with ID field level tracks (copy protection), and
+    INT 1Bh floppy access on the same drive model. (joncampbell123)
   - [AI] KVM CPU core: 256-colour VGA (mode 13h) games run at full speed:
     the guest writes video memory directly instead of every write going
     through DOSBox-X (Quake's timedemo went from 45 to over 200 fps).
@@ -228,6 +304,10 @@ Next version:
     (SergioMartin86, maron2000)
   - Fixed misplaced text underline in 20-line mode (SergioMartin86, maron2000)
   - Fixed turbo option remained true even after it is stopped (maron2000)
+  - FPU: Clear the C2 status flag before FPREM/FPREM1 input checks so an
+    early return does not leave a stale incomplete-remainder status. (cimarronm)
+  - FPU: Fixed x87 underflow reporting for inexact tiny results that round to
+    the minimum normal IEEE floating-point value. (cimarronm)
 
 2026.10.01:
   - Fixed DOS FCB operations trying to read/write from device_CON when performed
