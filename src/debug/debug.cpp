@@ -2979,7 +2979,16 @@ bool ParseCommand(char* str) {
 			DEBUG_ShowMsg("DEBUG: Invalid memory dump arguments. Usage: MEMDUMPLIN linear len [filename].\n");
 			return true;
 		}
-		SaveMemoryLinear(*found ? found : "MEMDUMP.BIN",linear,num);
+		if ((uint64_t)linear + num > 0x100000000ull) {
+			DEBUG_ShowMsg("DEBUG: MEMDUMPLIN %08X + %X runs past the end of the 32-bit linear space.\n",linear,num);
+			return true;
+		}
+		/* ParseCommand upper-cases its own copy, which a file name does not survive on a case-sensitive file system. */
+		const std::string typed = RawCommandArgument(str);
+		const size_t tail = strlen(found);
+		const std::string filename = !*found ? std::string("MEMDUMP.BIN") :
+			(tail <= typed.size() ? typed.substr(typed.size() - tail) : std::string(found));
+		SaveMemoryLinear(filename.c_str(),linear,num);
 		return true;
 	}
 
@@ -7352,12 +7361,14 @@ static void SaveMemoryBin(const char *filename, uint16_t seg, uint32_t ofs1, uin
  * hides. The tables live in RAM, and phys_readd answers 0xFFFFFFFF past it, which would read as a
  * present entry; a 4 MB page (when the CPU honours PS) is not walked. */
 static bool ReadTableEntry(PhysPt addr, X86PageEntry &entry) {
-	if (addr >= MemSize - 3u) return false;
+	if (MemSize < 4u || addr > MemSize - 4u) return false;
 	entry.load = phys_readd(addr);
 	return true;
 }
 
 static bool LinearToPhysical(uint32_t linear, PhysPt &phys) {
+	/* No page tables were ever loaded: the base is 0 and the "directory" would be the interrupt vector table. */
+	if (paging.cr3 == 0) return false;
 	X86PageEntry table;
 	if (!ReadTableEntry((PhysPt)((paging.base.page << 12u) + (linear >> 22u) * 4u), table) || !table.block.p)
 		return false;
