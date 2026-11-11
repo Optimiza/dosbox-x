@@ -528,6 +528,16 @@ static Bitu Normal_Loop(void) {
 #endif
             } else {
                 GFX_Events();
+#if C_DEBUG
+                /* A tick handler or an event can stop the machine (the debugger channel's BREAK,
+                 * the hotkey, the menu), and PIC_RunQueue then declines to run: the ticks still
+                 * owed would be added with the CPU parked, moving the devices' clock and every
+                 * queued event ahead of it. The test is PIC_RunQueue's own. */
+                bool IsDebuggerActive(void);
+                bool IsDebuggerRunwatch(void);
+                if (DEBUG_ExitLoop() || (IsDebuggerActive() && !IsDebuggerRunwatch()))
+                    return 0;
+#endif
                 if (DOSBox_Paused() == false && ticksRemain > 0) {
                     TIMER_AddTick();
                     ticksRemain--;
