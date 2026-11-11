@@ -2904,9 +2904,13 @@ bool ParseCommand(char* str) {
 				(unsigned long)vga.mem.memsize);
 			return false;
 		}
-		std::ofstream file(found + consumed, std::ios::binary);
+		/* ParseCommand upper-cases its own copy, which a file name does not survive on a case-sensitive file system. */
+		const std::string typed = RawCommandArgument(str);
+		const size_t tail = strlen(found + consumed);
+		const std::string filename = tail <= typed.size() ? typed.substr(typed.size() - tail) : std::string(found + consumed);
+		std::ofstream file(filename.c_str(), std::ios::binary);
 		if (!file.is_open() || !file.write((const char*)vga.mem.linear + ofs, (std::streamsize)len)) {
-			DEBUG_ShowMsg("DEBUG: VGAMEMDUMP cannot write %s\n", found + consumed);
+			DEBUG_ShowMsg("DEBUG: VGAMEMDUMP cannot write %s\n", filename.c_str());
 			return false;
 		}
 		file.close();
