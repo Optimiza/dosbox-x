@@ -2537,6 +2537,11 @@ void MEM_ResetPageHandler_Unmapped(Bitu phys_page, Bitu pages);
 void MEM_ResetPageHandler_RAM(Bitu phys_page, Bitu pages);
 
 extern void DISP2_SetPageHandler(void);
+static bool NonCgaIgnoreOddEvenEngaged(void) {
+	return (vga.seq.memory_mode & 8/*Chain 4 enable*/) ||
+		(non_cga_ignore_oddeven && !(vga.mode == M_TEXT || vga.mode == M_CGA2 || vga.mode == M_CGA4));
+}
+
 void VGA_SetupHandlers(void) {
 	/* This code inherited from DOSBox SVN confuses bank size with bank granularity.
 	 * This code is enforcing bank granularity. Bank size concerns how much memory is
@@ -2859,9 +2864,7 @@ void VGA_SetupHandlers(void) {
 	 *
 	 *      If chain 4 (or "compatible chain 4") is enabled, then ignore odd/even mode.
 	 *      If neither text nor CGA display mode and requested by the user through dosbox.conf, ignore odd/even mode. */
-	non_cga_ignore_oddeven_engage =
-		(vga.seq.memory_mode & 8/*Chain 4 enable*/) ||
-		(non_cga_ignore_oddeven && !(vga.mode == M_TEXT || vga.mode == M_CGA2 || vga.mode == M_CGA4));
+	non_cga_ignore_oddeven_engage = NonCgaIgnoreOddEvenEngaged();
 
 range_done:
 #if C_DEBUG
@@ -2870,6 +2873,24 @@ range_done:
 	/* bank switching changes the host memory behind the same page handlers */
 	MEM_MapChanged(VGA_PAGE_A0,32);
 	PAGING_ClearTLB();
+}
+
+/* A state load restores the registers but not the complexity flags derived from them nor the
+ * handler they select at A0000. Each flag is set as its register write sets it, the odd/even
+ * one once chain 4's override is worked out from the loaded registers. */
+void VGA_RederiveMemoryHandlers(void) {
+	vga.complexity.flags = 0;
+	non_cga_ignore_oddeven_engage = NonCgaIgnoreOddEvenEngaged();
+	VGA_ComplexityCheck_MAP_MASK();
+	VGA_ComplexityCheck_ODDEVEN();
+	vga.complexity.setf(VGACMPLX_NON_EXTENDED,(vga.seq.memory_mode & 2) == 0 && !vga_ignore_extended_memory_bit);
+	vga.complexity.setf(VGACMPLX_BITMASK,vga.config.full_bit_mask != 0xFFFFFFFFu);
+	vga.complexity.setf(VGACMPLX_COLORDONTCARE,vga.gfx.color_dont_care != 0 && vga.config.read_mode == 1);
+	vga.complexity.setf(VGACMPLX_WRITEMODE,vga.config.write_mode != 0);
+	vga.complexity.setf(VGACMPLX_READMODE,vga.config.read_mode != 0);
+	vga.complexity.setf(VGACMPLX_ROPROT,vga.config.data_rotate != 0 || vga.config.raster_op != 0);
+	vga.complexity.setf(VGACMPLX_SETRESET,(vga.gfx.enable_set_reset & 0xF) != 0);
+	VGA_SetupHandlers();
 }
 
 /* Chained 256-colour memory as a shadow in the guest's byte order (see vga.h): while all of

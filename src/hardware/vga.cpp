@@ -2299,6 +2299,7 @@ private:
 		// variants and the load-side switch has no default, so without this the renderer can be
 		// left pointing at a stale function (mode 13h → vertical colour bands).
 		VGA_SetupDrawing(0);
+		VGA_RederiveMemoryHandlers();
 	}
 } dummy;
 }
