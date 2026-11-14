@@ -1837,8 +1837,12 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		strcat(tempDir,end);
 	}
 
+	uint8_t sAttr;
+	char srch_pattern[LFN_NAMELENGTH+1];
+	dta.GetSearchParams(sAttr,srch_pattern,false);
+
 	uint16_t id;
-	if (!dirCache.FindFirst(tempDir,id)) {
+	if (!dirCache.FindFirst(tempDir,id,srch_pattern)) {
 		DOS_SetError(DOSERR_PATH_NOT_FOUND);
 		return false;
 	}
@@ -1849,9 +1853,6 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		ldid[lfn_filefind_handle]=id;
 		ldir[lfn_filefind_handle]=tempDir;
 	}
-
-	uint8_t sAttr;
-	dta.GetSearchParams(sAttr,tempDir,false);
 
 	if (this->isRemote() && this->isRemovable()) {
 		// cdroms behave a bit different than regular drives
@@ -1873,7 +1874,7 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		} else if ((sAttr & DOS_ATTR_VOLUME) && (*_dir == 0) && !fcb_findfirst) { 
 			//should check for a valid leading directory instead of 0
 			//exists==true if the volume label matches the searchmask and the path is valid
-			if (WildFileCmp(dirCache.GetLabel(),tempDir)) {
+			if (WildFileCmp(dirCache.GetLabel(),srch_pattern)) {
 				dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
 				return true;
 			}

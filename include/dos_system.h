@@ -221,7 +221,7 @@ public:
 	char*		GetExpandName		(const char* path);
 	bool		GetShortName		(const char* fullname, char* shortname);
 
-	bool		FindFirst			(char* path, uint16_t& id);
+	bool		FindFirst			(char* path, uint16_t& id, const char* pattern);
     bool        FindNext            (uint16_t id, char* &result, char* &lresult);
 
 	void		CacheOut			(const char* path, bool ignoreLastDir = false);
