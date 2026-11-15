@@ -1842,6 +1842,34 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 	char srch_pattern[LFN_NAMELENGTH+1];
 	dta.GetSearchParams(sAttr,srch_pattern,false);
 
+	if (sAttr == DOS_ATTR_VOLUME) {
+		// The label is all a search for the label alone returns: it takes no search of the
+		// cache, and the FindNext after it finds none to go on with.
+		uint16_t dirID;
+		if (!dirCache.OpenDir(tempDir,dirID)) {
+			DOS_SetError(DOSERR_PATH_NOT_FOUND);
+			return false;
+		}
+		// cdroms behave a bit different than regular drives
+		if (!(this->isRemote() && this->isRemovable()) && strcmp(dirCache.GetLabel(), "") == 0) {
+//			LOG(LOG_DOSMISC,LOG_ERROR)("DRIVELABEL REQUESTED: none present, returned  NOLABEL");
+//			dta.SetResult("NO_LABEL",0,0,0,DOS_ATTR_VOLUME);
+//			return true;
+			DOS_SetError(DOSERR_NO_MORE_FILES);
+			return false;
+		}
+		if (lfn_filefind_handle>=LFN_FILEFIND_MAX) {
+			dta.SetDirID(0);
+			dta.SetDirIDCluster(0);
+		} else {
+			ldid[lfn_filefind_handle]=0;
+			lgen[lfn_filefind_handle]=0;
+			ldir[lfn_filefind_handle]="";
+		}
+		dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
+		return true;
+	}
+
 	uint16_t id;
 	uint32_t generation;
 	if (!dirCache.FindFirst(tempDir,id,generation,srch_pattern)) {
@@ -1858,30 +1886,12 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 		ldir[lfn_filefind_handle]=tempDir;
 	}
 
-	if (this->isRemote() && this->isRemovable()) {
-		// cdroms behave a bit different than regular drives
-		if (sAttr == DOS_ATTR_VOLUME) {
+	if (!(this->isRemote() && this->isRemovable()) && (sAttr & DOS_ATTR_VOLUME) && (*_dir == 0) && !fcb_findfirst) {
+		//should check for a valid leading directory instead of 0
+		//exists==true if the volume label matches the searchmask and the path is valid
+		if (WildFileCmp(dirCache.GetLabel(),srch_pattern)) {
 			dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
 			return true;
-		}
-	} else {
-		if (sAttr == DOS_ATTR_VOLUME) {
-			if ( strcmp(dirCache.GetLabel(), "") == 0 ) {
-//				LOG(LOG_DOSMISC,LOG_ERROR)("DRIVELABEL REQUESTED: none present, returned  NOLABEL");
-//				dta.SetResult("NO_LABEL",0,0,0,DOS_ATTR_VOLUME);
-//				return true;
-				DOS_SetError(DOSERR_NO_MORE_FILES);
-				return false;
-			}
-			dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
-			return true;
-		} else if ((sAttr & DOS_ATTR_VOLUME) && (*_dir == 0) && !fcb_findfirst) { 
-			//should check for a valid leading directory instead of 0
-			//exists==true if the volume label matches the searchmask and the path is valid
-			if (WildFileCmp(dirCache.GetLabel(),srch_pattern)) {
-				dta.SetResult(dirCache.GetLabel(),dirCache.GetLabel(),0,0,0,0,DOS_ATTR_VOLUME);
-				return true;
-			}
 		}
 	}
 	return FindNext(dta);
