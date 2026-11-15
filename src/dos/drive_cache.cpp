@@ -43,6 +43,10 @@ extern bool gbk;
 char * DBCS_upcase(char * str);
 bool isDBCSCP(), shiftjis_lead_byte(int c), isKanji1_gbk(uint8_t chr), filename_not_8x3(const char *n), filename_not_strict_8x3(const char *n);
 
+// One counter for the searches of every drive, so that the search a DTA names is never taken
+// for one of the drive mounted in its place.
+uint32_t DOS_Drive_Cache::searchGeneration = 0;
+
 bool SortByName(DOS_Drive_Cache::CFileInfo* const &a, DOS_Drive_Cache::CFileInfo* const &b) {
     return strcmp(a->shortname,b->shortname)<0;
 }
@@ -940,7 +944,7 @@ bool DOS_Drive_Cache::SetResult(CFileInfo* dir, char* &result, char* &lresult, B
 }
 
 // FindFirst / FindNext
-bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, const char* pattern) {
+bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, const char* pattern) {
     uint16_t  dirID;
     // Cache directory in
     if (!OpenDir(path,dirID)) return false;
@@ -972,6 +976,11 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, const char* pattern) {
     }
     dirFindFirst[dirFindFirstID] = new CFileInfo();
     dirFindFirst[dirFindFirstID]-> nextEntry    = 0;
+    // A slot is given out again and again: its number and this generation together name the
+    // search that holds it now. 0 is the generation of no search.
+    if (++searchGeneration == 0) searchGeneration = 1;
+    dirFindFirstGeneration[dirFindFirstID] = searchGeneration;
+    generation = searchGeneration;
 
     // A pattern without wildcards matches one entry at most, unless two entries share a name.
     // Copy that entry alone, picked by the test the drive's FindNext applies, instead of the
@@ -1051,12 +1060,9 @@ void DOS_Drive_Cache::WidenSearch(CFileInfo* search) {
     if (held) search->nextEntry = (Bitu)(std::find(search->fileList.begin(),search->fileList.end(),held)-search->fileList.begin())+1;
 }
 
-bool DOS_Drive_Cache::FindNext(uint16_t id, char* &result, char* &lresult, const char* pattern) {
-    // out of range ?
-    if ((id>=MAX_OPENDIRS) || !dirFindFirst[id]) {
-        LOG(LOG_DOSMISC,LOG_ERROR)("DIRCACHE: FindFirst/Next failure : ID out of range: %04X",id);
-        return false;
-    }
+bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern) {
+    // A search that ended, or a slot that another search holds since: no more files
+    if ((id>=MAX_OPENDIRS) || !dirFindFirst[id] || dirFindFirstGeneration[id]!=generation) return false;
     // The search of an exact name holds one entry (see FindFirst) and has nothing more for that
     // name. Any other pattern goes on through the directory.
     CFileInfo* search = dirFindFirst[id];

@@ -221,8 +221,8 @@ public:
 	char*		GetExpandName		(const char* path);
 	bool		GetShortName		(const char* fullname, char* shortname);
 
-	bool		FindFirst			(char* path, uint16_t& id, const char* pattern);
-    bool        FindNext            (uint16_t id, char* &result, char* &lresult, const char* pattern);
+	bool		FindFirst			(char* path, uint16_t& id, uint32_t& generation, const char* pattern);
+    bool        FindNext            (uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern);
 
 	void		CacheOut			(const char* path, bool ignoreLastDir = false);
 	void		AddEntry			(const char* path, bool checkExists = false);
@@ -293,7 +293,9 @@ private:
 	CFileInfo*	dirSearch			[MAX_OPENDIRS] = {};
 	char		dirSearchName		[MAX_OPENDIRS] = {};
 	CFileInfo*	dirFindFirst		[MAX_OPENDIRS] = {};
+	uint32_t	dirFindFirstGeneration	[MAX_OPENDIRS] = {};
 	uint16_t		nextFreeFindFirst = 0;
+	static uint32_t	searchGeneration;
 
 	char		label				[CROSS_LEN] = {};
 	bool		updatelabel = false;

@@ -42,6 +42,7 @@
 bool logoverlay = false;
 extern int lfn_filefind_handle;
 extern uint16_t ldid[256];
+extern uint32_t lgen[256];
 extern std::string ldir[256];
 std::string prefix_overlay = ".DBOVERLAY";
 #endif
@@ -1048,11 +1049,13 @@ bool Overlay_Drive::FindNext(DOS_DTA & dta) {
 
 	dta.GetSearchParams(srch_attr,srch_pattern,false);
 	uint16_t id = lfn_filefind_handle>=LFN_FILEFIND_MAX?dta.GetDirID():ldid[lfn_filefind_handle];
+	uint32_t generation = lfn_filefind_handle>=LFN_FILEFIND_MAX?dta.GetDirIDCluster():lgen[lfn_filefind_handle];
 
 again:
-	if (!dirCache.FindNext(id,dir_ent,ldir_ent,srch_pattern)) {
+	if (!dirCache.FindNext(id,generation,dir_ent,ldir_ent,srch_pattern)) {
 		if (lfn_filefind_handle<LFN_FILEFIND_MAX) {
 			ldid[lfn_filefind_handle]=0;
+			lgen[lfn_filefind_handle]=0;
 			ldir[lfn_filefind_handle]="";
 		}
 		DOS_SetError(DOSERR_NO_MORE_FILES);

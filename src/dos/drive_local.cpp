@@ -111,6 +111,7 @@
 #endif
 
 uint16_t ldid[256];
+uint32_t lgen[256];
 std::string ldir[256];
 static host_cnv_char_t cpcnv_temp[4096];
 static host_cnv_char_t cpcnv_ltemp[4096];
@@ -1842,15 +1843,18 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 	dta.GetSearchParams(sAttr,srch_pattern,false);
 
 	uint16_t id;
-	if (!dirCache.FindFirst(tempDir,id,srch_pattern)) {
+	uint32_t generation;
+	if (!dirCache.FindFirst(tempDir,id,generation,srch_pattern)) {
 		DOS_SetError(DOSERR_PATH_NOT_FOUND);
 		return false;
 	}
 	if (lfn_filefind_handle>=LFN_FILEFIND_MAX) {
 		dta.SetDirID(id);
+		dta.SetDirIDCluster(generation);
 		strcpy(srchInfo[id].srch_dir,tempDir);
 	} else {
 		ldid[lfn_filefind_handle]=id;
+		lgen[lfn_filefind_handle]=generation;
 		ldir[lfn_filefind_handle]=tempDir;
 	}
 
@@ -1897,11 +1901,13 @@ bool localDrive::FindNext(DOS_DTA & dta) {
 
 	dta.GetSearchParams(srch_attr,srch_pattern,false);
 	uint16_t id = lfn_filefind_handle>=LFN_FILEFIND_MAX?dta.GetDirID():ldid[lfn_filefind_handle];
+	uint32_t generation = lfn_filefind_handle>=LFN_FILEFIND_MAX?dta.GetDirIDCluster():lgen[lfn_filefind_handle];
 
 again:
-	if (!dirCache.FindNext(id,dir_ent,ldir_ent,srch_pattern)) {
+	if (!dirCache.FindNext(id,generation,dir_ent,ldir_ent,srch_pattern)) {
 		if (lfn_filefind_handle<LFN_FILEFIND_MAX) {
 			ldid[lfn_filefind_handle]=0;
+			lgen[lfn_filefind_handle]=0;
 			ldir[lfn_filefind_handle]="";
 		}
 		DOS_SetError(DOSERR_NO_MORE_FILES);

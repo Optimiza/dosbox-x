@@ -705,7 +705,7 @@ private:
         uint8_t spext[3];                     /* The Search pattern for the extension */
 		uint8_t sattr;						/* The Attributes that need to be found */
 		uint16_t dirID;						/* custom: dir-search ID for multiple searches at the same time */
-		uint32_t dirCluster;					/* custom (drive_fat only): cluster number for multiple searches at the same time. 32-bit wide on FAT32 aware MS-DOS 7.1 or higher. */
+		uint32_t dirCluster;					/* custom: on a FAT image, cluster number for multiple searches at the same time. 32-bit wide on FAT32 aware MS-DOS 7.1 or higher. On a host folder, the generation of the search dirID names. */
 		uint8_t fill[2];
 		uint8_t attr;
 		uint16_t time;
