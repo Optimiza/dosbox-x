@@ -280,6 +280,7 @@ private:
 	void		WidenSearch		(CFileInfo* search);
 	bool		HoldsSearch		(uint16_t id, uint32_t generation);
 	void		FreeSearch		(uint16_t id);
+	uint16_t		SearchToEnd		(void);
 	uint16_t		GetFreeID		(CFileInfo* dir);
 	void		Clear			(void);
 
@@ -311,6 +312,8 @@ private:
 	CFileInfo*	dirFindFirst		[MAX_OPENDIRS] = {};
 	Listing*	dirFindFirstListing	[MAX_OPENDIRS] = {};
 	uint32_t	dirFindFirstGeneration	[MAX_OPENDIRS] = {};
+	uint32_t	dirFindFirstTick	[MAX_OPENDIRS] = {};	// when the search was last continued
+	uint32_t	findTick = 0;
 	uint16_t		nextFreeFindFirst = 0;
 	static uint32_t	searchGeneration;
 

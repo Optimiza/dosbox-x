@@ -953,7 +953,7 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, 
     if (!OpenDir(path,dirID)) return false;
 
     //Find a free slot.
-    //If the next one isn't free, move on to the next, if none is free => reset and assume the worst
+    //If the next one isn't free, move on to the next, if none is free => one search gives its slot up
     uint16_t local_findcounter = 0;
     while ( local_findcounter < MAX_OPENDIRS ) {
         if (!dirFindFirst[this->nextFreeFindFirst]) break;
@@ -964,17 +964,10 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, 
     uint16_t  dirFindFirstID = this->nextFreeFindFirst++;
     if (this->nextFreeFindFirst >= MAX_OPENDIRS) this->nextFreeFindFirst = 0; //Increase and wrap around for the next search.
 
-    if (local_findcounter == MAX_OPENDIRS) { //Here is the reset from above.
+    if (local_findcounter == MAX_OPENDIRS) {
         // no free slot found...
-        LOG(LOG_DOSMISC,LOG_ERROR)("DIRCACHE: FindFirst/Next: All slots full. Resetting");
-        // Clear the internal list then.
-        dirFindFirstID = 0;
-        this->nextFreeFindFirst = 1; //the next free one after this search
-        for(uint16_t n=0; n<MAX_OPENDIRS;n++) {
-            // Clear and reuse slot
-            if (dirFindFirst[n]) FreeSearch(n);
-        }
-
+        dirFindFirstID = SearchToEnd();
+        FreeSearch(dirFindFirstID);
     }
     dirFindFirst[dirFindFirstID] = new CFileInfo();
     dirFindFirst[dirFindFirstID]-> nextEntry    = 0;
@@ -983,6 +976,7 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, 
     if (++searchGeneration == 0) searchGeneration = 1;
     dirFindFirstGeneration[dirFindFirstID] = searchGeneration;
     generation = searchGeneration;
+    dirFindFirstTick[dirFindFirstID] = ++findTick;
 
     // A pattern without wildcards matches one entry at most, unless two entries share a name.
     // Copy that entry alone, picked by the test the drive's FindNext applies, instead of the
@@ -1096,6 +1090,30 @@ void DOS_Drive_Cache::FreeSearch(uint16_t id) {
     }
 }
 
+// The search that gives its slot up when every slot holds one. The oldest search of one name
+// first: it has returned its entry and has no more for that name. When there is none, the
+// search least recently continued among those of the copy that most searches read: all but
+// the few being read were left by their program.
+uint16_t DOS_Drive_Cache::SearchToEnd(void) {
+    uint16_t oneName = MAX_OPENDIRS, other = MAX_OPENDIRS;
+    Bitu users = 0;
+    for (uint16_t n=0; n<MAX_OPENDIRS; n++) {
+        if (dirFindFirst[n]->orgname[0]) {
+            if (oneName == MAX_OPENDIRS || dirFindFirstGeneration[n] < dirFindFirstGeneration[oneName]) oneName = n;
+        } else {
+            // A search that owns its copy is the only one that reads it.
+            const Bitu sharing = dirFindFirstListing[n] ? dirFindFirstListing[n]->users : 1;
+            if (other == MAX_OPENDIRS || sharing > users || (sharing == users && dirFindFirstTick[n] < dirFindFirstTick[other])) {
+                other = n;
+                users = sharing;
+            }
+        }
+    }
+    if (oneName != MAX_OPENDIRS) return oneName;
+    LOG(LOG_DOSMISC,LOG_WARN)("DIRCACHE: FindFirst: all %u slots hold a search, ending the one least recently continued (slot %04X)",(unsigned int)MAX_OPENDIRS,other);
+    return other;
+}
+
 bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern) {
     if (!HoldsSearch(id,generation)) return false;
     // The search of an exact name holds one entry (see FindFirst) and has nothing more for that
@@ -1108,6 +1126,7 @@ bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, 
         return false;
     }
     search->nextEntry++;
+    dirFindFirstTick[id] = ++findTick;
     return true;
 }
 
