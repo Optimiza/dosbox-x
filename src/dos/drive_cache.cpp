@@ -94,7 +94,7 @@ DOS_Drive_Cache::DOS_Drive_Cache(const char* path, DOS_Drive *drive) {
 
 DOS_Drive_Cache::~DOS_Drive_Cache(void) {
     Clear();
-    for (uint32_t i=0; i<MAX_OPENDIRS; i++) { DeleteFileInfo(dirFindFirst[i]); dirFindFirst[i]=nullptr; }
+    for (uint16_t i=0; i<MAX_OPENDIRS; i++) { if (dirFindFirst[i]) FreeSearch(i); }
 }
 
 void DOS_Drive_Cache::Clear(void) {
@@ -372,6 +372,7 @@ void DOS_Drive_Cache::CacheOut(const char* path, bool ignoreLastDir) {
     // clear lists
     dir->fileList.clear();
     dir->longNameList.clear();
+    dir->stamp = nextStamp;
     save_dir = nullptr;
 }
 
@@ -834,6 +835,7 @@ char* DOS_Drive_Cache::CreateEntry(CFileInfo* dir, const char* name, const char*
 	strcpy(info->orgname, name);
     info->shortNr = 0;
     info->isDir = is_directory;
+    dir->stamp = nextStamp;
 
     // Check for long filenames...
     if (sname[0]==0) CreateShortName(dir, info);
@@ -917,7 +919,10 @@ bool DOS_Drive_Cache::ReadDir(uint16_t id, char* &result, char * &lresult) {
             LOG_DEBUG(buffer);
         };*/
     }
-	if (SetResult(dirSearch[id], result, lresult, dirSearch[id]->nextEntry)) return true;
+	if (SetResult(dirSearch[id], result, lresult, dirSearch[id]->nextEntry)) {
+		dirSearch[id]->nextEntry++;
+		return true;
+	}
     if (dirSearch[id]) {
         dirSearch[id]->id = MAX_OPENDIRS;
         dirSearch[id] = nullptr;
@@ -925,7 +930,7 @@ bool DOS_Drive_Cache::ReadDir(uint16_t id, char* &result, char * &lresult) {
     return false;
 }
 
-bool DOS_Drive_Cache::SetResult(CFileInfo* dir, char* &result, char* &lresult, Bitu entryNr)
+bool DOS_Drive_Cache::SetResult(const CFileInfo* dir, char* &result, char* &lresult, Bitu entryNr)
 {
     static char res[CROSS_LEN] = { 0 };
     static char lres[CROSS_LEN] = { 0 };
@@ -938,8 +943,6 @@ bool DOS_Drive_Cache::SetResult(CFileInfo* dir, char* &result, char* &lresult, B
     // copy filename, short version
     strcpy(res,info->shortname);
     strcpy(lres,info->orgname);
-    // Set to next Entry
-    dir->nextEntry = entryNr+1;
     return true;
 }
 
@@ -967,10 +970,9 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, 
         // Clear the internal list then.
         dirFindFirstID = 0;
         this->nextFreeFindFirst = 1; //the next free one after this search
-        for(Bitu n=0; n<MAX_OPENDIRS;n++) {
+        for(uint16_t n=0; n<MAX_OPENDIRS;n++) {
             // Clear and reuse slot
-            DeleteFileInfo(dirFindFirst[n]);
-            dirFindFirst[n]=nullptr;
+            if (dirFindFirst[n]) FreeSearch(n);
         }
 
     }
@@ -1007,11 +1009,29 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, uint32_t& generation, 
         }
     }
 
-    // Copy entries to use with FindNext
-    for (Bitu i=0; i<dirSearch[dirID]->fileList.size(); i++) {
-        CopyEntry(dirFindFirst[dirFindFirstID],dirSearch[dirID]->fileList[i]);
+    // The searches of a whole directory read one sorted copy of it between them for as long as
+    // its entries do not change. A search keeps the copy it started on, and its own place in it.
+    const CFileInfo* dir = dirSearch[dirID];
+    Listing* listing = nullptr;
+    for (Listing* made : listings) {
+        if (made->stamp == dir->stamp && !strcmp(made->entries.orgname,path)) {
+            listing = made;
+            break;
+        }
     }
-    SortSearch(dirFindFirst[dirFindFirstID]);
+    if (!listing) {
+        listing = new Listing;
+        strcpy(listing->entries.orgname,path);
+        listing->stamp = dir->stamp;
+        for (Bitu i=0; i<dir->fileList.size(); i++) {
+            CopyEntry(&listing->entries,dir->fileList[i]);
+        }
+        SortSearch(&listing->entries);
+        listings.push_back(listing);
+        nextStamp++;
+    }
+    listing->users++;
+    dirFindFirstListing[dirFindFirstID] = listing;
 
 //  LOG(LOG_DOSMISC,LOG_ERROR)("DIRCACHE: FindFirst : %s (ID:%02X)",path,dirFindFirstID);
     id = dirFindFirstID;
@@ -1068,6 +1088,12 @@ bool DOS_Drive_Cache::HoldsSearch(uint16_t id, uint32_t generation) {
 
 void DOS_Drive_Cache::FreeSearch(uint16_t id) {
     DeleteFileInfo(dirFindFirst[id]); dirFindFirst[id] = nullptr;
+    Listing* listing = dirFindFirstListing[id];
+    dirFindFirstListing[id] = nullptr;
+    if (listing && --listing->users == 0) {
+        listings.erase(std::find(listings.begin(),listings.end(),listing));
+        delete listing;
+    }
 }
 
 bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern) {
@@ -1076,10 +1102,12 @@ bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, 
     // name. Any other pattern goes on through the directory.
     CFileInfo* search = dirFindFirst[id];
     if (search->orgname[0] && strcmp(search->orgname+strlen(search->orgname)+1,pattern)) WidenSearch(search);
-    if (!SetResult(dirFindFirst[id], result, lresult, dirFindFirst[id]->nextEntry)) {
+    const Listing* listing = dirFindFirstListing[id];
+    if (!SetResult(listing ? &listing->entries : search, result, lresult, search->nextEntry)) {
         FreeSearch(id);
         return false;
     }
+    search->nextEntry++;
     return true;
 }
 

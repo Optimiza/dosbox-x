@@ -252,6 +252,7 @@ public:
 		bool        isOverlayDir;
 		bool		isDir;
 		uint16_t		id = MAX_OPENDIRS;
+		uint32_t	stamp = 0;	// of a directory: another one whenever its entries change
 		Bitu		nextEntry;
 		Bitu		shortNr;
 		// contents
@@ -268,7 +269,7 @@ private:
 	void		CreateShortName		(CFileInfo* curDir, CFileInfo* info);
 	Bitu		CreateShortNameID	(CFileInfo* curDir, const char* name);
 	int		CompareShortname	(const char* compareName, const char* shortName);
-    bool        SetResult       (CFileInfo* dir, char * &result, char * &lresult, Bitu entryNr);
+    bool        SetResult       (const CFileInfo* dir, char * &result, char * &lresult, Bitu entryNr);
 	bool		IsCachedIn		(CFileInfo* curDir);
 	CFileInfo*	FindDirInfo		(const char* path, char* expandedPath);
 	bool		RemoveSpaces		(char* str);
@@ -295,7 +296,20 @@ private:
 	uint16_t		srchNr = 0;
 	CFileInfo*	dirSearch			[MAX_OPENDIRS] = {};
 	char		dirSearchName		[MAX_OPENDIRS] = {};
+	// The sorted copy of a directory that the searches of all of it share, when they started
+	// while the directory held the same entries.
+	struct Listing {
+		CFileInfo	entries;	// orgname is the directory's path
+		uint32_t	stamp = 0;	// the directory's when the copy was made
+		Bitu		users = 0;
+	};
+	std::vector<Listing*>	listings;
+	// A changed directory takes this stamp, which no listing made so far carries: it moves on
+	// with each listing made.
+	uint32_t	nextStamp = 1;
+
 	CFileInfo*	dirFindFirst		[MAX_OPENDIRS] = {};
+	Listing*	dirFindFirstListing	[MAX_OPENDIRS] = {};
 	uint32_t	dirFindFirstGeneration	[MAX_OPENDIRS] = {};
 	uint16_t		nextFreeFindFirst = 0;
 	static uint32_t	searchGeneration;
