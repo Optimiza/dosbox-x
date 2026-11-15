@@ -76,6 +76,7 @@ public:
 	bool TestDir(const char * dir) override;
 	bool FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst=false) override;
 	bool FindNext(DOS_DTA & dta) override;
+	void FindClose(DOS_DTA & dta) override;
 	bool SetFileAttr(const char * name,uint16_t attr) override;
 	bool GetFileAttr(const char * name,uint16_t * attr) override;
 	bool GetFileAttrEx(char* name, struct stat *status) override;

@@ -413,6 +413,16 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 	return true;	
 }
 
+/* A path lookup has read the one entry it searched for: its search is over. A device answers
+ * without the drive being searched, and the DTA then still names the search it named before. */
+static void DOS_EndPathLookup(uint8_t drive,DOS_DTA & dta,uint8_t attr) {
+	if (attr==DOS_ATTR_DEVICE) return;
+	int fbak=lfn_filefind_handle;
+	lfn_filefind_handle=LFN_FILEFIND_INTERNAL;
+	Drives[drive]->FindClose(dta);
+	lfn_filefind_handle=fbak;
+}
+
 bool checkwat=false;
 bool DOS_GetSFNPath(char const * const path,char * SFNPath,bool LFN) {
     char pdir[LFN_NAMELENGTH+4], *p;
@@ -449,6 +459,7 @@ bool DOS_GetSFNPath(char const * const path,char * SFNPath,bool LFN) {
 			if (DOS_FindFirst(pdir,0xffff & DOS_ATTR_DIRECTORY & ~DOS_ATTR_VOLUME,false)) {
 				lfn_filefind_handle=fbak;
 				dta.GetResult(name,lname,size,hsize,date,time,attr);
+				DOS_EndPathLookup(drive,dta,attr);
 				strcat(SFNPath,name);
 				strcat(LFNPath,lname);
 				strcat(SFNPath,"\\");
@@ -474,6 +485,7 @@ bool DOS_GetSFNPath(char const * const path,char * SFNPath,bool LFN) {
 		lfn_filefind_handle=LFN_FILEFIND_INTERNAL;
 		if (!strrchr(p,'*')&&!strrchr(p,'?')&&DOS_FindFirst(pdir,0xffff & ~DOS_ATTR_VOLUME,false)) {
 			dta.GetResult(name,lname,size,hsize,date,time,attr);
+			DOS_EndPathLookup(drive,dta,attr);
 			strcat(SFNPath,name);
 			strcat(LFNPath,lname);
         } else if (checkwat) {

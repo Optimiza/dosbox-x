@@ -5505,6 +5505,15 @@ void DOS_Int21_7147(char *name1, const char *name2) {
 #endif
 
 #if !defined(OSFREE)
+/* Ends the search a long name handle names, on the drive it was started on */
+static void DOS_LFN_FindClose(uint8_t handle) {
+	lfn_filefind_handle=handle;
+	DOS_DTA dta(dos.dta());
+	uint8_t drive=dta.GetSearchDrive();
+	if (drive<DOS_DRIVES && Drives[drive]) Drives[drive]->FindClose(dta);
+	lfn_filefind_handle=LFN_FILEFIND_NONE;
+}
+
 void DOS_Int21_714e(char *name1, char *name2) {
 	DOS_LFN_StrCopy(SegPhys(ds)+reg_dx,name1+1,DOSNAMEBUF);
 	*name1='\"';
@@ -5532,6 +5541,8 @@ void DOS_Int21_714e(char *name1, char *name2) {
 	}
 	if (strlen(name2)>2&&name2[strlen(name2)-2]=='\\'&&name2[strlen(name2)-1]=='*')
 		strcat(name2, ".*");
+	/* A handle number that is free was closed by 3Eh or with its process: the search it still names is over */
+	DOS_LFN_FindClose(handle);
 	lfn_filefind_handle=handle;
 	bool b=DOS_FindFirst(name2,reg_cx,false);
 	lfn_filefind_handle=LFN_FILEFIND_NONE;
@@ -5548,6 +5559,7 @@ void DOS_Int21_714e(char *name1, char *name2) {
 		DOS_PSP psp(dos.psp());
 		entry = psp.FindFreeFileEntry();
 		if (entry==0xff) {
+			DOS_LFN_FindClose(handle);
 			reg_ax=DOSERR_TOO_MANY_OPEN_FILES;
 			CALLBACK_SCF(true);
 			return;
@@ -5762,6 +5774,7 @@ void DOS_Int21_71a1(const char *name1, const char *name2) {
 		CALLBACK_SCF(true);
 		return;
 	}
+	DOS_LFN_FindClose(handle);
 	DOS_PSP psp(dos.psp());
 	uint16_t entry=psp.FindEntryByHandle(handle);
 	if (entry>0&&entry!=0xff) psp.SetFileHandle(entry,0xff);

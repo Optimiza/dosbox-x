@@ -1897,6 +1897,17 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 	return FindNext(dta);
 }
 
+void localDrive::FindClose(DOS_DTA & dta) {
+	if (lfn_filefind_handle>=LFN_FILEFIND_MAX) {
+		dirCache.FindClose(dta.GetDirID(),dta.GetDirIDCluster());
+	} else {
+		dirCache.FindClose(ldid[lfn_filefind_handle],lgen[lfn_filefind_handle]);
+		ldid[lfn_filefind_handle]=0;
+		lgen[lfn_filefind_handle]=0;
+		ldir[lfn_filefind_handle]="";
+	}
+}
+
 char * DBCS_upcase(char * str);
 
 bool localDrive::FindNext(DOS_DTA & dta) {

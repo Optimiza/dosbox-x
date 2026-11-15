@@ -223,6 +223,7 @@ public:
 
 	bool		FindFirst			(char* path, uint16_t& id, uint32_t& generation, const char* pattern);
     bool        FindNext            (uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern);
+	void		FindClose			(uint16_t id, uint32_t generation);
 
 	void		CacheOut			(const char* path, bool ignoreLastDir = false);
 	void		AddEntry			(const char* path, bool checkExists = false);
@@ -276,6 +277,8 @@ private:
 	void		CopyEntry		(CFileInfo* dir, CFileInfo* from);
 	void		SortSearch		(CFileInfo* search);
 	void		WidenSearch		(CFileInfo* search);
+	bool		HoldsSearch		(uint16_t id, uint32_t generation);
+	void		FreeSearch		(uint16_t id);
 	uint16_t		GetFreeID		(CFileInfo* dir);
 	void		Clear			(void);
 
@@ -313,6 +316,8 @@ public:
 	virtual bool TestDir(const char * _dir)=0;
 	virtual bool FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst=false)=0;
 	virtual bool FindNext(DOS_DTA & dta)=0;
+	/* Ends the search the DTA, or the long name handle in use, names: nothing will continue it */
+	virtual void FindClose(DOS_DTA & dta) { (void)dta; };
 	virtual bool SetFileAttr(const char * name,uint16_t attr)=0;
 	virtual bool GetFileAttr(const char * name,uint16_t * attr)=0;
 	virtual bool GetFileAttrEx(char* name, struct stat *status)=0;

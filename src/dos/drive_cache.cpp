@@ -1060,19 +1060,31 @@ void DOS_Drive_Cache::WidenSearch(CFileInfo* search) {
     if (held) search->nextEntry = (Bitu)(std::find(search->fileList.begin(),search->fileList.end(),held)-search->fileList.begin())+1;
 }
 
+// Whether the slot still holds the search of that generation: not one that ended, and not a
+// later one that took the slot.
+bool DOS_Drive_Cache::HoldsSearch(uint16_t id, uint32_t generation) {
+    return id<MAX_OPENDIRS && dirFindFirst[id] && dirFindFirstGeneration[id]==generation;
+}
+
+void DOS_Drive_Cache::FreeSearch(uint16_t id) {
+    DeleteFileInfo(dirFindFirst[id]); dirFindFirst[id] = nullptr;
+}
+
 bool DOS_Drive_Cache::FindNext(uint16_t id, uint32_t generation, char* &result, char* &lresult, const char* pattern) {
-    // A search that ended, or a slot that another search holds since: no more files
-    if ((id>=MAX_OPENDIRS) || !dirFindFirst[id] || dirFindFirstGeneration[id]!=generation) return false;
+    if (!HoldsSearch(id,generation)) return false;
     // The search of an exact name holds one entry (see FindFirst) and has nothing more for that
     // name. Any other pattern goes on through the directory.
     CFileInfo* search = dirFindFirst[id];
     if (search->orgname[0] && strcmp(search->orgname+strlen(search->orgname)+1,pattern)) WidenSearch(search);
     if (!SetResult(dirFindFirst[id], result, lresult, dirFindFirst[id]->nextEntry)) {
-        // free slot
-        DeleteFileInfo(dirFindFirst[id]); dirFindFirst[id] = nullptr;
+        FreeSearch(id);
         return false;
     }
     return true;
+}
+
+void DOS_Drive_Cache::FindClose(uint16_t id, uint32_t generation) {
+    if (HoldsSearch(id,generation)) FreeSearch(id);
 }
 
 void DOS_Drive_Cache::ClearFileInfo(CFileInfo *dir) {
