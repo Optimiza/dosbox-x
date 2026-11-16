@@ -785,12 +785,10 @@ static bool DOS_FindFirstIntoDTA(const char * search,uint16_t attr,bool fcb_find
 
 /* MS-DOS searches in a buffer of its own and copies it to the DTA once it has found an entry.
  * The search above writes the DTA as it goes, so one that found nothing puts back what the
- * DTA held: the search a program had in progress there goes on. The temporary DTA is this
- * DOS's own buffer and not a program's: it is left as the search left it, and the shell's
- * DIR reads from it the drive of a search that found nothing. The search
+ * DTA held: the search a program had in progress there goes on. The search
  * of a long name handle writes nothing in the DTA. */
 bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
-	if (lfn_filefind_handle<LFN_FILEFIND_MAX || dos.dta()==dos.tables.tempdta) return DOS_FindFirstIntoDTA(search,attr,fcb_findfirst);
+	if (lfn_filefind_handle<LFN_FILEFIND_MAX) return DOS_FindFirstIntoDTA(search,attr,fcb_findfirst);
 	DOS_DTA dta(dos.dta());
 	uint8_t before[DOS_DTA::BLOCK_SIZE];
 	dta.GetBlock(before,sizeof(before));
