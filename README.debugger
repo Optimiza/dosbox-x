@@ -251,7 +251,8 @@ BREAK has stopped emulation in the debugger; concurrent MCP tool calls are
 still serialized by the MCP server before they reach DOSBox-X.
 
 Unknown commands return ERR and include the normal debugger
-"command not recognized" text. Commands behind build options, such as
+"command not recognized" text. A recognised command that answers ERR gives
+its own reason, without that line. Commands behind build options, such as
 C_HEAVY_DEBUG-only commands, may be unavailable in some builds. MCP clients
 should call HELP for the live command list from the running DOSBox-X build,
 or use their own static command catalog as a hint before falling back to raw
@@ -285,10 +286,8 @@ box is logged instead, a version, program, memory or machine mismatch that the
 menu would ask about is refused (unless `forceloadstate` is set), and no save
 remark is asked for. A failure is reported as one (`DEBUG: SAVESTATE failed:
 ...`), and the log says why. A refusal or a failure answers ERR on the control
-channel, and, as for any command that returns an error, the response ends with
-the `*** Debugger command not recognized` line. A load that fails part-way, on
-a state missing a part, can leave the machine partly restored, as the menu's
-would.
+channel with that reason. A load that fails part-way, on a state missing a
+part, can leave the machine partly restored, as the menu's would.
 
 Both require the debugger to be stopped, so break in first, and neither runs
 from a timer tick: while the guest runs, the control channel is served from a
