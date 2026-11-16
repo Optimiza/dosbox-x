@@ -2684,7 +2684,10 @@ bool ParseCommand(char* str) {
 		}
 		name[15] = 0;
 
-		if(!name[0]) return false;
+		if(!name[0]) {
+			DEBUG_ShowMsg("DEBUG: IV usage: IV seg:off name\n");
+			return false;
+		}
 		DEBUG_ShowMsg("DEBUG: Created debug var %s at %04X:%04X\n",name,seg,ofs);
 		CDebugVar::InsertVariable(name,(PhysPt)GetAddress(seg,ofs));
 		return true;
@@ -2697,7 +2700,10 @@ bool ParseCommand(char* str) {
 			else { name[i] = 0; break; }
 		}
 		name[12] = 0;
-		if(!name[0]) return false;
+		if(!name[0]) {
+			DEBUG_ShowMsg("DEBUG: SV usage: SV filename\n");
+			return false;
+		}
 		DEBUG_ShowMsg("DEBUG: Variable list save (%s) : %s.\n",name,(CDebugVar::SaveVars(name)?"ok":"failure"));
 		return true;
 	}
@@ -2709,7 +2715,10 @@ bool ParseCommand(char* str) {
 			else { name[i] = 0; break; }
 		}
 		name[12] = 0;
-		if(!name[0]) return false;
+		if(!name[0]) {
+			DEBUG_ShowMsg("DEBUG: LV usage: LV filename\n");
+			return false;
+		}
 		DEBUG_ShowMsg("DEBUG: Variable list load (%s) : %s.\n",name,(CDebugVar::LoadVars(name)?"ok":"failure"));
 		return true;
 	}
@@ -3216,8 +3225,10 @@ bool ParseCommand(char* str) {
             MEM_A20_Enable(false);
         else if (command == "")
             DEBUG_ShowMsg("A20 gate is %s",MEM_A20_Enabled() ? "ON" : "OFF");
-        else
+        else {
+            DEBUG_ShowMsg("DEBUG: A20 usage: A20 [ON|OFF]\n");
             return false;
+        }
 
         return true;
     }
@@ -3267,6 +3278,7 @@ bool ParseCommand(char* str) {
             DEBUG_LogPIC();
         }
         else {
+            DEBUG_ShowMsg("DEBUG: PIC usage: PIC [MASKIRQ|UNMASKIRQ|ACKIRQ|LOWERIRQ|RAISEIRQ irq]\n");
             DEBUG_EndPagedContent();
             return false;
         }
@@ -3400,7 +3412,14 @@ bool ParseCommand(char* str) {
 		else if (command == "EMS") LogEMS();
 #endif
 		else if (command == "FNKEY") LogFNKEY();
-		else return false;
+		else {
+#if !defined(OSFREE)
+			DEBUG_ShowMsg("DEBUG: DOS usage: DOS MCBS|DEVS|KERN|XMS|EMS|FNKEY\n");
+#else
+			DEBUG_ShowMsg("DEBUG: DOS usage: DOS MCBS|DEVS|KERN|XMS|FNKEY\n");
+#endif
+			return false;
+		}
 
 		return true;
 	}
@@ -3409,7 +3428,10 @@ bool ParseCommand(char* str) {
         stream >> command;
 
         if (command == "MEM") LogBIOSMem();
-        else return false;
+        else {
+            DEBUG_ShowMsg("DEBUG: BIOS usage: BIOS MEM\n");
+            return false;
+        }
 
         return true;
     }
@@ -3450,7 +3472,10 @@ bool ParseCommand(char* str) {
             return true;
         }
         else if (subcommand == "SET") { /* remember this function capitalizes the entire string */
-            if (which < 0 || which > 7) return false; // regindex is REQUIRED here
+            if (which < 0 || which > 7) { // regindex is REQUIRED here
+                DEBUG_ShowMsg("DEBUG: MMX SET needs a register, 0 to 7: MMX [=t] reg SET val[,val...]\n");
+                return false;
+            }
             // MMX [=B|=W|=D|=Q|=S] <regindex> SET [val,val,...]
             //
             // if you don't want to change a particular part of the MMX register, set val to nothing or ""
@@ -3499,7 +3524,10 @@ bool ParseCommand(char* str) {
                     // FIXME: GetHexValue has a 32-bit datatype limit and therefore is unsuitable for 64-bit constants
                     bool parsed = false;
                     uint32_t r = GetHexValue(found,found,&parsed);
-                    if (!parsed) return false;
+                    if (!parsed) {
+                        DEBUG_ShowMsg("DEBUG: MMX SET cannot read a value: MMX [=t] reg SET val[,val...]\n");
+                        return false;
+                    }
                     param[pi] = (uint64_t)r;
                     paramexist[pi] = true;
                     paramfset[pi] = false;
@@ -3570,6 +3598,9 @@ bool ParseCommand(char* str) {
             DEBUG_PrintMMX(which,format);
             return true;
         }
+
+        DEBUG_ShowMsg("DEBUG: MMX usage: MMX [=t] [reg] [SET val[,val...]]\n");
+        return false;
     }
 
     // NTS: S = single precision float   F = double precision float   X = 128-bit unsigned integer constant
@@ -3609,7 +3640,10 @@ bool ParseCommand(char* str) {
             return true;
         }
         else if (subcommand == "SET") { /* remember this function capitalizes the entire string */
-            if (which < 0 || which > 7) return false; // regindex is REQUIRED here
+            if (which < 0 || which > 7) { // regindex is REQUIRED here
+                DEBUG_ShowMsg("DEBUG: SSE SET needs a register, 0 to 7: SSE [=t] reg SET val[,val...]\n");
+                return false;
+            }
             // MMX [=B|=W|=D|=Q] <regindex> SET [val,val,...]
             //
             // if you don't want to change a particular part of the MMX register, set val to nothing or ""
@@ -3673,7 +3707,10 @@ bool ParseCommand(char* str) {
                     // FIXME: GetHexValue has a 32-bit datatype limit and therefore is unsuitable for 64-bit constants
                     bool parsed = false;
                     uint32_t r = GetHexValue(found,found,&parsed);
-                    if (!parsed) return false;
+                    if (!parsed) {
+                        DEBUG_ShowMsg("DEBUG: SSE SET cannot read a value: SSE [=t] reg SET val[,val...]\n");
+                        return false;
+                    }
                     param[pi].u32[0] = (uint64_t)r;
                     param[pi].u32[1] = 0;
                     param[pi].u32[2] = 0;
@@ -3753,6 +3790,9 @@ bool ParseCommand(char* str) {
             DEBUG_PrintSSE(which,format);
             return true;
         }
+
+        DEBUG_ShowMsg("DEBUG: SSE usage: SSE [=t] [reg] [SET val[,val...]]\n");
+        return false;
     }
 
     if (command == "GUS") {
@@ -3770,6 +3810,9 @@ bool ParseCommand(char* str) {
             DEBUG_EndPagedContent();
             return true;
         }
+
+        DEBUG_ShowMsg("DEBUG: GUS takes no argument\n");
+        return false;
     }
 
     if (command == "VRD") {
@@ -3788,6 +3831,9 @@ bool ParseCommand(char* str) {
             DEBUG_PrintRTC();
             return true;
         }
+
+        DEBUG_ShowMsg("DEBUG: RTC takes no argument\n");
+        return false;
     }
 
     if (command == "VGA") {
@@ -4043,6 +4089,7 @@ bool ParseCommand(char* str) {
 	    }
         }
         else {
+            DEBUG_ShowMsg("DEBUG: VGA usage: VGA DS|FONTDUMP|CRTC|GC|DAC|DACPAL|SEQ|AC|DRAW|MODE\n");
             return false;
         }
 
@@ -4344,6 +4391,7 @@ bool ParseCommand(char* str) {
                 pc98_egc_shift_debug_status().c_str());
         }
         else {
+            DEBUG_ShowMsg("DEBUG: PC98 usage: PC98 MODE|DACPAL|GRAPHICS|TEXT|CGIO|EGC\n");
             return false;
         }
 
@@ -4355,7 +4403,10 @@ bool ParseCommand(char* str) {
 
         if (command == "MEM") LogEMUMem();
         else if (command == "MACHINE") LogEMUMachine();
-        else return false;
+        else {
+            DEBUG_ShowMsg("DEBUG: EMU usage: EMU MEM|MACHINE\n");
+            return false;
+        }
 
         return true;
     }
@@ -4429,6 +4480,8 @@ bool ParseCommand(char* str) {
 			OutputVecTable(found);
 			return true;
 		}
+		DEBUG_ShowMsg("DEBUG: INTVEC usage: INTVEC filename\n");
+		return false;
 	}
 
 	if (command == "INTHAND") {
@@ -4452,6 +4505,8 @@ bool ParseCommand(char* str) {
 			codeViewData.cursorPos = 0;
 			return true;
 		}
+		DEBUG_ShowMsg("DEBUG: INTHAND usage: INTHAND intNum (hex)\n");
+		return false;
 	}
 
 	if(command == "EXTEND") { //Toggle additional data.
@@ -4623,6 +4678,8 @@ bool ParseCommand(char* str) {
 		return true;
 	}
 
+	/* Only here has no command matched: one that matched and failed has said why itself. */
+	DEBUG_ShowMsg("*** Debugger command not recognized");
 	return false;
 }
 
@@ -4636,11 +4693,7 @@ bool DEBUG_ExecuteCommand(const char* command)
 	std::vector<char> buffer(command, command + strlen(command));
 	buffer.push_back(0);
 
-	if (ParseCommand(buffer.data()))
-		return true;
-
-	DEBUG_ShowMsg("*** Debugger command not recognized");
-	return false;
+	return ParseCommand(buffer.data());
 }
 
 char* AnalyzeInstruction(char* inst, bool saveSelector) {
@@ -5399,7 +5452,6 @@ uint32_t DEBUG_CheckKeys(void) {
                         histBuffPos = histBuff.end();
                         ClearInputLine();
                     } else {
-                        DEBUG_ShowMsg("*** Debugger command not recognized");
                         codeViewData.inputPos = (int)strlen(codeViewData.inputStr);
                     }
                 }
