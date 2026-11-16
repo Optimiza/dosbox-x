@@ -225,7 +225,7 @@ public:
     bool        FindNext            (uint16_t id, char* &result, char* &lresult);
 
 	void		CacheOut			(const char* path, bool ignoreLastDir = false);
-	bool		AddEntry			(const char* path, bool checkExists = false);
+	bool		AddEntry			(const char* path, bool checkExists = false, bool isDir = false);
 	void        AddEntryDirOverlay	(const char* path, char *sfile, bool checkExist = false);
 	void		DeleteEntry			(const char* path, bool ignoreLastDir = false);
 	bool		HoldsFolderOf		(const char* path);
