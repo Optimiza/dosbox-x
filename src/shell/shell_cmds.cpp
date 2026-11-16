@@ -2150,10 +2150,10 @@ void DOS_Shell::CMD_DIR(char * args) {
 		FormatNumber(byte_count,numformat);
 		WriteOut(MSG_Get("SHELL_CMD_DIR_BYTES_USED"),file_count,numformat);
 		if (!dirPaused(this, w_size, optP, optW)) {dos.dta(save_dta);return;}
-		uint8_t drive=dta.GetSearchDrive();
+		uint8_t drive=path[0]-'A';
 		uint64_t free_space=1024u*1024u*100u;
 
-        if(Drives[drive]) {
+        if(drive<DOS_DRIVES && Drives[drive]) {
             uint32_t bytes_sector32; uint32_t sectors_cluster32; uint32_t total_clusters32; uint32_t free_clusters32;
             uint64_t total_clusters64; uint64_t free_clusters64;
             // Since this is the *internal* shell, we want use maximum available query capability at first
