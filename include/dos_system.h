@@ -252,7 +252,7 @@ public:
 		bool        isOverlayDir;
 		bool		isDir;
 		uint16_t		id = MAX_OPENDIRS;
-		uint32_t	stamp = 0;	// of a directory: another one whenever its entries change
+		uint32_t	stamp = 0;	// of a directory: nextStamp as it stood when its entries were last cleared or one was created in it
 		Bitu		nextEntry;
 		Bitu		shortNr;
 		// contents
