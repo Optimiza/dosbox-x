@@ -191,6 +191,7 @@ Bitu DOS_FILES = 127;
 DOS_File ** Files = NULL;
 DOS_Drive * Drives[DOS_DRIVES] = {NULL};
 bool force_sfn = false;
+char * DBCS_upcase(char * str);
 int sdrive = 0;
 
 /* This is the LFN filefind handle that is currently being used, with normal values between
@@ -414,6 +415,8 @@ void DOS_SetDefaultDrive(uint8_t drive) {
 }
 
 static bool DOS_PathPackName(char * name,bool quoted);
+static bool DOS_FCBNameSpaced(const char * fcb);
+static void DOS_PathSpacesLFN(char * name,const bool * soft);
 
 bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive) {
     if(!name || *name == 0 || *name == ' ' || *name == '\n' || *name == ':') {
@@ -425,9 +428,10 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 	char names[LFN_NAMELENGTH];
 	strcpy(names,name);
 	char * name_int = names;
-	/* An FCB's name, D:NAME    .EXT, cut at its first space. With long file names off the name is
-	 * read as any other below, so a space inside it stays (FCB A B     TXT is A B.TXT in DOS) */
-	if (uselfn && strlen(names)==14 && name_int[1]==':' && name_int[2]!='\\' && name_int[9]==' ' && name_int[10]=='.') {
+	/* An FCB's name, D:NAME    .EXT, cut at its first space. With long file names off, or a space
+	 * inside the name or the extension, the name is read as any other below, so that space stays
+	 * (FCB A B     TXT is A B.TXT in DOS) */
+	if (uselfn && strlen(names)==14 && name_int[1]==':' && name_int[2]!='\\' && name_int[9]==' ' && name_int[10]=='.' && !DOS_FCBNameSpaced(name_int)) {
 		for (unsigned int i=0;i<strlen(names);i++)
 			if (i<10 && name_int[i]==32) {
 				name_int[i]='.';
@@ -460,6 +464,9 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 
     char tempdir[DOS_PATHLENGTH] = {};
     char upname[DOS_PATHLENGTH] = {};
+    /* With long file names on, the spaces DOS_PathSpacesLFN keeps or drops: outside quotes, and any
+     * space of a call that reads short names */
+    bool soft[DOS_PATHLENGTH] = {}, tsoft[DOS_PATHLENGTH] = {};
     Bitu r,w, q=0;
 	/* First get the drive */
 	*drive = DOS_GetDefaultDrive();
@@ -482,12 +489,16 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 		if (c=='/') c='\\';
 		else if (c=='"') {q++;continue;}
 		else if (uselfn&&!force_sfn) {
-			if (c==' ' && q/2*2 == q) continue;
+			if (c==' ' && q/2*2 == q) {
+				if (!w) continue;
+				soft[w]=true;
+			}
 		} else {
 			if ((c>='a') && (c<='z')) c-=32;
 			/* With long file names off a space is part of a name, as in DOS, where 3Ch of
 			 * F OO.TXT makes that name; each name's padding is dropped below */
-			else if (c==' ' && (uselfn || !w)) continue;
+			else if (c==' ' && !w) continue;
+			else if (c==' ' && uselfn) soft[w]=true;
 		}
 		upname[w++]=(char)c;
         if(((IS_PC98_ARCH && shiftjis_lead_byte(c)) || (isDBCSCP() && isKanji1(c))) && r < DOS_PATHLENGTH && name_int[r] != 0) {
@@ -524,6 +535,7 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 				DOS_SetError(stop ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND);
 				return false;
 			}
+			if (uselfn) DOS_PathSpacesLFN(tempdir,tsoft);
 			if (tempdir[0]==0) { w=0;r++;continue;}
 			if (strcmp(tempdir,".")==0) {
 				tempdir[0]=0;			
@@ -604,6 +616,7 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 			w=0;r++;
 			continue;
 		}
+		tsoft[w]=soft[r];
 		tempdir[w++]=upname[r++];
 	}
 	return true;	
@@ -1020,6 +1033,45 @@ static bool DOS_PathPackName(char * name,bool quoted) {
 	}
 	*w=0;
 	return true;
+}
+
+/* Whether an FCB's D:NAME    .EXT holds a space inside its name or anywhere before the end of its
+ * extension: a name DOS holds with that space (A B     TXT, FOO     . TX). */
+static bool DOS_FCBNameSpaced(const char * fcb) {
+	size_t name_len=8, ext_len=3;
+	while (name_len && fcb[2+name_len-1]==' ') name_len--;
+	while (ext_len && fcb[11+ext_len-1]==' ') ext_len--;
+	return (fcb[2]!=' ' && memchr(fcb+2,' ',name_len)) || memchr(fcb+11,' ',ext_len);
+}
+
+/* One name of a path, long file names on, whose soft spaces (outside quotes, or in a call that reads
+ * short names) DOS_MakeName has kept: they stay where the name, packed as DOS packs it, is one DOS
+ * holds with a space inside, so that a name listed with long names off reaches the same file after
+ * they are turned on (F OO.TXT is not FOO.TXT); elsewhere they are dropped, as the emulator always
+ * has (MY FILE.TXT is MYFILE.TXT). */
+static void DOS_PathSpacesLFN(char * name,const bool * soft) {
+	const size_t len=strlen(name);
+	size_t i=0;
+	while (i<len && !soft[i]) i++;
+	if (i==len) return;
+	char packed[DOS_PATHLENGTH], upper[DOS_PATHLENGTH];
+	strcpy(packed,name);
+	if (DOS_PathPackName(packed,true)) {
+		strcpy(upper,packed);
+		if (IS_PC98_ARCH || isDBCSCP()) DBCS_upcase(upper);
+		else upcase(upper);
+		/* F OO. is F OO, as the cache reads it */
+		const size_t n=strlen(upper);
+		if (n>1 && upper[n-1]=='.' && upper[n-2]!='.') upper[n-1]=0;
+		if (DOS_ShortNameWithSpace(upper)) {
+			strcpy(name,packed);
+			return;
+		}
+	}
+	char * w=name;
+	for (i=0;i<len;i++)
+		if (!soft[i]) *w++=name[i];
+	*w=0;
 }
 
 /* What a path names, its dots and slashes resolved as DOS_MakeName resolves them; -1 where it does
@@ -2795,18 +2847,12 @@ bool DOS_FCBGetFileSize(uint16_t seg,uint16_t offset) {
 }
 
 /* An FCB's eight and three name bytes as a name: each field's padding dropped, the dot only before
- * an extension. With long file names off a space inside a field is part of the name, as in DOS
- * (FOO     T X is FOO.T X); with them on DOS_MakeName drops it, and the name stops at it. */
+ * an extension. A space inside a field is part of the name, as in DOS (FOO     T X is FOO.T X),
+ * which DOS_MakeName keeps with long file names on too. */
 static void DOS_FCBNameJoin(const char * name8,const char * ext3,char * out) {
-	size_t name_len=0, ext_len=0;
-	if (uselfn) {
-		while (name_len<8 && name8[name_len]!=' ') name_len++;
-		if (ext3[0]!=' ') while (ext_len<3 && ext3[ext_len]!=' ') ext_len++;
-	} else {
-		name_len=8; ext_len=3;
-		while (name_len && name8[name_len-1]==' ') name_len--;
-		while (ext_len && ext3[ext_len-1]==' ') ext_len--;
-	}
+	size_t name_len=8, ext_len=3;
+	while (name_len && name8[name_len-1]==' ') name_len--;
+	while (ext_len && ext3[ext_len-1]==' ') ext_len--;
 	memcpy(out,name8,name_len);
 	out+=name_len;
 	if (ext_len) {

@@ -153,6 +153,69 @@ DOS_Drive_Cache::ReadIndex* DOS_Drive_Cache::ReadIndexOf(CFileInfo* dir) {
     return (readIndex && readIndex->dir==dir) ? readIndex : nullptr;
 }
 
+bool DOS_ShortNameWithSpace(const char* name) {
+    if (!strchr(name,' ') || name[0]==' ' || name[0]=='.') return false;
+    const char* dot = strchr(name,'.');
+    const size_t len = dot ? (size_t)(dot-name) : strlen(name);
+    if (name[len-1]==' ') return false;
+    if (dot && (dot[1]==0 || dot[strlen(dot)-1]==' ')) return false;
+    char probe[CROSS_LEN];
+    safe_strncpy(probe,name,CROSS_LEN);
+    for (char* p=probe; *p; p++) if (*p==' ') *p='_';
+    return !filename_not_8x3(probe);
+}
+
+static void UpperName(const char* name, char* upper) {
+    safe_strncpy(upper,name,CROSS_LEN);
+    if (IS_PC98_ARCH || isDBCSCP()) DBCS_upcase(upper);
+    else upcase(upper);
+}
+
+/* The names with a space ReadDir has given in the directory it is reading. During the read that
+ * directory's list is not sorted, so FindSpaced cannot tell whether such a name is taken, and on
+ * a host that tells case apart two names can upper-case to one. A name with a space never equals
+ * a generated alias or a name without one, so these are the only names it can meet. */
+static DOS_Drive_Cache::CFileInfo* spaced_dir = NULL;
+static std::unordered_set<std::string> spaced_names;
+
+/* A directory's names with a space, each to the short name (the alias) of the entry that holds it.
+ * Made from fileList the first time it is asked and kept as entries are made; an entry that has
+ * left fileList is found missing when its name is next asked. */
+struct DOS_Drive_Cache::SpacedNames : std::unordered_map<std::string, std::string> {};
+
+DOS_Drive_Cache::CFileInfo::~CFileInfo(void) {
+    for (uint32_t i=0; i<fileList.size(); i++) delete fileList[i];
+    fileList.clear();
+    longNameList.clear();
+    delete spacedNames;
+}
+
+// Where in curDir->fileList the entry is that holds name (upper case) as its name with a space; -1
+// if none does. Outside a read only: fileList is in strcmp order of the short names.
+Bits DOS_Drive_Cache::FindSpaced(CFileInfo* curDir, const char* name) {
+    char upper[CROSS_LEN];
+    if (!curDir->spacedNames) {
+        curDir->spacedNames = new SpacedNames;
+        for (CFileInfo* info : curDir->fileList)
+            if (info->spaced) {
+                UpperName(info->orgname,upper);
+                (*curDir->spacedNames)[upper] = info->shortname;
+            }
+    }
+    const auto found = curDir->spacedNames->find(name);
+    if (found == curDir->spacedNames->end()) return -1;
+    const std::vector<CFileInfo*>& list = curDir->fileList;
+    auto it = std::lower_bound(list.begin(), list.end(), found->second.c_str(),
+        [](CFileInfo* const &a, const char* b) { return strcmp(a->shortname,b)<0; });
+    for (; it!=list.end() && !strcmp((*it)->shortname,found->second.c_str()); ++it) {
+        if (!(*it)->spaced) continue;
+        UpperName((*it)->orgname,upper);
+        if (!strcmp(upper,name)) return (Bits)(it-list.begin());
+    }
+    curDir->spacedNames->erase(found);
+    return -1;
+}
+
 DOS_Drive_Cache::DOS_Drive_Cache(void) {
     dirBase         = new CFileInfo;
     save_dir        = nullptr;
@@ -566,6 +629,8 @@ void DOS_Drive_Cache::CacheOut(const char* path, bool ignoreLastDir) {
     dir->fileList.clear();
     dir->longNameList.clear();
     dir->longNameListSorted = true;
+    delete dir->spacedNames;
+    dir->spacedNames = nullptr;
     save_dir = nullptr;
 }
 
@@ -593,7 +658,8 @@ bool DOS_Drive_Cache::GetShortName(const char* fullname, char* shortname) {
 #else
         if (strcmp(pos,curDir->longNameList[i]->orgname) == 0) {
 #endif
-            strcpy(shortname,curDir->longNameList[i]->shortname);
+            if (!uselfn && curDir->longNameList[i]->spaced) UpperName(pos,shortname);
+            else strcpy(shortname,curDir->longNameList[i]->shortname);
             return true;
         }
     }
@@ -746,6 +812,18 @@ Bits DOS_Drive_Cache::GetLongName(CFileInfo* curDir, char* shortName) {
 			return mid;
 		};
 	}
+	/* A name DOS holds with a space answers in both modes, as the entry's alias does: the emulator
+	 * keeps a path it read in one mode (the current directory, quickrun's and HostAppRun's names)
+	 * and uses it in the other */
+	if (strchr(shortName,' ') && curDir != spaced_dir) {
+		char upper[CROSS_LEN];
+		UpperName(shortName,upper);
+		const Bits nr = FindSpaced(curDir,upper);
+		if (nr>=0) {
+			strcpy(shortName,curDir->fileList[(size_t)nr]->orgname);
+			return nr;
+		}
+	}
 	if (uselfn && strlen(shortName)) {
 		for (Bitu i=0; i<filelist_size; i++) {
 			if (!strcasecmp(shortName,curDir->fileList[i]->orgname)) {
@@ -774,38 +852,11 @@ Bits DOS_Drive_Cache::GetLongName(CFileInfo* curDir, char* shortName) {
     return -1;
 }
 
-/* With long file names off, a name DOS holds with a space inside it, as 3Ch of F OO.TXT makes it:
- * one to eight bytes before one dot and up to three after it, the name neither starting nor
- * ending with a space and the extension not ending with one, and every other byte one an 8.3 name
- * holds. name is upper case. No trail byte of a double-byte character is a space or a dot. */
-static bool ShortNameWithSpace(const char* name) {
-    if (uselfn || !strchr(name,' ') || name[0]==' ' || name[0]=='.') return false;
-    const char* dot = strchr(name,'.');
-    const size_t len = dot ? (size_t)(dot-name) : strlen(name);
-    if (name[len-1]==' ') return false;
-    if (dot && (dot[1]==0 || dot[strlen(dot)-1]==' ')) return false;
-    char probe[CROSS_LEN];
-    safe_strncpy(probe,name,CROSS_LEN);
-    for (char* p=probe; *p; p++) if (*p==' ') *p='_';
-    return !filename_not_8x3(probe);
-}
-
-/* The names with a space ReadDir has given in the directory it is reading. During the read that
- * directory's list is not sorted, so GetLongName cannot tell whether such a name is taken, and on
- * a host that tells case apart two names can upper-case to one. A name with a space never equals
- * a generated alias or a name without one, so these are the only names it can meet. */
-static const DOS_Drive_Cache::CFileInfo* spaced_dir = NULL;
-static std::unordered_set<std::string> spaced_names;
-
-/* The short name a host's folder read gives an entry: none, so that CreateShortName makes it, for
- * a name DOS holds with its space where the host's file system gave it another (Windows) */
-static const char* HostShortName(const char* name, const char* sname) {
-    if (!sname[0] || uselfn || !strchr(name,' ')) return sname;
-    char upper[CROSS_LEN];
-    safe_strncpy(upper,name,CROSS_LEN);
-    if (IS_PC98_ARCH || isDBCSCP()) DBCS_upcase(upper);
-    else upcase(upper);
-    return ShortNameWithSpace(upper) ? "" : sname;
+/* Whether pattern, a name without wildcards, asks by its alias for the entry the last FindNext
+ * gave by its name with a space: it answers to both, so DOS_GetSFNPath reaches a path kept in
+ * short form from long names on (the current directory) once they are off */
+bool DOS_Drive_Cache::FoundByAlias(const char* pattern) const {
+    return foundAlias[0] && !strpbrk(pattern,"*?") && WildFileCmp(foundAlias,pattern);
 }
 
 bool DOS_Drive_Cache::RemoveSpaces(char* str) {
@@ -1107,6 +1158,19 @@ char* DOS_Drive_Cache::CreateEntry(CFileInfo* dir, const char* name, const char*
 
     // Check for long filenames...
     if (sname[0]==0) CreateShortName(dir, info);
+
+    /* A name DOS holds with a space inside is the entry's own too, unless another entry has it: the
+     * name 4Eh lists with long file names off. Its alias is made as for any long name and listed
+     * with them on, so neither name depends on the mode a folder was read in. */
+    char upper[CROSS_LEN];
+    if (strchr(name,' ') && (UpperName(name,upper), DOS_ShortNameWithSpace(upper))) {
+        if (dir == spaced_dir) info->spaced = spaced_names.insert(upper).second;
+        else if (FindSpaced(dir,upper) < 0) {
+            info->spaced = true;
+            (*dir->spacedNames)[upper] = info->shortname;
+        }
+    }
+
     else if (ReadIndex* const index = ReadIndexOf(dir)) index->Take(info->shortname);
 
     // keep list sorted (so GetLongName works correctly, used by CreateShortName in this routine)
@@ -1144,6 +1208,7 @@ void DOS_Drive_Cache::CopyEntry(CFileInfo* dir, CFileInfo* from) {
     strcpy(info->shortname, from->shortname);
     info->shortNr = from->shortNr;
     info->isDir = from->isDir;
+    info->spaced = from->spaced;
 
     dir->fileList.push_back(info);
 }
@@ -1169,10 +1234,12 @@ bool DOS_Drive_Cache::ReadDir(uint16_t id, char* &result, char * &lresult) {
             ReadIndex index(dirSearch[id], readIndex);
             spaced_dir = dirSearch[id];
             spaced_names.clear();
+            delete dirSearch[id]->spacedNames;
+            dirSearch[id]->spacedNames = nullptr;
             if (drive->read_directory_first(dirp, dir_name, dir_sname, is_directory)) {
-                CreateEntry(dirSearch[id], dir_name, HostShortName(dir_name, dir_sname), is_directory, /*skip search*/true);
+                CreateEntry(dirSearch[id], dir_name, dir_sname, is_directory, /*skip search*/true);
                 while (drive->read_directory_next(dirp, dir_name, dir_sname, is_directory)) {
-                    CreateEntry(dirSearch[id], dir_name, HostShortName(dir_name, dir_sname), is_directory, /*skip search*/true);
+                    CreateEntry(dirSearch[id], dir_name, dir_sname, is_directory, /*skip search*/true);
                 }
             }
             // Every name that is an entry's own is known: the aliases, in the host's order.
@@ -1220,8 +1287,12 @@ bool DOS_Drive_Cache::SetResult(CFileInfo* dir, char* &result, char* &lresult, B
 
     if (entryNr>=dir->fileList.size()) return false;
     CFileInfo* info = dir->fileList[entryNr];
-    // copy filename, short version
-    strcpy(res,info->shortname);
+    // copy filename, short version: with long file names off, a name DOS holds with a space
+    foundAlias[0] = 0;
+    if (!uselfn && info->spaced) {
+        UpperName(info->orgname,res);
+        strcpy(foundAlias,info->shortname);
+    } else strcpy(res,info->shortname);
     strcpy(lres,info->orgname);
     // Set to next Entry
     dir->nextEntry = entryNr+1;
@@ -1277,7 +1348,13 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id, const char* pattern) {
         Bitu matches = 0;
         for (Bitu i=0; i<dirSearch[dirID]->fileList.size() && matches<2; i++) {
             CFileInfo* entry = dirSearch[dirID]->fileList[i];
-            if (WildFileCmp(entry->shortname,pattern) || LWildFileCmp(entry->orgname,pattern)) {
+            /* Every name the entry answers to, as the drive's FindNext tests them: its alias, the
+             * name SetResult gives (with long file names off a name DOS holds with a space, upper
+             * cased), and its long name. */
+            char upper[CROSS_LEN];
+            const char* name = entry->shortname;
+            if (!uselfn && entry->spaced) { UpperName(entry->orgname,upper); name = upper; }
+            if (WildFileCmp(entry->shortname,pattern) || WildFileCmp(name,pattern) || LWildFileCmp(entry->orgname,pattern)) {
                 match = entry;
                 matches++;
             }

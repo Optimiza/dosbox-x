@@ -204,6 +204,11 @@ class DOS_Drive;
 #define MAX_OPENDIRS 2048
 //Can be high as it's only storage (16 bit variable)
 
+/* Whether name (upper case) is one DOS holds with a space inside it, as 3Ch of F OO.TXT makes it:
+ * one to eight bytes before one dot and up to three after it, the name neither starting nor ending
+ * with a space and the extension not ending with one, every other byte one an 8.3 name holds. */
+bool DOS_ShortNameWithSpace(const char* name);
+
 class DOS_Drive_Cache {
 public:
 	DOS_Drive_Cache					(void);
@@ -245,23 +250,24 @@ public:
 	void		MediaChange			(void);
 	void		SetLabel			(const char* vname,bool cdrom,bool allowupdate);
 	char*		GetLabel			(void) { return label; };
+	bool		FoundByAlias		(const char* pattern) const;
 
+	struct SpacedNames;
 	class CFileInfo {
 	public:
 		CFileInfo(void) {
 			orgname[0] = shortname[0] = 0;
-			isOverlayDir = isDir = false;
+			isOverlayDir = isDir = spaced = false;
 			nextEntry = shortNr = 0;
 		}
-		~CFileInfo(void) {
-			for (uint32_t i=0; i<fileList.size(); i++) delete fileList[i];
-			fileList.clear();
-			longNameList.clear();
-		};
+		~CFileInfo(void);
 		char		orgname		[CROSS_LEN];
 		char		shortname	[DOS_NAMELENGTH_ASCII];
 		bool        isOverlayDir;
 		bool		isDir;
+		// orgname upper-cased is a name DOS holds with a space, listed with long file names off;
+		// shortname is the alias, listed with them on. The entry answers to both in both modes.
+		bool		spaced;
 		uint16_t		id = MAX_OPENDIRS;
 		Bitu		nextEntry;
 		Bitu		shortNr;
@@ -272,6 +278,7 @@ public:
 		// placed, and can then sort before the alias ahead of it: such a list is searched one
 		// alias at a time.
 		bool		longNameListSorted = true;
+		SpacedNames*	spacedNames = NULL;	// made by FindSpaced
 	};
 
 private:
@@ -282,6 +289,7 @@ private:
 	bool		RemoveTrailingDot	(char* shortname);
 	Bits		GetLongName		(CFileInfo* curDir, char* shortName);
 	bool		ShortNameBase		(const char* orgname, char* buffer, char*& name, Bits& len);
+	Bits		FindSpaced		(CFileInfo* curDir, const char* name);
 	void		CreateShortName		(CFileInfo* curDir, CFileInfo* info);
 	bool		ShortNameTaken		(CFileInfo* curDir, const char* shortname);
 	void		CreateAlias		(CFileInfo* curDir, CFileInfo* info, const char* tmpName, Bits len);
@@ -328,6 +336,7 @@ private:
 
 	char		label				[CROSS_LEN] = {};
 	bool		updatelabel = false;
+	char		foundAlias			[DOS_NAMELENGTH_ASCII] = {};	// SetResult's entry's, when it was listed by its name with a space
 };
 
 class DOS_Drive {

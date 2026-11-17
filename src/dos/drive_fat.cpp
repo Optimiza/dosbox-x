@@ -899,9 +899,9 @@ bool fatDrive::getEntryName(const char *fullname, char *entname) {
 	}
 	int j=0;
 	bool lead = false;
-	/* With long file names off a space inside a name is part of it, as DOS makes F OO.TXT */
+	/* A space inside a name is part of it, as DOS makes F OO.TXT: DOS_MakeName keeps only those */
 	for (int i=0; i<(int)strlen(findFile); i++) {
-		if ((findFile[i]!=' '||!uselfn)&&findFile[i]!='"'&&findFile[i]!='+'&&findFile[i]!='='&&findFile[i]!=','&&findFile[i]!=';'&&findFile[i]!=':'&&findFile[i]!='<'&&findFile[i]!='>'&&!((findFile[i]=='['||findFile[i]==']'||findFile[i]=='|'||findFile[i]=='\\')&&(!lead||((dos.loaded_codepage==936||IS_PDOSV)&&!gbk)))&&findFile[i]!='?'&&findFile[i]!='*') findFile[j++]=findFile[i];
+		if (findFile[i]!='"'&&findFile[i]!='+'&&findFile[i]!='='&&findFile[i]!=','&&findFile[i]!=';'&&findFile[i]!=':'&&findFile[i]!='<'&&findFile[i]!='>'&&!((findFile[i]=='['||findFile[i]==']'||findFile[i]=='|'||findFile[i]=='\\')&&(!lead||((dos.loaded_codepage==936||IS_PDOSV)&&!gbk)))&&findFile[i]!='?'&&findFile[i]!='*') findFile[j++]=findFile[i];
 		if (lead) lead = false;
 		else if ((IS_PC98_ARCH && shiftjis_lead_byte(findFile[i]&0xFF)) || (isDBCSCP() && isKanji1_gbk(findFile[i]&0xFF))) lead = true;
 	}
@@ -3161,12 +3161,10 @@ nextfile:
 	if (find_name[0] == 0x05) find_name[0] = (char)0xe5;
 	memcpy(extension,&sectbuf[entryoffset].entryname[8],3);
 
-	/* With long file names off an extension may start with a space (FOO. TX), which is part of
-	 * it; with them on DOS_MakeName drops it from the name a program asks for */
+	/* An extension may start with a space (FOO. TX), which is part of it, as DOS_MakeName keeps it */
 	if (!(sectbuf[entryoffset].attrib & DOS_ATTR_VOLUME)) {
 		trimString(&find_name[0]);
-		if (uselfn) trimString(&extension[0]);
-		else removeTrailingSpaces(&extension[0]);
+		removeTrailingSpaces(&extension[0]);
 	}
 
 	// A label with a blank extension field must not get a stray "." appended
