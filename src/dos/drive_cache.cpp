@@ -774,6 +774,40 @@ Bits DOS_Drive_Cache::GetLongName(CFileInfo* curDir, char* shortName) {
     return -1;
 }
 
+/* With long file names off, a name DOS holds with a space inside it, as 3Ch of F OO.TXT makes it:
+ * one to eight bytes before one dot and up to three after it, the name neither starting nor
+ * ending with a space and the extension not ending with one, and every other byte one an 8.3 name
+ * holds. name is upper case. No trail byte of a double-byte character is a space or a dot. */
+static bool ShortNameWithSpace(const char* name) {
+    if (uselfn || !strchr(name,' ') || name[0]==' ' || name[0]=='.') return false;
+    const char* dot = strchr(name,'.');
+    const size_t len = dot ? (size_t)(dot-name) : strlen(name);
+    if (name[len-1]==' ') return false;
+    if (dot && (dot[1]==0 || dot[strlen(dot)-1]==' ')) return false;
+    char probe[CROSS_LEN];
+    safe_strncpy(probe,name,CROSS_LEN);
+    for (char* p=probe; *p; p++) if (*p==' ') *p='_';
+    return !filename_not_8x3(probe);
+}
+
+/* The names with a space ReadDir has given in the directory it is reading. During the read that
+ * directory's list is not sorted, so GetLongName cannot tell whether such a name is taken, and on
+ * a host that tells case apart two names can upper-case to one. A name with a space never equals
+ * a generated alias or a name without one, so these are the only names it can meet. */
+static const DOS_Drive_Cache::CFileInfo* spaced_dir = NULL;
+static std::unordered_set<std::string> spaced_names;
+
+/* The short name a host's folder read gives an entry: none, so that CreateShortName makes it, for
+ * a name DOS holds with its space where the host's file system gave it another (Windows) */
+static const char* HostShortName(const char* name, const char* sname) {
+    if (!sname[0] || uselfn || !strchr(name,' ')) return sname;
+    char upper[CROSS_LEN];
+    safe_strncpy(upper,name,CROSS_LEN);
+    if (IS_PC98_ARCH || isDBCSCP()) DBCS_upcase(upper);
+    else upcase(upper);
+    return ShortNameWithSpace(upper) ? "" : sname;
+}
+
 bool DOS_Drive_Cache::RemoveSpaces(char* str) {
 // Removes all spaces
     char*   curpos  = str;
@@ -1133,10 +1167,12 @@ bool DOS_Drive_Cache::ReadDir(uint16_t id, char* &result, char * &lresult) {
         bool is_directory;
         {   // the entries are numbered as read only until the sort
             ReadIndex index(dirSearch[id], readIndex);
+            spaced_dir = dirSearch[id];
+            spaced_names.clear();
             if (drive->read_directory_first(dirp, dir_name, dir_sname, is_directory)) {
-                CreateEntry(dirSearch[id], dir_name, dir_sname, is_directory, /*skip search*/true);
+                CreateEntry(dirSearch[id], dir_name, HostShortName(dir_name, dir_sname), is_directory, /*skip search*/true);
                 while (drive->read_directory_next(dirp, dir_name, dir_sname, is_directory)) {
-                    CreateEntry(dirSearch[id], dir_name, dir_sname, is_directory, /*skip search*/true);
+                    CreateEntry(dirSearch[id], dir_name, HostShortName(dir_name, dir_sname), is_directory, /*skip search*/true);
                 }
             }
             // Every name that is an entry's own is known: the aliases, in the host's order.
@@ -1146,6 +1182,8 @@ bool DOS_Drive_Cache::ReadDir(uint16_t id, char* &result, char * &lresult) {
                 ShortNameBase(info->orgname, buffer, name, len);
                 CreateAlias(dirSearch[id], info, name, len);
             }
+            spaced_dir = NULL;
+            spaced_names.clear();
         }
 
         // Insertion skipped sorting, now sort in one go, which should be faster when faced with many files

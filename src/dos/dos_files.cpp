@@ -413,6 +413,8 @@ void DOS_SetDefaultDrive(uint8_t drive) {
 	if (drive<DOS_DRIVES && ((drive<2) || Drives[drive])) {dos.current_drive = drive; DOS_SDA(DOS_SDA_SEG,DOS_SDA_OFS).SetDrive(drive);}
 }
 
+static bool DOS_PathPackName(char * name,bool quoted);
+
 bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive) {
     if(!name || *name == 0 || *name == ' ' || *name == '\n' || *name == ':') {
 		/* Both \0 and space are separators and
@@ -423,7 +425,9 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 	char names[LFN_NAMELENGTH];
 	strcpy(names,name);
 	char * name_int = names;
-	if (strlen(names)==14 && name_int[1]==':' && name_int[2]!='\\' && name_int[9]==' ' && name_int[10]=='.') {
+	/* An FCB's name, D:NAME    .EXT, cut at its first space. With long file names off the name is
+	 * read as any other below, so a space inside it stays (FCB A B     TXT is A B.TXT in DOS) */
+	if (uselfn && strlen(names)==14 && name_int[1]==':' && name_int[2]!='\\' && name_int[9]==' ' && name_int[10]=='.') {
 		for (unsigned int i=0;i<strlen(names);i++)
 			if (i<10 && name_int[i]==32) {
 				name_int[i]='.';
@@ -481,7 +485,9 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 			if (c==' ' && q/2*2 == q) continue;
 		} else {
 			if ((c>='a') && (c<='z')) c-=32;
-			else if (c==' ') continue; /* should be separator */
+			/* With long file names off a space is part of a name, as in DOS, where 3Ch of
+			 * F OO.TXT makes that name; each name's padding is dropped below */
+			else if (c==' ' && (uselfn || !w)) continue;
 		}
 		upname[w++]=(char)c;
         if(((IS_PC98_ARCH && shiftjis_lead_byte(c)) || (isDBCSCP() && isKanji1(c))) && r < DOS_PATHLENGTH && name_int[r] != 0) {
@@ -514,6 +520,10 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 		else if ((upname[r]=='\\') || (upname[r]==0)){
 			if (upname[r]==0) stop=true;
 			tempdir[w]=0;
+			if (!uselfn && !DOS_PathPackName(tempdir,q!=0)) {
+				DOS_SetError(stop ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND);
+				return false;
+			}
 			if (tempdir[0]==0) { w=0;r++;continue;}
 			if (strcmp(tempdir,".")==0) {
 				tempdir[0]=0;			
@@ -975,38 +985,41 @@ static size_t DOS_PathFieldLength(const char * s,const char * e,size_t width) {
 	return (size_t)(end-s);
 }
 
-/* Each name of a path that holds a space, cut to its eight and three characters with their
- * padding dropped as DOS packs it into an entry: "FOO     X.TXT" is FOO.TXT, "FOO.TX T" is FOO.TX,
- * where the emulator's own path code would drop the spaces and read FOOX.TXT and FOO.TXT. */
-static void DOS_PathPack(char * path) {
-	char * w=path, * r=path;
-	if (r[0] && r[1]==':') w=r+=2;
-	while (*r) {
-		if (*r=='\\' || *r=='/') { *w++=*r++; continue; }
-		char * start=r, * dot=NULL;
-		bool lead=false, space=false;
-		for (;*r && (lead || (*r!='\\' && *r!='/'));r++) {
-			if (lead) lead=false;
-			else if (DOS_PathLeadByte((uint8_t)*r)) lead=true;
-			else if (*r==' ') space=true;
-			else if (*r=='.' && !dot) dot=r;
-		}
-		if (!space || dot==start) {
-			memmove(w,start,(size_t)(r-start));
-			w+=r-start;
-			continue;
-		}
-		const size_t name_len=DOS_PathFieldLength(start,dot ? dot : r,8);
-		memmove(w,start,name_len);
-		w+=name_len;
-		if (dot) {
-			const size_t ext_len=DOS_PathFieldLength(dot+1,r,3);
-			*w++='.';
-			memmove(w,dot+1,ext_len);
-			w+=ext_len;
-		}
+/* One name of a path holding a space, long file names off, as DOS packs it into an entry: its
+ * leading spaces dropped, then cut to its eight and three characters with their padding dropped.
+ * "FOO     X.TXT" is FOO.TXT, "FOO.TX T" is FOO.TX, "FOO. TXT" is FOO. TX and "F OO.TXT" stays,
+ * the space being part of the name. A name that starts with a dot keeps none of its spaces, so
+ * ". " is the current directory. In a quoted path, the emulator's own way of passing a name with
+ * its spaces, a name too long for its fields is no name (false), where packing it would reach
+ * another file ("PROGRAM FILES" is not PROGRAM). No trail byte of a double-byte character is a
+ * space or a dot, so both are looked for byte by byte. */
+static bool DOS_PathPackName(char * name,bool quoted) {
+	if (!strchr(name,' ')) return true;
+	char * start=name+strspn(name," ");
+	char * w=name;
+	if (*start=='.') {
+		for (const char * r=start;*r;r++)
+			if (*r!=' ') *w++=*r;
+		*w=0;
+		return true;
+	}
+	char * end=start+strlen(start);
+	char * dot=strchr(start,'.');
+	/* a second dot stays for DOS_MakeName to refuse: "A.TXT B.TXT" is no name */
+	if (dot && strchr(dot+1,'.')) return true;
+	if (quoted && (DOS_PathFieldLength(start,dot ? dot : end,(size_t)-1)>8 || (dot && DOS_PathFieldLength(dot+1,end,(size_t)-1)>3)))
+		return false;
+	const size_t name_len=DOS_PathFieldLength(start,dot ? dot : end,8);
+	memmove(w,start,name_len);
+	w+=name_len;
+	if (dot) {
+		const size_t ext_len=DOS_PathFieldLength(dot+1,end,3);
+		*w++='.';
+		memmove(w,dot+1,ext_len);
+		w+=ext_len;
 	}
 	*w=0;
+	return true;
 }
 
 /* What a path names, its dots and slashes resolved as DOS_MakeName resolves them; -1 where it does
@@ -1032,9 +1045,6 @@ struct DOS_PathAnswers {
 	uint8_t ah,al;          /* for AH=56h, AL=0 is the name renamed and AL=1 the new name */
 	uint16_t name;          /* a last name an 8.3 entry cannot hold, or no name at all */
 	uint16_t wildcard;      /* a wildcard in the last name */
-	uint16_t space;         /* a space inside the last name: 2 is not found (3 where its directory
-	                         * does not exist); 0 where DOS makes the name with its space, which
-	                         * DOS_MakeName drops on every drive */
 	uint16_t root;          /* the root, where it is not the current directory */
 	uint16_t root_current;  /* the root as the current directory */
 	uint16_t device;        /* a device in a directory that exists */
@@ -1045,17 +1055,17 @@ struct DOS_PathAnswers {
 };
 
 static const DOS_PathAnswers DOS_PathCalls[]={
-	/*  AH  AL name wild space root current device no_parent dir file absent */
-	{0x3d,0,   2,   2,    2,   5,     5,     0,     0,     5,   0,   2},  /* open */
-	{0x3c,0,   2,   2,    0,   5,     5,     0,     0,     5,   0,   0},  /* create */
-	{0x41,0,   3,   3,    2,   5,     5,     5,     0,     2,   0,   2},  /* delete */
-	{0x43,0,   3,   3,    2,   0,     0,     0,     0,     0,   0,   2},  /* get attributes */
-	{0x43,1,   3,   3,    2,   5,     5,     5,     0,     0,   0,   2},  /* set attributes */
-	{0x3b,0,   3,   3,    3,   0,     0,     0,     0,     0,   0,   0},  /* change directory */
-	{0x39,0,   3,   3,    0,   5,     5,     5,     0,     5,   5,   0},  /* make a directory */
-	{0x3a,0,   3,  16,    3,   0,     0,     5,     0,     0,   5,   3},  /* remove a directory */
-	{0x56,0,   3,   3,    2,   2,    16,     5,     0,     0,   0,   2},  /* rename, the name renamed */
-	{0x56,1,   3,   3,    0,   5,     5,     5,     3,     5,   5,   0},  /* rename, the new name */
+	/*  AH  AL name wild root current device no_parent dir file absent */
+	{0x3d,0,   2,   2,   5,     5,     0,     0,     5,   0,   2},  /* open */
+	{0x3c,0,   2,   2,   5,     5,     0,     0,     5,   0,   0},  /* create */
+	{0x41,0,   3,   3,   5,     5,     5,     0,     2,   0,   2},  /* delete */
+	{0x43,0,   3,   3,   0,     0,     0,     0,     0,   0,   2},  /* get attributes */
+	{0x43,1,   3,   3,   5,     5,     5,     0,     0,   0,   2},  /* set attributes */
+	{0x3b,0,   3,   3,   0,     0,     0,     0,     0,   0,   0},  /* change directory */
+	{0x39,0,   3,   3,   5,     5,     5,     0,     5,   5,   0},  /* make a directory */
+	{0x3a,0,   3,  16,   0,     0,     5,     0,     0,   5,   3},  /* remove a directory */
+	{0x56,0,   3,   3,   2,    16,     5,     0,     0,   0,   2},  /* rename, the name renamed */
+	{0x56,1,   3,   3,   5,     5,     5,     3,     5,   5,   0},  /* rename, the new name */
 };
 
 static const DOS_PathAnswers * DOS_PathAnswersOf(uint8_t ah,uint8_t al) {
@@ -1068,14 +1078,13 @@ static const DOS_PathAnswers * DOS_PathAnswersOf(uint8_t ah,uint8_t al) {
 /* What MS-DOS answers to a program's path before the call reads a directory, long names off; 0
  * lets the call go on. The call's row in DOS_PathCalls gives the answers that differ by call: a
  * name an 8.3 entry cannot hold (a character such as " + ; [, a wildcard, two dots, no name
- * before its dot, three dots or more, a leading space, nothing at all), a space inside a name
- * (part of it in DOS, where the emulator's own path code drops it), the root, a device. The same
- * for every call: a bad name in a directory's place, a climb above the root, a backslash that
- * ends a path below the root, a space inside a directory's name and a device in a directory that
- * does not exist are 3. A path that passes is packed as DOS packs each name (DOS_PathPack), and
- * \DEV\<device> is left as the device's name. A network resource is the redirector's and passes
- * untouched. late is set where the answer comes from what the path names rather than from how it
- * is spelt: a trailing backslash, a space inside a name, and everything after the walk. */
+ * before its dot, three dots or more, a leading space, nothing at all), the root, a device. The
+ * same for every call: a bad name in a directory's place, a climb above the root, a backslash
+ * that ends a path below the root and a device in a directory that does not exist are 3. A space
+ * inside a name is part of it, as DOS_MakeName reads it. \DEV\<device> is left as the device's
+ * name. A network resource is the redirector's and passes untouched. late is set where the answer
+ * comes from what the path names rather than from how it is spelt: a trailing backslash, and
+ * everything after the walk. */
 static uint16_t DOS_PathCheck(char * path,const DOS_PathAnswers * a,bool & late) {
 	late=false;
 #if !defined(OSFREE)
@@ -1104,7 +1113,7 @@ static uint16_t DOS_PathCheck(char * path,const DOS_PathAnswers * a,bool & late)
 			sep=false;
 		}
 	}
-	bool root=false, space=false;
+	bool root=false;
 	lead=false;
 	for (const char * c=p, * start=p;;c++) {
 		if (lead) {
@@ -1140,11 +1149,6 @@ static uint16_t DOS_PathCheck(char * path,const DOS_PathAnswers * a,bool & late)
 			}
 			if (bad || dots>1 || dot==start) return last ? a->name : DOSERR_PATH_NOT_FOUND;
 			if (wild) return last ? a->wildcard : DOSERR_PATH_NOT_FOUND;
-			if (memchr(start,' ',DOS_PathFieldLength(start,dot ? dot : c,8)) || (dot && memchr(dot+1,' ',DOS_PathFieldLength(dot+1,c,3)))) {
-				late=true;
-				if (!last) return DOSERR_PATH_NOT_FOUND;
-				space=true;
-			}
 			depth++;
 			root=false;
 		}
@@ -1152,11 +1156,6 @@ static uint16_t DOS_PathCheck(char * path,const DOS_PathAnswers * a,bool & late)
 		start=c+1;
 	}
 	late=true;
-	if (space) {
-		if (DOS_PathTarget(path,true)!=DOS_PATH_ABSENT) return DOSERR_PATH_NOT_FOUND;
-		if (a->space) return a->space;
-	}
-	DOS_PathPack(path);
 	if (root) return Drives[drive]->curdir[0] ? a->root : a->root_current;
 	/* \DEV\ in the root is where DOS finds every device, a directory of that name or not */
 	if ((p[0]=='\\' || p[0]=='/') && !strncasecmp(p+1,"DEV",3) && (p[4]=='\\' || p[4]=='/') && p[5] &&
@@ -2771,6 +2770,29 @@ bool DOS_FCBGetFileSize(uint16_t seg,uint16_t offset) {
 	return true;
 }
 
+/* An FCB's eight and three name bytes as a name: each field's padding dropped, the dot only before
+ * an extension. With long file names off a space inside a field is part of the name, as in DOS
+ * (FOO     T X is FOO.T X); with them on DOS_MakeName drops it, and the name stops at it. */
+static void DOS_FCBNameJoin(const char * name8,const char * ext3,char * out) {
+	size_t name_len=0, ext_len=0;
+	if (uselfn) {
+		while (name_len<8 && name8[name_len]!=' ') name_len++;
+		if (ext3[0]!=' ') while (ext_len<3 && ext3[ext_len]!=' ') ext_len++;
+	} else {
+		name_len=8; ext_len=3;
+		while (name_len && name8[name_len-1]==' ') name_len--;
+		while (ext_len && ext3[ext_len-1]==' ') ext_len--;
+	}
+	memcpy(out,name8,name_len);
+	out+=name_len;
+	if (ext_len) {
+		*out++='.';
+		memcpy(out,ext3,ext_len);
+		out+=ext_len;
+	}
+	*out=0;
+}
+
 bool DOS_FCBDeleteFile(uint16_t seg,uint16_t offset){
 /* Special case: ????????.??? and DOS_ATTR_VOLUME */
     {
@@ -2841,19 +2863,7 @@ bool DOS_FCBDeleteFile(uint16_t seg,uint16_t offset){
         DTAExtendName(name, file_name, ext);
 
         char shortname[DOS_NAMELENGTH_ASCII];
-        unsigned int pos = 0;
-        for(unsigned int i = 0; i < 8; i++) {
-            if(file_name[i] == ' ') break;
-            shortname[pos++] = file_name[i];
-        }
-        if(ext[0] != ' ') {
-            shortname[pos++] = '.';
-            for(unsigned int i = 0; i < 3; i++) {
-                if(ext[i] == ' ') break;
-                shortname[pos++] = ext[i];
-            }
-        }
-        shortname[pos] = 0;
+        DOS_FCBNameJoin(file_name, ext, shortname);
 
         //LOG_MSG("FCB delete found='%s'", shortname);
 
@@ -2966,19 +2976,7 @@ bool DOS_FCBRenameFile(uint16_t seg, uint16_t offset) {
         }
 
         char rename_name[DOS_NAMELENGTH_ASCII];
-        unsigned int pos = 0;
-        for(unsigned int i = 0; i < 8; i++) {
-            if(rename[i] == ' ') break;
-            rename_name[pos++] = rename[i];
-        }
-        if(rename[8] != ' ') {
-            rename_name[pos++] = '.';
-            for(unsigned int i = 8; i < 11; i++) {
-                if(rename[i] == ' ') break;
-                rename_name[pos++] = rename[i];
-            }
-        }
-        rename_name[pos] = 0;
+        DOS_FCBNameJoin(rename, rename + 8, rename_name);
 
         char source_name[DOS_PATHLENGTH];
         char dest_name[DOS_PATHLENGTH];
