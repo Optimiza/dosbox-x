@@ -769,7 +769,8 @@ static int DOS_PathTarget(const char * path,bool parent_only) {
 }
 
 /* What MS-DOS 6.22 and 7.10 answer, long names off, by the call that reads the path; 0 lets the
- * call answer. 5Bh and 6Ch answer as the open or the create they make. */
+ * call answer. 5Bh and 6Ch answer as the open or the create they make, and 4Bh as an open but
+ * for a device, which it does not load. */
 struct DOS_PathAnswers {
 	uint8_t ah,al;          /* for AH=56h, AL=0 is the name renamed and AL=1 the new name */
 	uint16_t name;          /* a last name an 8.3 entry cannot hold, or no name at all */
@@ -795,10 +796,12 @@ static const DOS_PathAnswers DOS_PathCalls[]={
 	{0x3a,0,   3,  16,   0,     0,     5,     0,     0,   5,   3},  /* remove a directory */
 	{0x56,0,   3,   3,   2,    16,     5,     0,     0,   0,   2},  /* rename, the name renamed */
 	{0x56,1,   3,   3,   5,     5,     5,     3,     5,   5,   0},  /* rename, the new name */
+	{0x4b,0,   2,   2,   5,     5,     2,     0,     5,   0,   2},  /* load, with or without running */
 };
 
 static const DOS_PathAnswers * DOS_PathAnswersOf(uint8_t ah,uint8_t al) {
 	if (ah==0x5b) ah=0x3c;
+	if (ah==0x4b) al=0;
 	for (const DOS_PathAnswers & a : DOS_PathCalls)
 		if (a.ah==ah && a.al==al) return &a;
 	return NULL;
