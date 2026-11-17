@@ -211,6 +211,27 @@ static void StripSpaces(char*&args,char also) {
 		args++;
 }
 
+/* With long file names off a name keeps a space inside it, so a second word after MD's, RD's or
+ * DEL's name would become part of that name. COMMAND.COM refuses it and does nothing (MS-DOS 6.22
+ * and 7.10: "Too many parameters - BAR" for MD FOO BAR). A name in quotes, the emulator's own way
+ * to pass one with a space, stays one word. Returns the second word, cut at its end, or NULL. */
+static char* SecondWord(char* args) {
+	if (uselfn) return NULL;
+	bool quoted = false;
+	for (char* p = args; *p; p++) {
+		if (*p == '"') quoted = !quoted;
+		else if (*p == ' ' && !quoted) {
+			while (*p == ' ') p++;
+			if (!*p) return NULL;
+			char* end = p;
+			while (*end && *end != ' ') end++;
+			*end = 0;
+			return p;
+		}
+	}
+	return NULL;
+}
+
 static char* ExpandDot(char*args, char* buffer , size_t bufsize, bool expand) {
 	if(*args == '.') {
 		if(*(args+1) == 0){
@@ -595,6 +616,10 @@ void DOS_Shell::CMD_DELETE(char* args) {
 
     StripSpaces(args);
     args = trim(args);
+    if(char* word = SecondWord(args)) {
+        WriteOut(MSG_Get("SHELL_TOO_MANY_PARAMETERS"), word);
+        return;
+    }
 
     if (!drive_mounted(args)) { WriteOut(MSG_Get("SHELL_ILLEGAL_DRIVE")); return; }
 
@@ -1596,6 +1621,10 @@ void DOS_Shell::CMD_MKDIR(char * args) {
 		WriteOut(MSG_Get("SHELL_MISSING_PARAMETER"));
 		return;
 	}
+	if (char* word = SecondWord(args)) {
+		WriteOut(MSG_Get("SHELL_TOO_MANY_PARAMETERS"), word);
+		return;
+	}
 	if (!drive_mounted(args)) { WriteOut(MSG_Get("SHELL_ILLEGAL_DRIVE")); return; }
 	if (!DOS_MakeDir(args)) {
 		WriteOut(MSG_Get(dos.errorcode==DOSERR_ACCESS_DENIED?"SHELL_CMD_MKDIR_EXIST":"SHELL_CMD_MKDIR_ERROR"),args);
@@ -1617,6 +1646,10 @@ void DOS_Shell::CMD_RMDIR(char * args) {
 	}
 	if (!*args) {
 		WriteOut(MSG_Get("SHELL_MISSING_PARAMETER"));
+		return;
+	}
+	if (char* word = SecondWord(args)) {
+		WriteOut(MSG_Get("SHELL_TOO_MANY_PARAMETERS"), word);
 		return;
 	}
 	if (!drive_mounted(args)) { WriteOut(MSG_Get("SHELL_ILLEGAL_DRIVE")); return; }
