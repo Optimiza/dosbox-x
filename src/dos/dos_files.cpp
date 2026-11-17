@@ -425,7 +425,13 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
 		DOS_SetError(DOSERR_FILE_NOT_FOUND);
 		return false;
 	}
-	char names[LFN_NAMELENGTH];
+	/* Room for any path the loop below takes (DOS_PATHLENGTH), behind a drive and the quote a
+	 * long-name call puts around it */
+	char names[DOS_PATHLENGTH+3];
+	if (strlen(name)>=sizeof(names)) {
+		DOS_SetError(DOSERR_PATH_NOT_FOUND);
+		return false;
+	}
 	strcpy(names,name);
 	char * name_int = names;
 	/* An FCB's name, D:NAME    .EXT, cut at its first space. With long file names off, or a space
