@@ -2525,7 +2525,17 @@ static Bitu DOS_21Handler(void) {
                 block.LoadData();
                 CommandTail ctail;
                 MEM_BlockRead(Real2Phys(block.exec.cmdtail),&ctail,sizeof(CommandTail));
-                if (DOS_Execute(name1,SegPhys(es)+reg_bx,reg_al)) {
+                /* A program's load (AL 0, 1 or 3) reads its path as MS-DOS does. The shell starts
+                 * every program through CALLBACK_RunRealInt, whose INT 21h returns into the
+                 * callback area, and keeps the emulator's answers: it prints the error it gets. A
+                 * resident program that chains INT 21h with a far call hides that return, and the
+                 * shell's load is then read as a program's */
+                const uint8_t mode=reg_al & 0x7f;
+                const bool program=(mode==0 || mode==1 || mode==3) && ((cpu.pmode && !GETFLAG(VM)) ||
+                    !CALLBACK_RealIntReturn(0x21,mem_readw(SegPhys(ss)+reg_sp+2),mem_readw(SegPhys(ss)+reg_sp)));
+                if (program && DOS_PathRefused(name1,0x4b,reg_al)) {
+                    /* refused before anything is loaded */
+                } else if (DOS_Execute(name1,SegPhys(es)+reg_bx,reg_al)) {
                     strcpy(appname, name1);
                     strncpy(appargs, ctail.buffer, sizeof(appargs));
                     if(ctail.count < sizeof(appargs))
@@ -2533,6 +2543,7 @@ static Bitu DOS_21Handler(void) {
                     else
                         appname[sizeof(appargs) - 1] = 0;
                 } else {
+                    if (program && !uselfn) DOS_PathCallFailed(name1,0x4b,reg_al);
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }

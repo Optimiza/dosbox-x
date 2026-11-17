@@ -76,6 +76,12 @@ static INLINE Bitu CALLBACK_RealIntStubSize(void) {
 	return 2u + CALLBACK_InstrLength();
 }
 
+/* True where cs:ip is where the INT intnum of CALLBACK_RunRealInt returns to, the return
+ * address an interrupt the emulator itself called finds on the stack */
+static INLINE bool CALLBACK_RealIntReturn(uint8_t intnum,uint16_t cs,uint16_t ip) {
+	return cs==CB_SEG && ip==CB_SOFFSET+CB_MAX*CB_SIZE+intnum*CALLBACK_RealIntStubSize()+2u;
+}
+
 static INLINE RealPt CALLBACK_RealPointer(Bitu callback) {
 	return RealMake(CB_SEG,(uint16_t)(CB_SOFFSET+callback*CB_SIZE));
 }
