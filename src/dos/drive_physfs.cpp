@@ -634,7 +634,7 @@ again:
 		DOS_SetError(DOSERR_NO_MORE_FILES);
 		return false;
 	}
-    if(!WildFileCmp(dir_ent,srch_pattern)&&!LWildFileCmp(ldir_ent,srch_pattern)) goto again;
+    if(!WildFileCmp(dir_ent,srch_pattern)&&!LWildFileCmp(ldir_ent,srch_pattern)&&!dirCache.FoundByAlias(srch_pattern)) goto again;
 
 	strcpy(full_name,lfn_filefind_handle>=LFN_FILEFIND_MAX?srchInfo[id].srch_dir:ldir[lfn_filefind_handle].c_str());
 	strcpy(lfull_name,full_name);
