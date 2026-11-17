@@ -642,6 +642,7 @@ static Bitu DOS_21Handler(void);
 uint16_t DOS_FindFirstPathError(const char * search);
 uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al);
 uint16_t DOS_PathRenameError(char * oldname,char * newname);
+uint16_t DOS_PathSetAttrError(char * path,uint16_t attr);
 void DOS_PathCallFailed(const char * path,uint8_t ah,uint8_t al);
 void XMS_DOS_LocalA20DisableIfNotEnabled(void);
 void XMS_DOS_LocalA20DisableIfNotEnabled_XMSCALL(void);
@@ -2373,7 +2374,9 @@ static Bitu DOS_21Handler(void) {
         case 0x43:                  /* Get/Set file attributes */
             unmask_irq0 |= disk_io_unmask_irq0;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
-            if (DOS_PathRefused(name1,0x43,reg_al)) break;
+            if (reg_al==1 && !uselfn) {
+                if (DOS_PathFail(DOS_PathSetAttrError(name1,reg_cx))) break;
+            } else if (DOS_PathRefused(name1,0x43,reg_al)) break;
             switch (reg_al) {
                 case 0x00:              /* Get */
                     {
