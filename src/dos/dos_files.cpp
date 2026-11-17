@@ -1884,6 +1884,8 @@ bool DOS_FCBCreate(uint16_t seg,uint16_t offset) {
 	return true;
 }
 
+static bool FCBFindFirst(uint16_t seg,uint16_t offset,bool keep_search);
+
 bool DOS_FCBOpen(uint16_t seg,uint16_t offset) { 
 	DOS_FCB fcb(seg,offset);
 	char shortname[DOS_FCBNAME];uint16_t handle;
@@ -1892,7 +1894,8 @@ bool DOS_FCBOpen(uint16_t seg,uint16_t offset) {
 	/* Search for file if name has wildcards */
 	if (strpbrk(shortname,"*?")) {
 		LOG(LOG_FCB,LOG_WARN)("Wildcards in filename");
-		if (!DOS_FCBFindFirst(seg,offset)) {
+		/* Not an FCB search: MS-DOS leaves the name of the FCB it opens as the program wrote it */
+		if (!FCBFindFirst(seg,offset,false)) {
 			fcb.SetSeqData(0xff,0);
 			return false;
 		}
@@ -1953,7 +1956,7 @@ static void SaveFindSearch(DOS_FCB & find_fcb) {
 	find_fcb.SetSearch(search);
 }
 
-bool DOS_FCBFindFirst(uint16_t seg,uint16_t offset) {
+static bool FCBFindFirst(uint16_t seg,uint16_t offset,bool keep_search) {
 	DOS_FCB fcb(seg,offset);
 	RealPt old_dta=dos.dta();dos.dta(dos.tables.tempdta);
 	char name[DOS_FCBNAME];fcb.GetName(name);
@@ -1962,10 +1965,14 @@ bool DOS_FCBFindFirst(uint16_t seg,uint16_t offset) {
 	bool ret=DOS_FindFirst(name,attr,true);
 	dos.dta(old_dta);
 	if (ret) {
-		SaveFindSearch(fcb);
+		if (keep_search) SaveFindSearch(fcb);
 		SaveFindResult(fcb);
 	}
 	return ret;
+}
+
+bool DOS_FCBFindFirst(uint16_t seg,uint16_t offset) {
+	return FCBFindFirst(seg,offset,true);
 }
 
 bool DOS_FCBFindNext(uint16_t seg,uint16_t offset) {
