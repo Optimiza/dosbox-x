@@ -1708,6 +1708,7 @@ void SHELL_MessagesInit() {
 	MSG_Add("SHELL_CMD_ECHO_OFF","ECHO is off.\n");
 	MSG_Add("SHELL_ILLEGAL_SWITCH","Invalid switch - %s\n");
 	MSG_Add("SHELL_INVALID_PARAMETER","Invalid parameter - %s\n");
+	MSG_Add("SHELL_TOO_MANY_PARAMETERS","Too many parameters - %s\n");
 	MSG_Add("SHELL_MISSING_PARAMETER","Required parameter missing.\n");
 	MSG_Add("SHELL_MISSING_FILE","The following file is missing or corrupted: %s\n");
 	MSG_Add("SHELL_CMD_CHDIR_ERROR","Invalid directory - %s\n");
