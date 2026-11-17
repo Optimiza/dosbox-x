@@ -344,8 +344,7 @@ the output it is drawn on: `none` while there is no output yet, `undrawable`
 for one it cannot draw on (an 8-bit output, or the TrueType output while it
 shows text; its graphics modes are drawn on like any other). An unknown state or
 key, or a value out of its range, answers ERR naming it and changes nothing;
-as for any command that returns an error, the response then ends with the
-`*** Debugger command not recognized` line. The arguments keep their case.
+the response ends with that reason alone. The arguments keep their case.
 
 The bare command, `PRESENCE` with no state, changes nothing and answers the same line
 with `version=2` appended, so a client can refuse a build that announces no version
