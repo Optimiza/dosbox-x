@@ -625,6 +625,8 @@ extern bool date_host_forced;
 extern bool dos_a20_disable_on_exec;
 
 static Bitu DOS_21Handler(void);
+uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al);
+void DOS_PathNotFound(const char * path);
 void XMS_DOS_LocalA20DisableIfNotEnabled(void);
 void XMS_DOS_LocalA20DisableIfNotEnabled_XMSCALL(void);
 #if !defined(OSFREE)
@@ -1949,9 +1951,14 @@ static Bitu DOS_21Handler(void) {
             }
 			force_sfn = false;
             break;
-        case 0x3b:      /* CHDIR Set current directory */
+        case 0x3b: {    /* CHDIR Set current directory */
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
-            if  (DOS_ChangeDir(name1)) {
+            const uint16_t path_error=uselfn?0:DOS_PathCallError(name1,0x3b,0);
+            if (path_error) {
+                DOS_SetError(path_error);
+                reg_ax=path_error;
+                CALLBACK_SCF(true);
+            } else if (DOS_ChangeDir(name1)) {
                 reg_ax=0x00;    /* ax destroyed */
                 CALLBACK_SCF(false);
             } else {
@@ -1959,6 +1966,7 @@ static Bitu DOS_21Handler(void) {
                 CALLBACK_SCF(true);
             }
             break;
+        }
         case 0x3c:      /* CREATE Create or truncate file */
 			force_sfn = true;
             unmask_irq0 |= disk_io_unmask_irq0;
@@ -2025,6 +2033,13 @@ static Bitu DOS_21Handler(void) {
                 }
             }
 #endif
+            const uint16_t path_error=uselfn?0:DOS_PathCallError(name1,0x3d,reg_al);
+            if (path_error) {
+                DOS_SetError(path_error);
+                reg_ax=path_error;
+                CALLBACK_SCF(true);
+                break;
+            }
 			uint8_t oldal=reg_al;
 			force_sfn = true;
             if (DOS_OpenFile(name1,reg_al,&reg_ax)) {
@@ -2044,6 +2059,7 @@ static Bitu DOS_21Handler(void) {
 					diskio_delay_handle(reg_ax, 1024);
 					CALLBACK_SCF(false);
 				} else {
+                    if (!uselfn) DOS_PathNotFound(name1);
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
@@ -2253,9 +2269,16 @@ static Bitu DOS_21Handler(void) {
                 }
                 break;
             }
-        case 0x43:                  /* Get/Set file attributes */
+        case 0x43: {                /* Get/Set file attributes */
             unmask_irq0 |= disk_io_unmask_irq0;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+            const uint16_t path_error=(uselfn||reg_al>1)?0:DOS_PathCallError(name1,0x43,reg_al);
+            if (path_error) {
+                DOS_SetError(path_error);
+                reg_ax=path_error;
+                CALLBACK_SCF(true);
+                break;
+            }
             switch (reg_al) {
                 case 0x00:              /* Get */
                     {
@@ -2265,6 +2288,7 @@ static Bitu DOS_21Handler(void) {
                             reg_ax=attr_val; /* Undocumented */   
                             CALLBACK_SCF(false);
                         } else {
+                            if (!uselfn) DOS_PathNotFound(name1);
                             CALLBACK_SCF(true);
                             reg_ax=dos.errorcode;
                         }
@@ -2275,6 +2299,7 @@ static Bitu DOS_21Handler(void) {
                         reg_ax=0x202;   /* ax destroyed */
                         CALLBACK_SCF(false);
                     } else {
+                        if (!uselfn) DOS_PathNotFound(name1);
                         CALLBACK_SCF(true);
                         reg_ax=dos.errorcode;
                     }
@@ -2286,6 +2311,7 @@ static Bitu DOS_21Handler(void) {
                     break;
             }
             break;
+        }
         case 0x44:                  /* IOCTL Functions */
             if(ias_handle != 0 && ias_handle == reg_bx) {
                 if(reg_al == 0) {

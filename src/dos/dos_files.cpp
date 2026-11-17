@@ -687,6 +687,178 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
 	return false;
 }
 
+static bool DOS_PathLeadByte(uint8_t c) {
+	return (IS_PC98_ARCH && shiftjis_lead_byte(c)) || (isDBCSCP() && isKanji1(c));
+}
+
+/* The length of a name or an extension cut to its field, its padding dropped; a double-byte
+ * character the field's end would split is left out whole */
+static size_t DOS_PathFieldLength(const char * s,const char * e,size_t width) {
+	const char * end=s;
+	while (end<e) {
+		const size_t n=(DOS_PathLeadByte((uint8_t)*end) && end+1<e) ? 2 : 1;
+		if ((size_t)(end-s)+n>width) break;
+		end+=n;
+	}
+	while (end>s && end[-1]==' ') end--;
+	return (size_t)(end-s);
+}
+
+/* Each name of a path that holds a space, cut to its eight and three characters with their
+ * padding dropped as DOS packs it into an entry: "FOO     X.TXT" is FOO.TXT, "FOO.TX T" is FOO.TX,
+ * where the emulator's own path code would drop the spaces and read FOOX.TXT and FOO.TXT. */
+static void DOS_PathPack(char * path) {
+	char * w=path, * r=path;
+	if (r[0] && r[1]==':') w=r+=2;
+	while (*r) {
+		if (*r=='\\' || *r=='/') { *w++=*r++; continue; }
+		char * start=r, * dot=NULL;
+		bool lead=false, space=false;
+		for (;*r && (lead || (*r!='\\' && *r!='/'));r++) {
+			if (lead) lead=false;
+			else if (DOS_PathLeadByte((uint8_t)*r)) lead=true;
+			else if (*r==' ') space=true;
+			else if (*r=='.' && !dot) dot=r;
+		}
+		if (!space || dot==start) {
+			memmove(w,start,(size_t)(r-start));
+			w+=r-start;
+			continue;
+		}
+		const size_t name_len=DOS_PathFieldLength(start,dot ? dot : r,8);
+		memmove(w,start,name_len);
+		w+=name_len;
+		if (dot) {
+			const size_t ext_len=DOS_PathFieldLength(dot+1,r,3);
+			*w++='.';
+			memmove(w,dot+1,ext_len);
+			w+=ext_len;
+		}
+	}
+	*w=0;
+}
+
+/* Whether the directory a path's last name lies in exists, the path's dots and slashes resolved
+ * as DOS_MakeName resolves them: 1 or 0, and -1 where the path does not resolve */
+static int DOS_PathParent(const char * path) {
+	char fullname[DOS_PATHLENGTH];
+	uint8_t drive;
+	if (!DOS_MakeName(path,fullname,&drive)) return -1;
+	char * name=strrchr_dbcs(fullname,'\\');
+	if (name) *name=0;
+	else fullname[0]=0;
+	return Drives[drive]->TestDir(fullname) ? 1 : 0;
+}
+
+/* What MS-DOS answers, long names off, to the path of a program's open (AH=3Dh), get or set
+ * attributes (AH=43h, AL=0 or 1) or change directory (AH=3Bh) before it reads a directory; 0 lets
+ * the call go on. A name an 8.3 entry cannot hold (a character such as " + ; [ or a wildcard, two
+ * dots, no name before its dot, three dots or more, a leading space, nothing at all) is error 2
+ * for an open and 3 for the others; in a directory's place it is 3, as are a climb above the root
+ * and a backslash that ends a path below the root. A space inside a name is part of it in DOS
+ * where the emulator's own path code drops it, so such a name is not found: 2, or 3 for 3Bh and
+ * where its directory does not exist.
+ * Setting the attributes of the root or of a device is 5. A path that passes is packed as DOS
+ * packs each name (DOS_PathPack), and \DEV\<device> is left as the device's name. A network
+ * resource is the redirector's and passes untouched. */
+uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
+	const bool open=ah==0x3d, chdir=ah==0x3b, setattr=ah==0x43 && al==1;
+	const uint16_t bad_name=open ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND;
+#if !defined(OSFREE)
+# if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+	if (Network_IsNetworkResource(path)) return 0;
+# endif
+#endif
+	const char * p=path;
+	uint8_t drive=DOS_GetDefaultDrive();
+	if (p[0] && p[1]==':') {
+		drive=(p[0] | 0x20)-'a';
+		p+=2;
+	}
+	if (!*p) return bad_name;
+	if (drive>=DOS_DRIVES || !Drives[drive]) return 0;
+
+	int depth=0;
+	bool lead=false;
+	if (*p!='\\' && *p!='/') {
+		bool sep=true;
+		for (const char * c=Drives[drive]->curdir;*c;c++) {
+			if (lead) lead=false;
+			else if (*c=='\\') { sep=true; continue; }
+			else if (DOS_PathLeadByte((uint8_t)*c)) lead=true;
+			if (sep) depth++;
+			sep=false;
+		}
+	}
+	bool root=false, absent=false;
+	lead=false;
+	for (const char * c=p, * start=p;;c++) {
+		if (lead) {
+			lead=false;
+			if (*c) continue;
+		}
+		const uint8_t ch=(uint8_t)*c;
+		if (ch && DOS_PathLeadByte(ch)) { lead=true; continue; }
+		if (ch && ch!='\\' && ch!='/') continue;
+		const bool last=!ch;
+		const size_t len=(size_t)(c-start);
+		if (!len) {
+			if (last && c>p) {
+				if (depth>0) return DOSERR_PATH_NOT_FOUND;
+				root=true;
+			}
+		} else if (strspn(start,".")>=len) {
+			if (len>2) return last ? bad_name : DOSERR_PATH_NOT_FOUND;
+			if (len==2 && --depth<0) return DOSERR_PATH_NOT_FOUND;
+			root=depth==0;
+		} else {
+			size_t dots=0;
+			const char * dot=NULL;
+			bool bad=*start==' ', lead2=false;
+			for (const char * d=start;d<c;d++) {
+				if (lead2) { lead2=false; continue; }
+				const uint8_t b=(uint8_t)*d;
+				if (DOS_PathLeadByte(b)) lead2=true;
+				else if (b=='.') { if (!dots++) dot=d; }
+				else if (strchr("\"+,;=[]|<>:*?",b)) bad=true;
+			}
+			if (bad || dots>1 || dot==start) return last ? bad_name : DOSERR_PATH_NOT_FOUND;
+			if (memchr(start,' ',DOS_PathFieldLength(start,dot ? dot : c,8)) || (dot && memchr(dot+1,' ',DOS_PathFieldLength(dot+1,c,3)))) {
+				if (!last || chdir) return DOSERR_PATH_NOT_FOUND;
+				absent=true;
+			}
+			depth++;
+			root=false;
+		}
+		if (last) break;
+		start=c+1;
+	}
+	if (absent) return DOS_PathParent(path)==1 ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND;
+	DOS_PathPack(path);
+	/* \DEV\ in the root is where DOS finds every device, a directory of that name or not */
+	if ((p[0]=='\\' || p[0]=='/') && !strncasecmp(p+1,"DEV",3) && (p[4]=='\\' || p[4]=='/') && p[5] &&
+		!strpbrk(p+5,"\\/") && DOS_FindDevice(p+5)!=DOS_DEVICES) {
+		memmove(path,p+5,strlen(p+5)+1);
+		if (setattr) return DOSERR_ACCESS_DENIED;
+	}
+	if (setattr && (root || (DOS_PathParent(path)==1 && DOS_FindDevice(path)!=DOS_DEVICES))) return DOSERR_ACCESS_DENIED;
+	return 0;
+}
+
+/* After an open (AH=3Dh) or a get or set attributes (AH=43h) that found nothing, long names off:
+ * MS-DOS answers 3 where the directory the name lies in does not exist and 2 where it does, the
+ * path's dots and slashes resolved first, as DOS_MakeName resolves them */
+void DOS_PathNotFound(const char * path) {
+	if (dos.errorcode!=DOSERR_FILE_NOT_FOUND && dos.errorcode!=DOSERR_PATH_NOT_FOUND) return;
+#if !defined(OSFREE)
+# if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+	if (Network_IsNetworkResource(path)) return;
+# endif
+#endif
+	const int parent=DOS_PathParent(path);
+	if (parent>=0) DOS_SetError(parent ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND);
+}
+
 bool forcelfn = false;
 bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 	LOG(LOG_FILES,LOG_NORMAL)("file search attributes %X name %s",attr,search);
