@@ -757,7 +757,7 @@ static int DOS_PathParent(const char * path) {
  * for an open and 3 for the others; in a directory's place it is 3, as are a climb above the root
  * and a backslash that ends a path below the root. A space inside a name is part of it in DOS
  * where the emulator's own path code drops it, so such a name is not found: 2, or 3 for 3Bh and
- * where its directory does not exist.
+ * where its directory does not exist. A device in a directory that does not exist is 3.
  * Setting the attributes of the root or of a device is 5. A path that passes is packed as DOS
  * packs each name (DOS_PathPack), and \DEV\<device> is left as the device's name. A network
  * resource is the redirector's and passes untouched. */
@@ -841,7 +841,11 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 		memmove(path,p+5,strlen(p+5)+1);
 		if (setattr) return DOSERR_ACCESS_DENIED;
 	}
-	if (setattr && (root || (DOS_PathParent(path)==1 && DOS_FindDevice(path)!=DOS_DEVICES))) return DOSERR_ACCESS_DENIED;
+	/* A device is reached only through a directory that exists: DOS_FindDevice tests the
+	 * directory for NUL alone, and an open of D:\NOSUCH\CON would reach CON */
+	const bool device=DOS_FindDevice(path)!=DOS_DEVICES;
+	if (device && DOS_PathParent(path)==0) return DOSERR_PATH_NOT_FOUND;
+	if (setattr && (root || device)) return DOSERR_ACCESS_DENIED;
 	return 0;
 }
 
