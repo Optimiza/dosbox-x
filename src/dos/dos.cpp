@@ -641,7 +641,8 @@ extern bool dos_a20_disable_on_exec;
 static Bitu DOS_21Handler(void);
 uint16_t DOS_FindFirstPathError(const char * search);
 uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al);
-void DOS_PathNotFound(const char * path);
+uint16_t DOS_PathRenameError(char * oldname,char * newname);
+void DOS_PathCallFailed(const char * path,uint8_t ah,uint8_t al);
 void XMS_DOS_LocalA20DisableIfNotEnabled(void);
 void XMS_DOS_LocalA20DisableIfNotEnabled_XMSCALL(void);
 #if !defined(OSFREE)
@@ -1094,6 +1095,21 @@ void DOS_FlushSTDIN(void) {
 		    n=1; DOS_ReadFile(STDIN,&c,&n);
 	    }
     }
+}
+
+/* A program's call fails with error, where error is not 0 */
+static bool DOS_PathFail(uint16_t error) {
+    if (!error) return false;
+    DOS_SetError(error);
+    reg_ax=error;
+    CALLBACK_SCF(true);
+    return true;
+}
+
+/* A program's path refused before its call reads a directory, long file names off: the call
+ * fails with what MS-DOS answers (DOS_PathCallError) */
+static bool DOS_PathRefused(char * path,uint8_t ah,uint8_t al) {
+    return !uselfn && DOS_PathFail(DOS_PathCallError(path,ah,al));
 }
 
 static Bitu DOS_21Handler(void) {
@@ -1983,11 +1999,13 @@ static Bitu DOS_21Handler(void) {
             break;
         case 0x39:      /* MKDIR Create directory */
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+            if (DOS_PathRefused(name1,0x39,0)) break;
 			force_sfn = true;
             if (DOS_MakeDir(name1)) {
                 reg_ax=0x05;    /* ax destroyed */
                 CALLBACK_SCF(false);
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,0x39,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
@@ -1995,25 +2013,23 @@ static Bitu DOS_21Handler(void) {
             break;
         case 0x3a:      /* RMDIR Remove directory */
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+            if (DOS_PathRefused(name1,0x3a,0)) break;
 			force_sfn = true;
             if  (DOS_RemoveDir(name1)) {
                 reg_ax=0x05;    /* ax destroyed */
                 CALLBACK_SCF(false);
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,0x3a,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
                 LOG(LOG_DOSMISC,LOG_NORMAL)("Remove dir failed on %s with error %X",name1,dos.errorcode);
             }
 			force_sfn = false;
             break;
-        case 0x3b: {    /* CHDIR Set current directory */
+        case 0x3b:      /* CHDIR Set current directory */
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
-            const uint16_t path_error=uselfn?0:DOS_PathCallError(name1,0x3b,0);
-            if (path_error) {
-                DOS_SetError(path_error);
-                reg_ax=path_error;
-                CALLBACK_SCF(true);
-            } else if (DOS_ChangeDir(name1)) {
+            if (DOS_PathRefused(name1,0x3b,0)) break;
+            if (DOS_ChangeDir(name1)) {
                 reg_ax=0x00;    /* ax destroyed */
                 CALLBACK_SCF(false);
             } else {
@@ -2021,15 +2037,16 @@ static Bitu DOS_21Handler(void) {
                 CALLBACK_SCF(true);
             }
             break;
-        }
         case 0x3c:      /* CREATE Create or truncate file */
-			force_sfn = true;
             unmask_irq0 |= disk_io_unmask_irq0;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+            if (DOS_PathRefused(name1,0x3c,0)) break;
+			force_sfn = true;
             if (DOS_CreateFile(name1,reg_cx,&reg_ax)) {
                 diskio_delay_handle(reg_ax, 2048);
                 CALLBACK_SCF(false);
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,0x3c,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
@@ -2088,13 +2105,7 @@ static Bitu DOS_21Handler(void) {
                 }
             }
 #endif
-            const uint16_t path_error=uselfn?0:DOS_PathCallError(name1,0x3d,reg_al);
-            if (path_error) {
-                DOS_SetError(path_error);
-                reg_ax=path_error;
-                CALLBACK_SCF(true);
-                break;
-            }
+            if (DOS_PathRefused(name1,0x3d,0)) break;
 			uint8_t oldal=reg_al;
 			force_sfn = true;
             if (DOS_OpenFile(name1,reg_al,&reg_ax)) {
@@ -2114,7 +2125,7 @@ static Bitu DOS_21Handler(void) {
 					diskio_delay_handle(reg_ax, 1024);
 					CALLBACK_SCF(false);
 				} else {
-                    if (!uselfn) DOS_PathNotFound(name1);
+                    if (!uselfn) DOS_PathCallFailed(name1,0x3d,0);
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
@@ -2332,11 +2343,13 @@ static Bitu DOS_21Handler(void) {
         case 0x41:                  /* UNLINK Delete file */
             unmask_irq0 |= disk_io_unmask_irq0;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+            if (DOS_PathRefused(name1,0x41,0)) break;
 			force_sfn = true;
             if (DOS_UnlinkFile(name1)) {
                 diskio_delay_drive((name1[1] == ':') ? toupper(name1[0]) - 'A' : DOS_GetDefaultDrive(), 1024);
                 CALLBACK_SCF(false);
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,0x41,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
@@ -2357,16 +2370,10 @@ static Bitu DOS_21Handler(void) {
                 }
                 break;
             }
-        case 0x43: {                /* Get/Set file attributes */
+        case 0x43:                  /* Get/Set file attributes */
             unmask_irq0 |= disk_io_unmask_irq0;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
-            const uint16_t path_error=(uselfn||reg_al>1)?0:DOS_PathCallError(name1,0x43,reg_al);
-            if (path_error) {
-                DOS_SetError(path_error);
-                reg_ax=path_error;
-                CALLBACK_SCF(true);
-                break;
-            }
+            if (DOS_PathRefused(name1,0x43,reg_al)) break;
             switch (reg_al) {
                 case 0x00:              /* Get */
                     {
@@ -2376,7 +2383,7 @@ static Bitu DOS_21Handler(void) {
                             reg_ax=attr_val; /* Undocumented */   
                             CALLBACK_SCF(false);
                         } else {
-                            if (!uselfn) DOS_PathNotFound(name1);
+                            if (!uselfn) DOS_PathCallFailed(name1,0x43,0);
                             CALLBACK_SCF(true);
                             reg_ax=dos.errorcode;
                         }
@@ -2387,7 +2394,7 @@ static Bitu DOS_21Handler(void) {
                         reg_ax=0x202;   /* ax destroyed */
                         CALLBACK_SCF(false);
                     } else {
-                        if (!uselfn) DOS_PathNotFound(name1);
+                        if (!uselfn) DOS_PathCallFailed(name1,0x43,1);
                         CALLBACK_SCF(true);
                         reg_ax=dos.errorcode;
                     }
@@ -2399,7 +2406,6 @@ static Bitu DOS_21Handler(void) {
                     break;
             }
             break;
-        }
         case 0x44:                  /* IOCTL Functions */
             if(ias_handle != 0 && ias_handle == reg_bx) {
                 if(reg_al == 0) {
@@ -2671,12 +2677,14 @@ static Bitu DOS_21Handler(void) {
             reg_al=0xf0;    /* al destroyed */
             break;
         case 0x56:                  /* RENAME Rename file */
-			force_sfn = true;
             MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
             MEM_StrCopy(SegPhys(es)+reg_di,name2,DOSNAMEBUF);
+            if (!uselfn && DOS_PathFail(DOS_PathRenameError(name1,name2))) break;
+			force_sfn = true;
             if (DOS_Rename(name1,name2)) {
                 CALLBACK_SCF(false);            
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,0x56,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
@@ -2767,8 +2775,11 @@ static Bitu DOS_21Handler(void) {
         case 0x5b:                  /* Create new file */
             {
                 MEM_StrCopy(SegPhys(ds)+reg_dx,name1,DOSNAMEBUF);
+                if (DOS_PathRefused(name1,0x5b,0)) break;
                 uint16_t handle;
-                if (DOS_OpenFile(name1,0,&handle)) {
+                /* A device is opened, as by 3Ch, long file names off: MS-DOS refuses only a file
+                 * that exists */
+                if ((uselfn || DOS_FindDevice(name1)==DOS_DEVICES) && DOS_OpenFile(name1,0,&handle)) {
                     DOS_CloseFile(handle);
                     DOS_SetError(DOSERR_FILE_ALREADY_EXISTS);
                     reg_ax=dos.errorcode;
@@ -2779,6 +2790,7 @@ static Bitu DOS_21Handler(void) {
                     reg_ax=handle;
                     CALLBACK_SCF(false);
                 } else {
+                    if (!uselfn) DOS_PathCallFailed(name1,0x5b,0);
                     reg_ax=dos.errorcode;
                     CALLBACK_SCF(true);
                 }
@@ -3220,15 +3232,25 @@ static Bitu DOS_21Handler(void) {
         case 0x6b:                  /* NULL Function */
             goto default_fallthrough;
 #endif
-        case 0x6c:                  /* Extended Open/Create */
+        case 0x6c: {                /* Extended Open/Create */
             MEM_StrCopy(SegPhys(ds)+reg_si,name1,DOSNAMEBUF);
-            if (DOS_OpenFileExtended(name1,reg_bx,reg_cx,reg_dx,&reg_ax,&reg_cx)) {
+            /* The path is read as the open (3Dh) or the create (3Ch) the action makes, once
+             * DOS_OpenFileExtended would take the action */
+            const uint8_t as_call=(reg_dx & 0xf0) ? 0x3c : 0x3d;
+            if (reg_dx && (reg_dx & 0x0f)<=2 && (reg_dx & 0xf0)<=0x10 && DOS_PathRefused(name1,as_call,0)) break;
+            /* A device is opened where the action fails a file that exists, as by 5Bh, and CX says
+             * it was created, as MS-DOS says */
+            const bool device_new=!uselfn && reg_dx==0x10 && DOS_FindDevice(name1)!=DOS_DEVICES;
+            if (DOS_OpenFileExtended(name1,reg_bx,reg_cx,device_new ? 0x11 : reg_dx,&reg_ax,&reg_cx)) {
+                if (device_new) reg_cx=2;
                 CALLBACK_SCF(false);
             } else {
+                if (!uselfn) DOS_PathCallFailed(name1,as_call,0);
                 reg_ax=dos.errorcode;
                 CALLBACK_SCF(true);
             }
             break;
+        }
 #if !defined(OSFREE)
         case 0x6d:                  /* ROM - Find first ROM program */
             LOG(LOG_DOSMISC, LOG_ERROR)("DOS:ROM - Find first ROM program not implemented");
