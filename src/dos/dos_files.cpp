@@ -1918,6 +1918,7 @@ bool DOS_SetFileAttr(char const * const name,uint16_t attr)
 
 	if ((old_attr ^ attr) & DOS_ATTR_VOLUME) { /* change in volume label attribute */
 		LOG(LOG_DOSMISC,LOG_WARN)("Attempted to change volume label attribute of '%s' with SetFileAttr",name);
+		DOS_SetError(DOSERR_ACCESS_DENIED);
 		return false;
 	}
 
