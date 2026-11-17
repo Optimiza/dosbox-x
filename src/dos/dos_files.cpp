@@ -738,32 +738,75 @@ static void DOS_PathPack(char * path) {
 	*w=0;
 }
 
-/* Whether the directory a path's last name lies in exists, the path's dots and slashes resolved
- * as DOS_MakeName resolves them: 1 or 0, and -1 where the path does not resolve */
-static int DOS_PathParent(const char * path) {
-	char fullname[DOS_PATHLENGTH];
+/* What a path names, its dots and slashes resolved as DOS_MakeName resolves them; -1 where it does
+ * not resolve. With parent_only, DOS_PATH_ABSENT stands for any name in a directory that exists. */
+enum { DOS_PATH_NO_PARENT, DOS_PATH_ABSENT, DOS_PATH_FILE, DOS_PATH_DIR };
+static int DOS_PathTarget(const char * path,bool parent_only) {
+	char fullname[DOS_PATHLENGTH], parent[DOS_PATHLENGTH];
 	uint8_t drive;
 	if (!DOS_MakeName(path,fullname,&drive)) return -1;
-	char * name=strrchr_dbcs(fullname,'\\');
+	strcpy(parent,fullname);
+	char * name=strrchr_dbcs(parent,'\\');
 	if (name) *name=0;
-	else fullname[0]=0;
-	return Drives[drive]->TestDir(fullname) ? 1 : 0;
+	else parent[0]=0;
+	if (!Drives[drive]->TestDir(parent)) return DOS_PATH_NO_PARENT;
+	if (parent_only) return DOS_PATH_ABSENT;
+	if (!fullname[0] || Drives[drive]->TestDir(fullname)) return DOS_PATH_DIR;
+	return Drives[drive]->FileExists(fullname) ? DOS_PATH_FILE : DOS_PATH_ABSENT;
 }
 
-/* What MS-DOS answers, long names off, to the path of a program's open (AH=3Dh), get or set
- * attributes (AH=43h, AL=0 or 1) or change directory (AH=3Bh) before it reads a directory; 0 lets
- * the call go on. A name an 8.3 entry cannot hold (a character such as " + ; [ or a wildcard, two
- * dots, no name before its dot, three dots or more, a leading space, nothing at all) is error 2
- * for an open and 3 for the others; in a directory's place it is 3, as are a climb above the root
- * and a backslash that ends a path below the root. A space inside a name is part of it in DOS
- * where the emulator's own path code drops it, so such a name is not found: 2, or 3 for 3Bh and
- * where its directory does not exist. A device in a directory that does not exist is 3.
- * Setting the attributes of the root or of a device is 5. A path that passes is packed as DOS
- * packs each name (DOS_PathPack), and \DEV\<device> is left as the device's name. A network
- * resource is the redirector's and passes untouched. */
-uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
-	const bool open=ah==0x3d, chdir=ah==0x3b, setattr=ah==0x43 && al==1;
-	const uint16_t bad_name=open ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND;
+/* What MS-DOS 6.22 and 7.10 answer, long names off, by the call that reads the path; 0 lets the
+ * call answer. 5Bh and 6Ch answer as the open or the create they make. */
+struct DOS_PathAnswers {
+	uint8_t ah,al;          /* for AH=56h, AL=0 is the name renamed and AL=1 the new name */
+	uint16_t name;          /* a last name an 8.3 entry cannot hold, or no name at all */
+	uint16_t wildcard;      /* a wildcard in the last name */
+	uint16_t space;         /* a space inside the last name: 2 is not found (3 where its directory
+	                         * does not exist); 0 where DOS makes the name with its space, which
+	                         * DOS_MakeName drops on every drive */
+	uint16_t root;          /* the root, where it is not the current directory */
+	uint16_t root_current;  /* the root as the current directory */
+	uint16_t device;        /* a device in a directory that exists */
+	uint16_t no_parent;     /* asked before the call: the directory of the last name does not
+	                         * exist, where the emulator's own answer is another */
+	uint16_t dir,file,absent; /* the call failed with 2 or 3 and its name is a directory, a file,
+	                           * or nothing in a directory that exists */
+};
+
+static const DOS_PathAnswers DOS_PathCalls[]={
+	/*  AH  AL name wild space root current device no_parent dir file absent */
+	{0x3d,0,   2,   2,    2,   5,     5,     0,     0,     5,   0,   2},  /* open */
+	{0x3c,0,   2,   2,    0,   5,     5,     0,     0,     5,   0,   0},  /* create */
+	{0x41,0,   3,   3,    2,   5,     5,     5,     0,     2,   0,   2},  /* delete */
+	{0x43,0,   3,   3,    2,   0,     0,     0,     0,     0,   0,   2},  /* get attributes */
+	{0x43,1,   3,   3,    2,   5,     5,     5,     0,     0,   0,   2},  /* set attributes */
+	{0x3b,0,   3,   3,    3,   0,     0,     0,     0,     0,   0,   0},  /* change directory */
+	{0x39,0,   3,   3,    0,   5,     5,     5,     0,     5,   5,   0},  /* make a directory */
+	{0x3a,0,   3,  16,    3,   0,     0,     5,     0,     0,   5,   3},  /* remove a directory */
+	{0x56,0,   3,   3,    2,   2,    16,     5,     0,     0,   0,   2},  /* rename, the name renamed */
+	{0x56,1,   3,   3,    0,   5,     5,     5,     3,     5,   5,   0},  /* rename, the new name */
+};
+
+static const DOS_PathAnswers * DOS_PathAnswersOf(uint8_t ah,uint8_t al) {
+	if (ah==0x5b) ah=0x3c;
+	for (const DOS_PathAnswers & a : DOS_PathCalls)
+		if (a.ah==ah && a.al==al) return &a;
+	return NULL;
+}
+
+/* What MS-DOS answers to a program's path before the call reads a directory, long names off; 0
+ * lets the call go on. The call's row in DOS_PathCalls gives the answers that differ by call: a
+ * name an 8.3 entry cannot hold (a character such as " + ; [, a wildcard, two dots, no name
+ * before its dot, three dots or more, a leading space, nothing at all), a space inside a name
+ * (part of it in DOS, where the emulator's own path code drops it), the root, a device. The same
+ * for every call: a bad name in a directory's place, a climb above the root, a backslash that
+ * ends a path below the root, a space inside a directory's name and a device in a directory that
+ * does not exist are 3. A path that passes is packed as DOS packs each name (DOS_PathPack), and
+ * \DEV\<device> is left as the device's name. A network resource is the redirector's and passes
+ * untouched. late is set where the answer comes from what the path names rather than from how it
+ * is spelt: a trailing backslash, a space inside a name, and everything after the walk. */
+static uint16_t DOS_PathCheck(char * path,const DOS_PathAnswers * a,bool & late) {
+	late=false;
 #if !defined(OSFREE)
 # if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
 	if (Network_IsNetworkResource(path)) return 0;
@@ -775,7 +818,7 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 		drive=(p[0] | 0x20)-'a';
 		p+=2;
 	}
-	if (!*p) return bad_name;
+	if (!*p) return a->name;
 	if (drive>=DOS_DRIVES || !Drives[drive]) return 0;
 
 	int depth=0;
@@ -790,7 +833,7 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 			sep=false;
 		}
 	}
-	bool root=false, absent=false;
+	bool root=false, space=false;
 	lead=false;
 	for (const char * c=p, * start=p;;c++) {
 		if (lead) {
@@ -804,28 +847,32 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 		const size_t len=(size_t)(c-start);
 		if (!len) {
 			if (last && c>p) {
+				late=true;
 				if (depth>0) return DOSERR_PATH_NOT_FOUND;
 				root=true;
 			}
 		} else if (strspn(start,".")>=len) {
-			if (len>2) return last ? bad_name : DOSERR_PATH_NOT_FOUND;
+			if (len>2) return last ? a->name : DOSERR_PATH_NOT_FOUND;
 			if (len==2 && --depth<0) return DOSERR_PATH_NOT_FOUND;
 			root=depth==0;
 		} else {
 			size_t dots=0;
 			const char * dot=NULL;
-			bool bad=*start==' ', lead2=false;
+			bool bad=*start==' ', wild=false, lead2=false;
 			for (const char * d=start;d<c;d++) {
 				if (lead2) { lead2=false; continue; }
 				const uint8_t b=(uint8_t)*d;
 				if (DOS_PathLeadByte(b)) lead2=true;
 				else if (b=='.') { if (!dots++) dot=d; }
-				else if (strchr("\"+,;=[]|<>:*?",b)) bad=true;
+				else if (b=='*' || b=='?') wild=true;
+				else if (strchr("\"+,;=[]|<>:",b)) bad=true;
 			}
-			if (bad || dots>1 || dot==start) return last ? bad_name : DOSERR_PATH_NOT_FOUND;
+			if (bad || dots>1 || dot==start) return last ? a->name : DOSERR_PATH_NOT_FOUND;
+			if (wild) return last ? a->wildcard : DOSERR_PATH_NOT_FOUND;
 			if (memchr(start,' ',DOS_PathFieldLength(start,dot ? dot : c,8)) || (dot && memchr(dot+1,' ',DOS_PathFieldLength(dot+1,c,3)))) {
-				if (!last || chdir) return DOSERR_PATH_NOT_FOUND;
-				absent=true;
+				late=true;
+				if (!last) return DOSERR_PATH_NOT_FOUND;
+				space=true;
 			}
 			depth++;
 			root=false;
@@ -833,34 +880,78 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 		if (last) break;
 		start=c+1;
 	}
-	if (absent) return DOS_PathParent(path)==1 ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND;
+	late=true;
+	if (space) {
+		if (DOS_PathTarget(path,true)!=DOS_PATH_ABSENT) return DOSERR_PATH_NOT_FOUND;
+		if (a->space) return a->space;
+	}
 	DOS_PathPack(path);
+	if (root) return Drives[drive]->curdir[0] ? a->root : a->root_current;
 	/* \DEV\ in the root is where DOS finds every device, a directory of that name or not */
 	if ((p[0]=='\\' || p[0]=='/') && !strncasecmp(p+1,"DEV",3) && (p[4]=='\\' || p[4]=='/') && p[5] &&
-		!strpbrk(p+5,"\\/") && DOS_FindDevice(p+5)!=DOS_DEVICES) {
+		!strpbrk(p+5,"\\/") && DOS_FindDevice(p+5)!=DOS_DEVICES)
 		memmove(path,p+5,strlen(p+5)+1);
-		if (setattr) return DOSERR_ACCESS_DENIED;
-	}
 	/* A device is reached only through a directory that exists: DOS_FindDevice tests the
 	 * directory for NUL alone, and an open of D:\NOSUCH\CON would reach CON */
-	const bool device=DOS_FindDevice(path)!=DOS_DEVICES;
-	if (device && DOS_PathParent(path)==0) return DOSERR_PATH_NOT_FOUND;
-	if (setattr && (root || device)) return DOSERR_ACCESS_DENIED;
+	if (DOS_FindDevice(path)!=DOS_DEVICES) return DOS_PathTarget(path,true)==DOS_PATH_NO_PARENT ? DOSERR_PATH_NOT_FOUND : a->device;
+	if (a->no_parent && DOS_PathTarget(path,true)==DOS_PATH_NO_PARENT) return a->no_parent;
 	return 0;
 }
 
-/* After an open (AH=3Dh) or a get or set attributes (AH=43h) that found nothing, long names off:
- * MS-DOS answers 3 where the directory the name lies in does not exist and 2 where it does, the
- * path's dots and slashes resolved first, as DOS_MakeName resolves them */
-void DOS_PathNotFound(const char * path) {
+uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
+	const DOS_PathAnswers * const a=DOS_PathAnswersOf(ah,al);
+	bool late;
+	return a ? DOS_PathCheck(path,a,late) : 0;
+}
+
+/* A rename's two names, long names off, in the order MS-DOS reads them: how each is spelt, then
+ * whether both are on one drive (17), then what the name renamed is (2 where it does not exist,
+ * 3 where its directory does not), then what the new name points at */
+uint16_t DOS_PathRenameError(char * oldname,char * newname) {
+#if !defined(OSFREE)
+# if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+	if (Network_IsNetworkResource(oldname) || Network_IsNetworkResource(newname)) return 0;
+# endif
+#endif
+	bool old_late, new_late;
+	const uint16_t old_error=DOS_PathCheck(oldname,DOS_PathAnswersOf(0x56,0),old_late);
+	if (old_error && !old_late) return old_error;
+	const uint16_t new_error=DOS_PathCheck(newname,DOS_PathAnswersOf(0x56,1),new_late);
+	if (new_error && !new_late) return new_error;
+	char fullold[DOS_PATHLENGTH], fullnew[DOS_PATHLENGTH];
+	uint8_t driveold, drivenew;
+	if (!DOS_MakeName(oldname,fullold,&driveold) || !DOS_MakeName(newname,fullnew,&drivenew)) return 0;
+	if (driveold!=drivenew) return DOSERR_NOT_SAME_DEVICE;
+	if (old_error || !new_error) return old_error;
+	switch (DOS_PathTarget(oldname,false)) {
+		case DOS_PATH_NO_PARENT: return DOSERR_PATH_NOT_FOUND;
+		case DOS_PATH_ABSENT: return DOSERR_FILE_NOT_FOUND;
+		default: return new_error;
+	}
+}
+
+/* After a call DOS_PathCallError let through failed with 2 or 3, long names off: what MS-DOS
+ * answers by what the path names, its dots and slashes resolved first, as DOS_MakeName resolves
+ * them. 3 where the directory its last name lies in does not exist, else the call's row in
+ * DOS_PathCalls, the error left as it is where the row holds 0. */
+void DOS_PathCallFailed(const char * path,uint8_t ah,uint8_t al) {
 	if (dos.errorcode!=DOSERR_FILE_NOT_FOUND && dos.errorcode!=DOSERR_PATH_NOT_FOUND) return;
+	const DOS_PathAnswers * const a=DOS_PathAnswersOf(ah,al);
+	if (!a) return;
 #if !defined(OSFREE)
 # if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
 	if (Network_IsNetworkResource(path)) return;
 # endif
 #endif
-	const int parent=DOS_PathParent(path);
-	if (parent>=0) DOS_SetError(parent ? DOSERR_FILE_NOT_FOUND : DOSERR_PATH_NOT_FOUND);
+	uint16_t error=0;
+	switch (DOS_PathTarget(path,false)) {
+		case DOS_PATH_NO_PARENT: error=DOSERR_PATH_NOT_FOUND; break;
+		case DOS_PATH_ABSENT: error=a->absent; break;
+		case DOS_PATH_FILE: error=a->file; break;
+		case DOS_PATH_DIR: error=a->dir; break;
+		default: break;
+	}
+	if (error) DOS_SetError(error);
 }
 
 bool forcelfn = false;
