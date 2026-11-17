@@ -159,19 +159,21 @@ TEST_F(DOS_FilesTest, DOS_MakeName_CONVERTS_FWD_SLASH)
 	assert_DOS_MakeName("Z:/FOLDER/", true, "FOLDER", 25);
 	assert_DOS_MakeName("Z:/FOLDER/FILE", true, "FOLDER\\FILE", 25);}
 
-// spaces get stripped out before processing (\t, \r, etc, are illegal chars,
-// not whitespace)
+// with long file names off a space inside a name is part of it, as in DOS; each
+// name is packed into its eight and three characters, leading spaces and the
+// padding after each field dropped (\t, \r, etc, are illegal chars, not
+// whitespace)
 TEST_F(DOS_FilesTest, DOS_MakeName_STRIP_SPACE)
 {
 	bool oldlfn = uselfn;
 	uselfn = false;
 	safe_strcpy(Drives[25]->curdir, "");
 	assert_DOS_MakeName("Z:\\   A U T  OE X   EC     .BAT", true,
-	                    "AUTOEXEC.BAT", 25);
+	                    "A U T  O.BAT", 25);
 	assert_DOS_MakeName("Z: \\   A U T  OE X   EC     .BAT", true,
-	                    "AUTOEXEC.BAT", 25);
-	assert_DOS_MakeName("12345   678.123", true, "12345678.123", 25);
-	assert_DOS_MakeName("Z:\\\\A\\ B \\CDE\\ E F G\\", true, "A\\B\\CDE\\EFG", 25);
+	                    "A U T  O.BAT", 25);
+	assert_DOS_MakeName("12345   678.123", true, "12345.123", 25);
+	assert_DOS_MakeName("Z:\\\\A\\ B \\CDE\\ E F G\\", true, "A\\B\\CDE\\E F G", 25);
 	// except here, whitespace isn't stripped & causes failure
 	//assert_DOS_MakeName("Z :\\AUTOEXEC.BAT", false);
 	uselfn = oldlfn;
