@@ -1063,11 +1063,15 @@ bool DOS_Drive_Cache::FindFirst(char* path, uint16_t& id) {
             // Clear and reuse slot
             DeleteFileInfo(dirFindFirst[n]);
             dirFindFirst[n]=nullptr;
+            dirFindFirstDir[n] = SearchDir();
         }
 
     }
     dirFindFirst[dirFindFirstID] = new CFileInfo();
     dirFindFirst[dirFindFirstID]-> nextEntry    = 0;
+    // OpenDir left the directory's host path in dirPath.
+    dirFindFirstDir[dirFindFirstID] = SearchDir();
+    dirFindFirstDir[dirFindFirstID].path = dirPath;
 
     // Copy entries to use with FindNext
     for (Bitu i=0; i<dirSearch[dirID]->fileList.size(); i++) {
@@ -1097,8 +1101,52 @@ bool DOS_Drive_Cache::FindNext(uint16_t id, char* &result, char* &lresult) {
     if (!SetResult(dirFindFirst[id], result, lresult, dirFindFirst[id]->nextEntry)) {
         // free slot
         DeleteFileInfo(dirFindFirst[id]); dirFindFirst[id] = nullptr;
+        dirFindFirstDir[id] = SearchDir();
         return false;
     }
+    return true;
+}
+
+// DOS reads on in a search's directory by its place on the disk: under its new name once it is
+// renamed, and once it is removed in its freed cluster, which holds . and .. alone. So a rename
+// or a removal on the host moves the record of every search open in that directory or below it.
+static bool search_in(const std::string& searched, const char* dir, size_t len) {
+    return searched.size()>len && !searched.compare(0,len,dir) && searched[len]==CROSS_FILESPLIT;
+}
+
+void DOS_Drive_Cache::SearchesRenamed(const char* from, const char* to) {
+    const size_t len = strlen(from);
+    for (uint16_t i=0; i<MAX_OPENDIRS; i++) {
+        SearchDir& dir = dirFindFirstDir[i];
+        if (!dirFindFirst[i] || dir.state==SearchDir::REMOVED || !search_in(dir.path,from,len)) continue;
+        dir.path.replace(0,len,to);
+        dir.state = SearchDir::RENAMED;
+    }
+}
+
+// date and time are the removed directory's, which its . and .. carry from then on.
+void DOS_Drive_Cache::SearchesRemoved(const char* dir, uint16_t date, uint16_t time) {
+    const size_t len = strlen(dir);
+    for (uint16_t i=0; i<MAX_OPENDIRS; i++) {
+        SearchDir& found = dirFindFirstDir[i];
+        if (!dirFindFirst[i] || found.state==SearchDir::REMOVED || !search_in(found.path,dir,len)) continue;
+        found.state = SearchDir::REMOVED;
+        found.date = date;
+        found.time = time;
+    }
+}
+
+// The host path a search reads its directory by since a rename moved it; nullptr while the path
+// the search was given still names it, and for a removed one.
+const char* DOS_Drive_Cache::RenamedSearchDir(uint16_t id) {
+    if (id>=MAX_OPENDIRS || !dirFindFirst[id] || dirFindFirstDir[id].state!=SearchDir::RENAMED) return nullptr;
+    return dirFindFirstDir[id].path.c_str();
+}
+
+bool DOS_Drive_Cache::RemovedSearchDir(uint16_t id, uint16_t& date, uint16_t& time) {
+    if (id>=MAX_OPENDIRS || !dirFindFirst[id] || dirFindFirstDir[id].state!=SearchDir::REMOVED) return false;
+    date = dirFindFirstDir[id].date;
+    time = dirFindFirstDir[id].time;
     return true;
 }
 
