@@ -1910,6 +1910,13 @@ bool localDrive::FindFirst(const char * _dir,DOS_DTA & dta,bool fcb_findfirst) {
 
 char * DBCS_upcase(char * str);
 
+/* The folder mounted as the drive's root has "." and ".."; a DOS root has neither */
+bool localDrive::IsRootDotEntry(const char * dir_ent,const char * srch_dir) {
+	if ((strcmp(dir_ent,".") && strcmp(dir_ent,"..")) || (isRemote() && isRemovable())) return false;
+	const size_t baselen=strlen(basedir);
+	return strlen(srch_dir)==baselen+(check_last_split_char(basedir,baselen,CROSS_FILESPLIT)?0:1);
+}
+
 bool localDrive::FindNext(DOS_DTA & dta) {
 
 	char * dir_ent, *ldir_ent;
@@ -1937,11 +1944,7 @@ again:
 	if(!WildFileCmp(dir_ent,srch_pattern)&&!LWildFileCmp(ldir_ent,srch_pattern)) goto again;
 
 	strcpy(full_name,lfn_filefind_handle>=LFN_FILEFIND_MAX?srchInfo[id].srch_dir:(ldir[lfn_filefind_handle]!=""?ldir[lfn_filefind_handle].c_str():"\\"));
-	/* The folder mounted as the drive's root has "." and ".."; a DOS root has neither */
-	if ((!strcmp(dir_ent,".") || !strcmp(dir_ent,"..")) && !(this->isRemote() && this->isRemovable())) {
-		const size_t baselen=strlen(basedir);
-		if (strlen(full_name)==baselen+(check_last_split_char(basedir,baselen,CROSS_FILESPLIT)?0:1)) goto again;
-	}
+	if (IsRootDotEntry(dir_ent,full_name)) goto again;
 	strcpy(lfull_name,full_name);
 
 	strcat(full_name,dir_ent);

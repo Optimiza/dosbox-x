@@ -125,6 +125,7 @@ private:
 protected:
 	DOS_Drive_Cache dirCache;
 	char basedir[CROSS_LEN];
+	bool IsRootDotEntry(const char * dir_ent,const char * srch_dir);
 	friend void DOS_Shell::CMD_SUBST(char* args); 	
 	struct {
 		char srch_dir[CROSS_LEN];
