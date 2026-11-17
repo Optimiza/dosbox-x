@@ -906,6 +906,27 @@ uint16_t DOS_PathCallError(char * path,uint8_t ah,uint8_t al) {
 	return a ? DOS_PathCheck(path,a,late) : 0;
 }
 
+/* 4301h, long names off, as MS-DOS reads it: how the path is spelt, then an attribute that is not
+ * read-only, hidden, system or archive (5, whether the file exists or not), then the rest.
+ * DOS_SetFileAttr instead keeps the directory bit as it was and succeeds, the guard against
+ * Windows 95's setup turning WINBOOT.INI into a directory on a FAT image; MS-DOS refuses that
+ * call, and the setup is made to run on MS-DOS. */
+uint16_t DOS_PathSetAttrError(char * path,uint16_t attr) {
+#if !defined(OSFREE)
+# if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+	if (Network_IsNetworkResource(path)) return 0;
+# endif
+#endif
+	bool late;
+	const uint16_t error=DOS_PathCheck(path,DOS_PathAnswersOf(0x43,1),late);
+	if (error && !late) return error;
+	/* a drive that does not exist is the call's answer, 3, as for any other attribute */
+	const uint8_t drive=(path[0] && path[1]==':') ? (uint8_t)((path[0] | 0x20)-'a') : DOS_GetDefaultDrive();
+	if (drive>=DOS_DRIVES || !Drives[drive]) return 0;
+	if (attr & ~(DOS_ATTR_READ_ONLY|DOS_ATTR_HIDDEN|DOS_ATTR_SYSTEM|DOS_ATTR_ARCHIVE)) return DOSERR_ACCESS_DENIED;
+	return error;
+}
+
 /* A rename's two names, long names off, in the order MS-DOS reads them: how each is spelt, then
  * whether both are on one drive (17), then what the name renamed is (2 where it does not exist,
  * 3 where its directory does not), then what the new name points at */
