@@ -899,16 +899,18 @@ bool fatDrive::getEntryName(const char *fullname, char *entname) {
 	}
 	int j=0;
 	bool lead = false;
-	/* A space inside a name is part of it, as DOS makes F OO.TXT: DOS_MakeName keeps only those */
+	/* Spaces stay as DOS_MakeName left them: DOS makes F OO.TXT with its space, and a long-name
+	 * call keeps every space inside its quotes, so the name can pass 12 bytes */
 	for (int i=0; i<(int)strlen(findFile); i++) {
 		if (findFile[i]!='"'&&findFile[i]!='+'&&findFile[i]!='='&&findFile[i]!=','&&findFile[i]!=';'&&findFile[i]!=':'&&findFile[i]!='<'&&findFile[i]!='>'&&!((findFile[i]=='['||findFile[i]==']'||findFile[i]=='|'||findFile[i]=='\\')&&(!lead||((dos.loaded_codepage==936||IS_PDOSV)&&!gbk)))&&findFile[i]!='?'&&findFile[i]!='*') findFile[j++]=findFile[i];
 		if (lead) lead = false;
 		else if ((IS_PC98_ARCH && shiftjis_lead_byte(findFile[i]&0xFF)) || (isDBCSCP() && isKanji1_gbk(findFile[i]&0xFF))) lead = true;
 	}
 	findFile[j]=0;
-	if (strlen(findFile)>12)
+	if (strlen(findFile)>12) {
 		strncpy(entname, DBCS_upcase(findFile), 12);
-	else
+		entname[12]=0;
+	} else
 		strcpy(entname, DBCS_upcase(findFile));
 	return true;
 }
