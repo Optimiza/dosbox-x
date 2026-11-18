@@ -513,7 +513,8 @@ bool DOS_MakeName(char const * const name,char * const fullname,uint8_t * drive)
         }
 	}
 	while (r>0 && name_int[r-1]==' ') r--;
-	if (r>=DOS_PATHLENGTH) { DOS_SetError(DOSERR_PATH_NOT_FOUND);return false; }
+	/* w as well as r: a trailing space is kept in upname but trimmed from r */
+	if (r>=DOS_PATHLENGTH || w>=DOS_PATHLENGTH) { DOS_SetError(DOSERR_PATH_NOT_FOUND);return false; }
 	upname[w]=0;
 
 	/* Now parse the new file name to make the final filename */
