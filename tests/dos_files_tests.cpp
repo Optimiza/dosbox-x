@@ -176,6 +176,11 @@ TEST_F(DOS_FilesTest, DOS_MakeName_STRIP_SPACE)
 	assert_DOS_MakeName("Z:\\\\A\\ B \\CDE\\ E F G\\", true, "A\\B\\CDE\\E F G", 25);
 	// except here, whitespace isn't stripped & causes failure
 	//assert_DOS_MakeName("Z :\\AUTOEXEC.BAT", false);
+	// a kept trailing space must not take the path past DOS_PATHLENGTH
+	const std::string spaced_long = "Z:\\" + std::string(DOS_PATHLENGTH - 2, 'A') + " ";
+	dos.errorcode = DOSERR_NONE;
+	assert_DOS_MakeName(spaced_long.c_str(), false);
+	EXPECT_EQ(dos.errorcode, DOSERR_PATH_NOT_FOUND);
 	uselfn = oldlfn;
 }
 
