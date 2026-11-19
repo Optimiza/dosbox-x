@@ -18,6 +18,8 @@
 
 
 #include <string.h>
+#include <deque>
+#include <map>
 #include <stdlib.h>
 #include <time.h>
 #include <ctype.h>
@@ -196,6 +198,150 @@ int sdrive = 0;
  * internally by LFN and image handling functions. For non-LFN calls the value is fixed to
  * be LFN_FILEFIND_NONE as defined in drives.h. */
 int lfn_filefind_handle = LFN_FILEFIND_NONE;
+
+// A search owns a snapshot in the drive cache. Track it by DOS DTA (classic
+// FindFirst) or DOS LFN search handle so abandoning an iteration releases it.
+struct ActiveFindSnapshot {
+    uint8_t drive;
+    uint16_t id;
+    uint32_t generation;
+    DOS_Drive * instance;
+    uint16_t psp;
+    bool dta_wildcards;
+};
+
+static std::map<uint64_t, ActiveFindSnapshot> active_dta_finds;
+// DOS keeps the whole state of a 4Eh search in the DTA, so a program may save those
+// bytes, run other searches through the same DTA and put them back, as a directory
+// walk or a DOS extender relaying its DTA does. A search with wildcards that another
+// FindFirst through its DTA replaced is kept; past this many, the one read least recently goes.
+static const size_t KEPT_SEARCHES_PER_DTA = 8;
+static std::map<uint64_t, std::deque<ActiveFindSnapshot>> kept_dta_finds;
+static std::map<uint8_t, ActiveFindSnapshot> active_lfn_finds;
+
+static uint64_t FindDtaKey() {
+    return (static_cast<uint64_t>(dos.psp()) << 32) |
+           static_cast<uint64_t>(dos.dta());
+}
+
+static void ReleaseFindSnapshot(const ActiveFindSnapshot & snapshot) {
+    if (snapshot.drive < DOS_DRIVES &&
+        Drives[snapshot.drive] == snapshot.instance)
+        snapshot.instance->FindClose(snapshot.id, snapshot.generation);
+}
+
+void DOS_CloseFindSnapshot(uint8_t handle) {
+    auto found = active_lfn_finds.find(handle);
+    if (found == active_lfn_finds.end())
+        return;
+    ReleaseFindSnapshot(found->second);
+    active_lfn_finds.erase(found);
+}
+
+template <typename Key>
+static void CloseFindSnapshotsForPSP(std::map<Key, ActiveFindSnapshot> & finds, uint16_t psp) {
+    for (auto it = finds.begin(); it != finds.end(); ) {
+        if (it->second.psp == psp && !it->second.dta_wildcards) {
+            ReleaseFindSnapshot(it->second);
+            it = finds.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Release searches owned by a DOS program when it terminates, but not a 4Eh search
+// with wildcards: its parent may go on with it through the DTA bytes it was given.
+// TSR processes are deliberately excluded by the caller.
+void DOS_CloseFindSnapshotsForPSP(uint16_t psp) {
+    CloseFindSnapshotsForPSP(active_dta_finds, psp);
+    CloseFindSnapshotsForPSP(active_lfn_finds, psp);
+}
+
+static void ReplaceCurrentFindSnapshot() {
+    if (lfn_filefind_handle < LFN_FILEFIND_MAX) {
+        DOS_CloseFindSnapshot(static_cast<uint8_t>(lfn_filefind_handle));
+        return;
+    }
+    const auto key = FindDtaKey();
+    auto found = active_dta_finds.find(key);
+    if (found == active_dta_finds.end())
+        return;
+    if (found->second.dta_wildcards) {
+        auto & kept = kept_dta_finds[key];
+        if (kept.size() == KEPT_SEARCHES_PER_DTA) {
+            ReleaseFindSnapshot(kept.front());
+            kept.pop_front();
+        }
+        kept.push_back(found->second);
+    } else {
+        ReleaseFindSnapshot(found->second);
+    }
+    active_dta_finds.erase(found);
+}
+
+static bool NamesSearch(const ActiveFindSnapshot & snapshot, uint8_t drive, DOS_DTA & dta) {
+    return snapshot.drive == drive && snapshot.id == dta.GetDirID();
+}
+
+static std::deque<ActiveFindSnapshot>::iterator FindKeptSearch(std::deque<ActiveFindSnapshot> & kept, uint8_t drive, DOS_DTA & dta) {
+    return std::find_if(kept.begin(), kept.end(),
+        [&](const ActiveFindSnapshot & snapshot) { return NamesSearch(snapshot, drive, dta); });
+}
+
+// A kept search read through its DTA is the last its DTA gives up.
+static void ReadCurrentFindSnapshot(uint8_t drive, DOS_DTA & dta) {
+    if (lfn_filefind_handle < LFN_FILEFIND_MAX)
+        return;
+    auto kept = kept_dta_finds.find(FindDtaKey());
+    if (kept == kept_dta_finds.end())
+        return;
+    auto found = FindKeptSearch(kept->second, drive, dta);
+    if (found == kept->second.end())
+        return;
+    const ActiveFindSnapshot snapshot = *found;
+    kept->second.erase(found);
+    kept->second.push_back(snapshot);
+}
+
+static void ForgetCurrentFindSnapshot(uint8_t drive, DOS_DTA & dta) {
+    if (lfn_filefind_handle < LFN_FILEFIND_MAX) {
+        active_lfn_finds.erase(static_cast<uint8_t>(lfn_filefind_handle));
+        return;
+    }
+    // A search may end through another DTA its bytes were copied to, as DJGPP's findnext does.
+    for (auto found = active_dta_finds.begin(); found != active_dta_finds.end(); ++found) {
+        if (NamesSearch(found->second, drive, dta)) {
+            active_dta_finds.erase(found);
+            return;
+        }
+    }
+    for (auto kept = kept_dta_finds.begin(); kept != kept_dta_finds.end(); ++kept) {
+        auto ended = FindKeptSearch(kept->second, drive, dta);
+        if (ended != kept->second.end()) {
+            kept->second.erase(ended);
+            if (kept->second.empty())
+                kept_dta_finds.erase(kept);
+            return;
+        }
+    }
+}
+
+static void RememberCurrentFindSnapshot(uint8_t drive, DOS_DTA & dta, bool wildcards) {
+    if (drive >= DOS_DRIVES || !Drives[drive])
+        return;
+    uint16_t id = MAX_OPENDIRS;
+    uint32_t generation = 0;
+    if (!Drives[drive]->GetFindCacheID(dta, id, generation))
+        return;
+    const bool lfn = lfn_filefind_handle < LFN_FILEFIND_MAX;
+    const ActiveFindSnapshot snapshot = { drive, id, generation, Drives[drive], dos.psp(), wildcards && !lfn };
+    if (lfn)
+        active_lfn_finds[static_cast<uint8_t>(lfn_filefind_handle)] = snapshot;
+    else
+        active_dta_finds[FindDtaKey()] = snapshot;
+}
+
 bool isDBCSCP(), isKanji1(uint8_t chr), shiftjis_lead_byte(int c);
 
 bool DOS_GetFileAttrEx(char const* const name, struct stat *status, uint8_t hdrive)
@@ -689,6 +835,7 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
 
 bool forcelfn = false;
 bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
+	ReplaceCurrentFindSnapshot();
 	LOG(LOG_FILES,LOG_NORMAL)("file search attributes %X name %s",attr,search);
 	DOS_DTA dta(dos.dta());
 	uint8_t drive;char fullsearch[DOS_PATHLENGTH];
@@ -779,7 +926,10 @@ bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 	if (net) return Network_FindFirst(dir,dta);
 #endif
 #endif
-	if (Drives[drive]->FindFirst(dir,dta,fcb_findfirst)) return true;
+	if (Drives[drive]->FindFirst(dir,dta,fcb_findfirst)) {
+		RememberCurrentFindSnapshot(drive, dta, strpbrk(pattern, "*?") != NULL);
+		return true;
+	}
 	return false;
 }
 
@@ -799,8 +949,12 @@ bool DOS_FindNext(void) {
 	if (pos==65534) return Network_FindNext(dta);
  #endif
 #endif
-	if (Drives[i]->FindNext(dta)) return true;
-	return false;
+	const bool found = Drives[i]->FindNext(dta);
+	if (found)
+		ReadCurrentFindSnapshot(i, dta);
+	else
+		ForgetCurrentFindSnapshot(i, dta);
+	return found;
 }
 
 
