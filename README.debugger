@@ -305,12 +305,20 @@ glide is drawing only: the guest's pointer is where the driver says at once.
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
 
-  PRESENCE held frames=1234 pointer=1 output=640x400x32
+  PRESENCE held frames=1234 pointer=1 output=640x400x32 px_read=51245 px_written=51744
+           bytes_presented=1026560
 
-`frames` counts the frames presented with the overlay drawn, and `output` is
+(one line). `frames` counts the frames the overlay was drawn on, and `output` is
 the output it is drawn on: `none` while there is no output yet, `undrawable`
 for one it cannot draw on (an 8-bit output, or the TrueType output while it
-shows text; its graphics modes are drawn on like any other). An unknown state or
+shows text; its graphics modes are drawn on like any other). On an output it
+draws on, three counters say what drawing it has cost since that output was
+made (they start again at 0 when the output changes size or format, and
+`frames` does not), the same on any host: `px_read` the output pixels it read (the ones it
+saves before drawing and the ones it blends onto), `px_written` the output
+pixels it wrote (put back, blended or painted), and `bytes_presented` the bytes
+of the rows it handed on to be presented, the scaler's own rows included. Two
+replies with the same `output` give the cost between them. An unknown state or
 key, or a value out of its range, answers ERR naming it and changes nothing;
 the response ends with that reason alone. The arguments keep their case.
 

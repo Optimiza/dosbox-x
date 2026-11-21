@@ -181,6 +181,7 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt) {
     presented_ = Key();
     glide_ = Glide();
     full_.assign({0, (uint16_t)std::min(height, 65535u)});
+    cost_ = Cost();
 }
 
 void Overlay::Guest(unsigned width, unsigned height) {
@@ -297,7 +298,7 @@ uint32_t Overlay::Blend(uint32_t under, const uint32_t c8[3], int alpha256) cons
     return v;
 }
 
-void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
+void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key, Cost &cost) const {
     const unsigned bytes = fmt_.bytes;
     const int w = (int)width_, h = (int)height_, band = Band();
     const int a = key.alpha * 256 / ALPHA_LEVELS;
@@ -311,6 +312,8 @@ void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
             const int d = std::min(std::min(x, w - 1 - x), std::min(y, h - 1 - y));
             uint8_t *p = out + (size_t)x * bytes;
             WritePixel(p, bytes, Blend(ReadPixel(p, bytes), c8, alpha_at[(size_t)d]));
+            cost.read++;
+            cost.written++;
         };
         if (y < band || y >= h - band) {
             for (int x = 0; x < w; x++) shade(x);
@@ -327,8 +330,10 @@ void Overlay::Draw(uint8_t *buf, size_t pitch, const Key &key) const {
             if (line[c] == '.') continue;
             const uint32_t px = line[c] == 'X' ? outline : fill;
             for (int y = key.ay + CellEdge(scale_y_, r); y < key.ay + CellEdge(scale_y_, r + 1) && y < h; y++)
-                for (int x = key.ax + CellEdge(scale_x_, c); x < key.ax + CellEdge(scale_x_, c + 1) && x < w; x++)
+                for (int x = key.ax + CellEdge(scale_x_, c); x < key.ax + CellEdge(scale_x_, c + 1) && x < w; x++) {
                     WritePixel(buf + (size_t)y * pitch + (size_t)x * bytes, bytes, px);
+                    cost.written++;
+                }
         }
     }
 }
@@ -343,6 +348,7 @@ void Overlay::Undraw(uint8_t *buf, size_t pitch) {
         if (n == 0) continue;
         at -= n;
         std::memcpy(buf + (size_t)s->y * pitch + (size_t)s->x0 * bytes, &under_[at], n);
+        cost_.written += s->x1 - s->x0;
     }
     drawn_ = false;
 }
@@ -361,23 +367,42 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
         for (const auto &s : covered_) {
             const uint8_t *p = buf + (size_t)s.y * pitch + (size_t)s.x0 * bytes;
             under_.insert(under_.end(), p, p + (size_t)(s.x1 - s.x0) * bytes);
+            cost_.read += s.x1 - s.x0;
         }
-        Draw(buf, pitch, key);
+        Draw(buf, pitch, key, cost_);
         drawn_ = true;
         frames_++;
     }
     if (shown) presented_ = key;
-    return moved ? full_.data() : changed;
+    const uint16_t *runs = moved ? full_.data() : changed;
+    if (shown) cost_.presented += RunBytes(runs);
+    return runs;
+}
+
+/* Walked as the outputs walk them: unchanged and changed counts in turn until the frame's height. */
+uint64_t Overlay::RunBytes(const uint16_t *runs) const {
+    if (runs == nullptr) return 0;
+    uint64_t rows = 0;
+    unsigned y = 0;
+    for (size_t i = 0; y < height_; i++) {
+        const unsigned n = std::min((unsigned)runs[i], height_ - y);
+        if (i & 1) rows += n;
+        y += n;
+    }
+    return rows * width_ * fmt_.bytes;
 }
 
 std::string Overlay::Describe(bool with_version) const {
-    char line[160];
+    char line[256];
     /* `none` while there is no output yet, `undrawable` for one it cannot draw
        on (8-bit, TrueType text): a client tells "not yet" from "never here" */
     if (drawable())
-        std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%ux%ux%u",
+        std::snprintf(line, sizeof(line),
+                      "PRESENCE %s frames=%llu pointer=%d output=%ux%ux%u px_read=%llu"
+                      " px_written=%llu bytes_presented=%llu",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0, width_,
-                      height_, fmt_.bytes * 8u);
+                      height_, fmt_.bytes * 8u, (unsigned long long)cost_.read,
+                      (unsigned long long)cost_.written, (unsigned long long)cost_.presented);
     else
         std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=%s",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0,

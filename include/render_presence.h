@@ -62,6 +62,16 @@ struct Format {
 bool FormatFromPixels(unsigned bytes, uint32_t black, uint32_t r, uint32_t g, uint32_t b,
                       Format &out);
 
+/* What drawing the overlay has cost, counted since the output was made: the output pixels it read
+   (the pixels it saves, the ones it blends onto), the output pixels it wrote (put back, blended,
+   painted) and the bytes of the rows it handed on to be presented. Pixels and bytes, so the same
+   on any host. */
+struct Cost {
+    uint64_t read = 0;
+    uint64_t written = 0;
+    uint64_t presented = 0;
+};
+
 class Overlay {
 public:
     /* "<off|held|acting> [key=value ...]": the state, the look and whether the
@@ -97,6 +107,7 @@ public:
     State state() const { return state_; }
     bool drawn() const { return drawn_; }
     uint64_t frames() const { return frames_; }
+    const Cost &cost() const { return cost_; }
     bool drawable() const { return fmt_.bytes != 0 && width_ != 0 && height_ != 0; }
     /* One line for the channel's reply. */
     std::string Describe(bool with_version = false) const;
@@ -126,7 +137,9 @@ private:
     static float GuestPixel(float fraction, unsigned guest_pixels);
     static int CellEdge(float scale, size_t i) { return (int)std::lround(scale * (float)i); }
     std::vector<Span> Covered(const Key &key) const;
-    void Draw(uint8_t *buf, size_t pitch, const Key &key) const;
+    void Draw(uint8_t *buf, size_t pitch, const Key &key, Cost &cost) const;
+    /* The bytes of the rows the line runs `runs` present (nullptr presents nothing). */
+    uint64_t RunBytes(const uint16_t *runs) const;
     uint32_t Blend(uint32_t under, const uint32_t c8[3], int alpha256) const;
     uint32_t Pixel(uint32_t rgb) const;
 
@@ -150,6 +163,7 @@ private:
     Key presented_;                  /* what the screen was last shown */
     std::vector<uint16_t> full_;     /* the line runs of a whole frame */
     uint64_t frames_ = 0;
+    Cost cost_;
     /* the arrow's glide: from where it was drawn to the pointer, since when.
        Mutable because asking where the arrow is is what moves it on. */
     struct Glide {

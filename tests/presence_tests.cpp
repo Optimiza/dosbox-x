@@ -4,11 +4,15 @@
  *  on the inner sides only, taken off before the scaler writes and drawn anew
  *  after, so a scaler that rewrites part of a line never gets the overlay
  *  blended onto itself; restored when turned off; and an arrow at the guest's
- *  pointer.
+ *  pointer. The cost cases print the baseline the overlay's redesign is judged against.
  */
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
@@ -344,6 +348,7 @@ TEST(Presence, AFrameDrawnButNeverShownIsDrawnAgain) {
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0, false);
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0)) << "an aborted frame showed nothing";
+    EXPECT_EQ(o.cost().presented, 0u) << "and presented nothing";
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0));
 }
@@ -362,6 +367,155 @@ TEST(Presence, TheSameLookSentAgainIsNotANewOne) {
     EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0)) << "an unchanged look repaints the whole frame";
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook + " rgb=00FF00", error, 0));
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0));
+}
+
+/* The look and the arrow the DOSBox-X server sends, so the baseline prices what a session draws. */
+const char *const kSessionLook =
+    " rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283 fade=2.5 outline=2A1400 glide=0"
+    " pointer=1 sprite=XX........./XoX......../XooX......./XoooX....../XooooX...../XoooooX...."
+    "/XooooooX.../XoooooooX../XooooooooX./XoooooXXXXX/XooXooX..../XoXXXooX.../XX..XooX..."
+    "/.....XooX../.....XooX../......XX...";
+
+struct Output { unsigned w, h; };
+/* Mode 13h doubled, and the same picture on a large window. */
+const Output kOutputs[] = {{640, 400}, {1920, 1200}};
+const unsigned kGuestW = 320, kGuestH = 200;
+
+/* What one frame of a case costs, worked out from the geometry, not from the overlay's code. */
+struct Expected {
+    uint64_t edge, arrow_box, arrow_ink;
+    Expected(const Output &out) {
+        const unsigned band = (unsigned)std::lround(0.025 * std::min(out.w, out.h));
+        edge = (uint64_t)out.w * out.h - (uint64_t)(out.w - 2 * band) * (out.h - 2 * band);
+        const unsigned sx = out.w / kGuestW, sy = out.h / kGuestH;
+        arrow_box = 11ull * sx * 16ull * sy;
+        uint64_t ink = 0;
+        for (const char *c = std::strstr(kSessionLook, "sprite=") + 7; *c; c++) ink += *c == 'X' || *c == 'o';
+        arrow_ink = ink * sx * sy;
+    }
+    /* undraw what was covered, save it again, blend the edge, paint the arrow */
+    uint64_t read() const { return edge + arrow_box + edge; }
+    uint64_t written() const { return edge + arrow_box + edge + arrow_ink; }
+};
+
+presence::Cost Delta(const presence::Cost &after, const presence::Cost &before) {
+    presence::Cost d;
+    d.read = after.read - before.read;
+    d.written = after.written - before.written;
+    d.presented = after.presented - before.presented;
+    return d;
+}
+
+void Print(const char *name, const Output &out, uint64_t frames, const presence::Cost &c) {
+    std::printf("[presence-baseline] case=%-7s output=%ux%u frames=%llu px_read=%llu"
+                " px_written=%llu bytes_presented=%llu\n",
+                name, out.w, out.h, (unsigned long long)frames, (unsigned long long)c.read,
+                (unsigned long long)c.written, (unsigned long long)c.presented);
+}
+
+/* An overlay on a session's output with the arrow mid-picture, its first frame already shown. */
+struct Session {
+    Overlay o;
+    Frame frame;
+    explicit Session(const Output &out, const char *state = "held") : frame(out.w, out.h, 0x00204060u) {
+        std::string error;
+        EXPECT_TRUE(o.Configure(std::string(state) + kSessionLook, error, 0)) << error;
+        const Format f = Rgb32();
+        o.Resize(out.w, out.h, &f);
+        o.Guest(kGuestW, kGuestH);
+        o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+    }
+    /* A running guest's frame: the scaler takes the overlay off, rewrites one line, and it is drawn. */
+    presence::Cost Running(uint32_t now_ms, float fx, float fy) {
+        const presence::Cost before = o.cost();
+        o.Undraw(frame.buf(), frame.pitch());
+        const uint16_t one_line[] = {100, 1, (uint16_t)(frame.h - 101)};
+        o.Compose(frame.buf(), frame.pitch(), one_line, now_ms, true, fx, fy);
+        return Delta(o.cost(), before);
+    }
+};
+
+TEST(PresenceCost, TheReplyCarriesTheCounters) {
+    Session s(kOutputs[0]);
+    const presence::Cost &c = s.o.cost();
+    const std::string line = s.o.Describe();
+    EXPECT_NE(line.find(" px_read=" + std::to_string(c.read) + " "), std::string::npos) << line;
+    EXPECT_NE(line.find(" px_written=" + std::to_string(c.written) + " "), std::string::npos) << line;
+    EXPECT_NE(line.find(" bytes_presented=" + std::to_string(c.presented)), std::string::npos) << line;
+    EXPECT_GT(c.presented, 0u);
+    const Format f = Rgb32();
+    s.o.Resize(640, 400, &f);
+    EXPECT_EQ(s.o.cost().read + s.o.cost().written + s.o.cost().presented, 0u)
+        << "a new output starts its own count";
+}
+
+TEST(PresenceCost, AStillOverlayOnARunningGameIsTakenOffAndDrawnAgainEveryFrame) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        const presence::Cost c = s.Running(0, 0.5f, 0.5f);
+        Print("still", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read, e.read());
+        EXPECT_EQ(c.written, e.written());
+        EXPECT_EQ(c.presented, 1ull * out.w * 4) << "only the scaler's line";
+    }
+}
+
+TEST(PresenceCost, AFadeFramePresentsTheWholeFrame) {
+    for (const Output &out : kOutputs) {
+        Session s(out, "acting");
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost c = s.Running(1250, 0.5f, 0.5f);
+        Print("fade", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read, e.read());
+        EXPECT_EQ(c.written, e.written());
+        EXPECT_EQ(c.presented, (uint64_t)out.w * out.h * 4);
+    }
+}
+
+TEST(PresenceCost, AMovingArrowPresentsTheWholeFrame) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        const presence::Cost c = s.Running(0, 0.5f + 1.0f / kGuestW, 0.5f);
+        Print("arrow", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read, e.read());
+        EXPECT_EQ(c.written, e.written());
+        EXPECT_EQ(c.presented, (uint64_t)out.w * out.h * 4);
+    }
+}
+
+TEST(PresenceCost, ThereIsNoCaptionToChangeYet) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        std::string error;
+        EXPECT_FALSE(s.o.Configure("held caption=start", error, 0)) << "a caption layer exists now";
+    }
+}
+
+TEST(PresenceCost, AParkedFadeRepaintsTheWholeFrameAtEveryAlphaStep) {
+    for (const Output &out : kOutputs) {
+        Session s(out, "acting");
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop ticks once a millisecond */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(s.frame.buf(), s.frame.pitch(), nullptr, ms, true, 0.5f, 0.5f);
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("parked", out, repaints, c);
+        /* the state's own change, then one alpha level at a time from acting's 54 to held's 18 */
+        EXPECT_EQ(repaints, 1u + (54u - 18u));
+        const Expected e(out);
+        EXPECT_EQ(c.read, repaints * e.read());
+        EXPECT_EQ(c.written, repaints * e.written());
+        EXPECT_EQ(c.presented, repaints * out.w * out.h * 4);
+    }
 }
 
 } /* namespace */
