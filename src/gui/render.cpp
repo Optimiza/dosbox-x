@@ -279,6 +279,29 @@ cacheMiss:
     return false;
 }
 
+/* Where the output buffer the scaler writes this frame begins: the scaler moves
+   `render.scale.outWrite` down it line by line, so it is kept here for the presence
+   overlay, taken off it before the scaler writes and drawn over it once the frame is
+   complete. */
+static uint8_t *presence_base = nullptr;
+
+/* The presence overlay leaves the rows of a line the scaler is about to write: the scaler
+   rewrites only the blocks that changed, so the rest of the row would keep the overlay and get
+   it blended on again. A line equal to its cache is not written and keeps it. The compare is
+   the scaler's own, every byte of the line: the start handler's word compare stops short of a
+   tail narrower than a word, which the scaler still writes. The complex scalers write a line
+   late and had every row taken off at the frame's start. */
+static inline void RENDER_PresenceUndrawLine(const void *s, bool writes_whole_line) {
+    if (useTraditionalRenderCache || s == nullptr || !PRESENCE_Drawn())
+        return;
+    const size_t line_bytes = (size_t)render.src.width *
+        (render.src.bpp == 32 ? 4u : render.src.bpp == 15 || render.src.bpp == 16 ? 2u : 1u);
+    if (!writes_whole_line && memcmp(s, render.scale.cacheRead, line_bytes) == 0)
+        return;
+    PRESENCE_UndrawRows((unsigned)((render.scale.outWrite - presence_base) / render.scale.outPitch),
+                        (unsigned)Scaler_Aspect[render.scale.outLine]);
+}
+
 #if defined(C_SCALER_FULL_LINE)
 static unsigned int RENDER_scaler_countdown = 0;
 static const unsigned int RENDER_scaler_countdown_init = 12;
@@ -314,6 +337,7 @@ static void RENDER_DrawLine_countdown(const void * s) {
     if (render.disablerender)
         return;
 
+    RENDER_PresenceUndrawLine(s, true);
     render.scale.lineHandler(s);
     if (--RENDER_scaler_countdown == 0)
         RENDER_DrawLine = RENDER_DrawLine_countdown_wait;
@@ -322,6 +346,7 @@ static void RENDER_DrawLine_countdown(const void * s) {
 
 static void RENDER_ScalerLineHandler(const void * s) {
 	if (render.scale.outLine < render.src.height) {
+		RENDER_PresenceUndrawLine(s, false);
 		render.scale.lineHandler(s);
 	}
 	else {
@@ -332,12 +357,6 @@ static void RENDER_ScalerLineHandler(const void * s) {
 }
 
 void D3D11_DrawLine_8bpp(const void* src);
-
-/* Where the output buffer the scaler writes this frame begins: the scaler moves
-   `render.scale.outWrite` down it line by line, so it is kept here for the presence
-   overlay, taken off it before the scaler writes and drawn over it once the frame is
-   complete. */
-static uint8_t *presence_base = nullptr;
 
 static void RENDER_StartLineHandler(const void * s) {
     if (render.disablerender)
@@ -355,7 +374,7 @@ static void RENDER_StartLineHandler(const void * s) {
             return;
         }
         presence_base = render.scale.outWrite;
-        PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
+        PRESENCE_BeginFrame(presence_base, render.scale.outPitch, useTraditionalRenderCache);
         render.scale.outWrite += render.scale.outPitch * Scaler_ChangedLines[0];
 #if defined(C_SCALER_FULL_LINE)
         RENDER_scaler_countdown = RENDER_scaler_countdown_init;
@@ -440,7 +459,7 @@ bool RENDER_StartUpdate(void) {
         if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
             return false;
         presence_base = render.scale.outWrite;
-        PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
+        PRESENCE_BeginFrame(presence_base, render.scale.outPitch, true);
         render.fullFrame = true;
         vga.draw.must_complete_frame = true;
         RENDER_DrawLine = RENDER_ClearCacheHandler;
@@ -450,7 +469,7 @@ bool RENDER_StartUpdate(void) {
             if (GCC_UNLIKELY(!GFX_StartUpdate( render.scale.outWrite, render.scale.outPitch )))
                 return false;
             presence_base = render.scale.outWrite;
-            PRESENCE_BeginFrame(presence_base, render.scale.outPitch);
+            PRESENCE_BeginFrame(presence_base, render.scale.outPitch, true);
             RENDER_DrawLine = render.scale.linePalHandler;
             vga.draw.must_complete_frame = true;
             render.fullFrame = true;
@@ -616,7 +635,7 @@ void RENDER_Reset( void ) {
 
 	if (width == 0 || height == 0) {
 		render.disablerender = true;
-		PRESENCE_OutputChanged(0, 0, 0);
+		PRESENCE_OutputChanged(0, 0, 0, false);
 		return;
 	}
 
@@ -970,10 +989,21 @@ forcenormal:
 #else
 	const bool ttf_text = false;
 #endif
+	/* the outputs that present a rectangle of the frame, not only whole rows; xBRZ rescales
+	   whole rows and a pixel buffer object uploads the whole frame */
+	bool presence_columns = sdl.desktop.type == SCREEN_SURFACE;
+#if C_OPENGL
+	presence_columns = presence_columns ||
+	                   (sdl.desktop.type == SCREEN_OPENGL && !sdl_opengl.pixel_buffer_object);
+#endif
+#if C_XBRZ
+	presence_columns = presence_columns && !(sdl_xbrz.enable && sdl_xbrz.scale_on);
+#endif
 	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
 	                       ttf_text ? 0u :
 	                       render.scale.outMode == scalerMode32 ? 4u :
-	                       render.scale.outMode == scalerMode8 ? 0u : 2u);
+	                       render.scale.outMode == scalerMode8 ? 0u : 2u,
+	                       presence_columns);
 	ScalerLineBlock_t *lineBlock;
 
 	/* how many bytes will be needed in the write cache?

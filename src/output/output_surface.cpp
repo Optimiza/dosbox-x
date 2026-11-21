@@ -8,6 +8,7 @@
 #include "sdlmain.h"
 #include "render.h"
 #include "vga.h"
+#include "render_presence.h"
 
 #include <output/output_tools.h>
 #include <output/output_tools_xbrz.h>
@@ -750,21 +751,40 @@ void OUTPUT_SURFACE_EndUpdate(const uint16_t *changedLines)
             if (changedLines[0] == sdl.draw.height)
                 return;
             if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
+            /* the presence overlay's changes, as rectangles beside the frame's own rows, when
+               they fit the rectangles this output keeps; else the rows they lie on */
+            const uint16_t *rows = changedLines;
+            const std::vector<presence::Rect> *columns = nullptr;
+            const Bitu maxRects = sizeof(sdl.updateRects) / sizeof(sdl.updateRects[0]);
+            if (PRESENCE_Columns(changedLines, rows, columns) && columns->size() + sdl.draw.height / 2 + 1 > maxRects) {
+                rows = changedLines;
+                columns = nullptr;
+            }
             Bitu y = 0, index = 0, rectCount = 0;
-            while (y < sdl.draw.height) {
+            while (rows && y < sdl.draw.height) {
                 if (!(index & 1)) {
-                    y += changedLines[index];
+                    y += rows[index];
                 }
                 else {
                     SDL_Rect *rect = &sdl.updateRects[rectCount++];
                     rect->x = sdl.clip.x;
                     rect->y = sdl.clip.y + (int)y;
                     rect->w = (uint16_t)sdl.draw.width;
-                    rect->h = changedLines[index];
-                    y += changedLines[index];
+                    rect->h = rows[index];
+                    y += rows[index];
                     SDL_rect_cliptoscreen(*rect);
                 }
                 index++;
+            }
+            if (columns) {
+                for (const presence::Rect &r : *columns) {
+                    SDL_Rect *rect = &sdl.updateRects[rectCount++];
+                    rect->x = sdl.clip.x + (int)r.x0;
+                    rect->y = sdl.clip.y + (int)r.y0;
+                    rect->w = (uint16_t)(r.x1 - r.x0);
+                    rect->h = (uint16_t)(r.y1 - r.y0);
+                    SDL_rect_cliptoscreen(*rect);
+                }
             }
             if (rectCount) {
 #if defined(C_SDL2)

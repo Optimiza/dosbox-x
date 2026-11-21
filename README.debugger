@@ -271,8 +271,9 @@ commands are accepted. A client driving the emulator over the control channel
 marks with it the window it drives, so whoever sits at the host can tell that
 somebody is driving it and keep their hands off:
 
-  REQ 12 EXEC PRESENCE held rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283
+  REQ 12 EXEC PRESENCE acting rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283
          fade=2.5 outline=2A1400 sprite=X.../XX../XoX./XXXX pointer=1
+         caption=send_keys%20Esc serial=3 tint=FF8C00 keys=Esc place=auto
 
 (one line). The first word is the state:
 
@@ -280,60 +281,106 @@ somebody is driving it and keep their hands off:
   held     a dim edge on the inner sides of the picture
   acting   the same edge, brighter; going back to held, it fades over `fade`
            seconds
+  paused   held's edge and a pause mark: the client holds the machine stopped
 
-The `key=value` words set how it is drawn, and a key left out keeps its value:
+The `key=value` words set what is drawn and how, and a key left out keeps its
+value:
 
   rgb       the colour, six hex digits
   edge      the edge's width, a fraction of the picture's shorter side
   steps     the bands its gradient is drawn in, strongest at the rim
   acting    the alpha while acting, 0 to 1
-  held      the alpha while held, 0 to 1
+  held      the alpha while held or paused, 0 to 1
   fade      the seconds from acting back to held
   sprite    an arrow drawn at the guest's mouse position, its rows top first
             and separated by `/`: `X` the outline, `o` the fill, `.` untouched
   outline   the arrow's outline colour, six hex digits (the fill is `rgb`)
   glide     the seconds the arrow takes to ease out to a new place, 0 to jump
   pointer   1 to draw the arrow (with a sprite given), 0 not to
+  layers    the layers to draw, comma separated, from `edge`, `pointer`,
+            `keys`, `calls`, `pause`; all of them unless told
+  place     where the caption, the keycaps and the pause mark go: `top` or
+            `bottom` band of the picture, or `auto`, the band showing less
+  caption   the call's caption, at most 160 bytes, one word: `%XX` for a
+            space, a percent sign or any byte outside printable ASCII; empty
+            to take it away (it leaves with its fade)
+  serial    the caption's number: a caption is new when its serial changes, so
+            the same caption sent again restarts nothing; with no serial ever
+            sent, every `caption` is a new one
+  tint      the caption box's colour, six hex digits
+  keys      the names of the keys down now, comma separated, at most 8 of at
+            most 12 bytes each, encoded as `caption`; empty for none
+  caption_text_rgb, keycap_rgb, keycap_text_rgb
+            the caption's text, the keycaps' box and text, six hex digits
+  caption_alpha, keycap_alpha
+            the boxes' alphas, 0 to 1
+  caption_in, caption_out
+            the seconds a caption takes to fade in and out
+  scroll_cps
+            characters a second a caption too wide for its room scrolls at
 
-Each sprite cell is one guest pixel, scaled with the picture, so a sprite the
-size of the guest's own pointer is drawn at that size whatever the mode, the
-scaler or the window. The arrow follows the built-in INT 33h driver's position,
-within the range the driver keeps it in, gliding to each new place from where it
-was drawn rather than jumping; with no driver installed there is no arrow. The
-glide is drawing only: the guest's pointer is where the driver says at once.
+Each sprite cell and each glyph pixel is one guest pixel, scaled with the
+picture, so a sprite the size of the guest's own pointer is drawn at that size
+whatever the mode, the scaler or the window. The arrow follows the built-in
+INT 33h driver's position, within the range the driver keeps it in, gliding to
+each new place from where it was drawn rather than jumping; with no driver
+installed there is no arrow. The glide is drawing only: the guest's pointer is
+where the driver says at once.
+
+The caption, the keycaps and the pause mark share a band, the top or bottom
+eighth of the picture, inset from the edge: the pause mark at the left, the
+keycaps at the right, the caption between them, centred when it fits and
+scrolling when it does not. Text is drawn in the VGA ROM font, 8x16, or 8x8 in a
+band too short for it. With `place=auto` the overlay samples the guest's own
+picture once a second on a grid in each band (16 columns by 2 rows, the band an
+eighth of the picture), scores each band by how many samples differ from its most
+common colour, and moves to the other band once that one scored 4 lower on 2
+samples running.
 
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
 
   PRESENCE held frames=1234 pointer=1 output=640x400x32 px_read=51245 px_written=51744
-           bytes_presented=1026560
+           bytes_presented=1026560 uploads=0 upload_bytes=0
+           layers=edge,pointer,keys,calls,pause place=bottom
 
 (one line). `frames` counts the frames the overlay was drawn on, and `output` is
 the output it is drawn on: `none` while there is no output yet, `undrawable`
 for one it cannot draw on (an 8-bit output, or the TrueType output while it
 shows text; its graphics modes are drawn on like any other). On an output it
-draws on, three counters say what drawing it has cost since that output was
-made (they start again at 0 when the output changes size or format, and
-`frames` does not), the same on any host: `px_read` the output pixels it read (the ones it
-saves before drawing and the ones it blends onto), `px_written` the output
-pixels it wrote (put back, blended or painted), and `bytes_presented` the bytes
-of the rows it handed on to be presented, the scaler's own rows included. Two
-replies with the same `output` give the cost between them. An unknown state or
-key, or a value out of its range, answers ERR naming it and changes nothing;
-the response ends with that reason alone. The arguments keep their case.
+draws on, counters say what drawing it has cost since that output was made
+(they start again at 0 each time the render makes the output again, a new size,
+format, scaler or window mode, and `frames` does not), the same on any host: `px_read` the output pixels it read (the ones
+it saves before drawing, and the guest pixels `auto` samples), `px_written` the
+output pixels it wrote (put back or blended), `bytes_presented` the bytes it
+handed on to be presented, the scaler's own rows included, and `uploads` and
+`upload_bytes` the uploads of an overlay texture, 0 where it is drawn into the
+frame. `layers` names the layers asked for and `place` the band in use; on an
+output it cannot draw on, `layers` is empty and `lacks` names the layers asked
+for. Two replies with no output made between them give the cost between them. An unknown
+state or key, or a value out of its range, answers ERR naming it and changes
+nothing; the response ends with that reason alone. The arguments keep their
+case.
 
 The bare command, `PRESENCE` with no state, changes nothing and answers the same line
-with `version=2` appended, so a client can refuse a build that announces no version
-(version 1 was implicit).
+with `version=3` appended, so a client can refuse a build older than it expects
+(version 1 was implicit, version 2 drew the edge and the arrow only).
 
 The overlay is drawn into the scaled output just before it is presented, after
 the frame was handed to capture: screenshots, video capture and the VGA memory
-never contain it. The scaler writes that output in place, rewriting only what
-changed, so the overlay never stays in it while the scaler works: the pixels it
-covers are put back before each frame is written and it is drawn anew after,
-which costs a copy of the edge and the arrow per frame while it is on, and a
-check per frame while it is off. While the debugger holds the machine, its loop repaints the window when the
-overlay changes (a new state, the fade), and only then.
+never contain it. Its layers are composited once per change into a buffer of
+their own, and a frame blends that buffer onto the picture only where it has
+to. The scaler writes the output in place, rewriting only the blocks of a line
+that changed, so before it writes a line the overlay puts the picture back on
+that line's rows, and after the frame it draws itself again on those rows; every
+other row keeps the overlay as it was, and only a layer that changed (a fade, the
+arrow moving, a new caption, a scroll step) is redrawn and presented, and on an
+output that presents rectangles (the surface output, OpenGL without a pixel
+buffer object) only its rectangles are. The complex scalers (hq2x, the SaI
+family, advmame) and a frame that rewrites everything take the overlay off every
+row first. A still overlay over a still picture costs nothing but a check per
+frame. While the debugger holds the machine, its loop repaints the window when the
+overlay changes, and only then.
 
 Debugger keyboard shortcuts
 ---------------------------

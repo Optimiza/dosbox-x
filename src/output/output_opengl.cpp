@@ -24,6 +24,7 @@ extern "C" {
 
 #include "sdlmain.h"
 #include "render.h"
+#include "render_presence.h"
 
 using namespace std;
 
@@ -1113,18 +1114,31 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
             if (changedLines[0] == sdl.draw.height)
                 return;
 
+            /* the presence overlay's changes come as rectangles beside the frame's own rows,
+               and only the rectangle is uploaded */
+            const uint16_t *rows = changedLines;
+            const std::vector<presence::Rect> *columns = nullptr;
+            if (!PRESENCE_Columns(changedLines, rows, columns)) columns = nullptr;
             Bitu y = 0, index = 0;
             glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
-            while (y < sdl.draw.height) 
+            if (columns && !columns->empty()) {
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(sdl_opengl.pitch / 4));
+                for (const presence::Rect &r : *columns)
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, (int)r.x0, (int)r.y0, (int)(r.x1 - r.x0),
+                        (int)(r.y1 - r.y0), GL_BGRA_EXT, OPENGL_PixelType(),
+                        (uint8_t *)sdl_opengl.framebuf + r.y0 * sdl_opengl.pitch + r.x0 * 4);
+                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+            }
+            while (rows && y < sdl.draw.height) 
             {
                 if (!(index & 1)) 
                 {
-                    y += changedLines[index];
+                    y += rows[index];
                 }
                 else 
                 {
                     uint8_t *pixels = (uint8_t *)sdl_opengl.framebuf + y * sdl_opengl.pitch;
-                    Bitu height = changedLines[index];
+                    Bitu height = rows[index];
 
                     // FIXME: This is causing libgallium crashes by sometimes getting y+height > sdl.draw.height.
                     //        It seems to happen on VGA mode changes.

@@ -4566,7 +4566,7 @@ bool ParseCommand(char* str) {
 		DEBUG_ShowMsg("STEPIN                    - Execute exactly one instruction, then stop.\n");
 		DEBUG_ShowMsg("SAVESTATE [slot|file]     - Save a state to a slot (1-100) or a .sav file.\n");
 		DEBUG_ShowMsg("LOADSTATE [slot|file]     - Load a state from a slot (1-100) or a .sav file.\n");
-		DEBUG_ShowMsg("PRESENCE state [key=val]  - Mark the window a client drives (off, held, acting).\n");
+		DEBUG_ShowMsg("PRESENCE state [key=val]  - Mark the window a client drives (off, held, acting, paused).\n");
 #if C_HEAVY_DEBUG
 		DEBUG_ShowMsg("LOG [num]                 - Write CPU log file.\n");
 		DEBUG_ShowMsg("LOGS/LOGL/LOGC [num]      - Write short/long/cs:ip-only CPU log file.\n");
