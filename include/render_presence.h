@@ -260,7 +260,6 @@ private:
     std::vector<uint8_t> row_drawn_;        /* the row holds the overlay as `drawn_` covers it */
     Scene drawn_;                           /* what over_ and the buffer hold */
     std::vector<Rect> pending_;             /* changed since the screen was last shown */
-    bool shown_ = true;                     /* the last drawn scene reached the screen */
     std::vector<uint16_t> runs_;            /* the merged runs handed on */
     std::vector<Rect> present_;             /* the rectangles handed on beside them */
     const uint16_t *present_rows_ = nullptr;
