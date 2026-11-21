@@ -2,7 +2,8 @@
  *  Presence indicator: a client driving the emulator through the mcp_server
  *  debugger channel marks the window it drives: a soft edge on the output's
  *  inner sides and, as asked, the guest's mouse pointer, the keys held down, a
- *  caption naming the call and a mark while the session holds the machine.
+ *  caption naming the call, a mark while the session holds the machine and a
+ *  blinking mark while it records.
  *
  *  It is drawn into the scaled output buffer just before it is presented, or
  *  on OpenGL as a texture of its own over the frame, after the frame has been
@@ -29,7 +30,9 @@ enum class State { Off, Held, Acting, Paused };
 /* The band of the picture the captions, keycaps and pause mark go in. */
 enum class Place { Top, Bottom, Auto };
 /* Drawing order, bottom first; the words are the client's layer names. */
-enum Layer { EDGE, POINTER, KEYS, CALLS, PAUSE, LAYER_COUNT };
+enum Layer { EDGE, POINTER, KEYS, CALLS, PAUSE, RECORD, LAYER_COUNT };
+/* What the session records, which the record mark shows. */
+enum class Recording { None, Video, Audio, Both };
 
 /* How the overlay is drawn: everything comes from the client, so the emulator
    holds no look of its own. Colours are 0xRRGGBB, alphas and the edge 0 to 1,
@@ -53,6 +56,8 @@ struct Look {
     uint32_t keycap_rgb = 0x202020;
     uint32_t keycap_text_rgb = 0xFFFFFF;
     float keycap_alpha = 0.8f;
+    uint32_t record_rgb = 0xFF3B30;   /* the record mark's dot */
+    float record_blink_s = 1.0f;      /* the record mark's blink, on for its first half */
     bool operator==(const Look &o) const {
         return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
                acting == o.acting && held == o.held && fade == o.fade && glide == o.glide &&
@@ -60,7 +65,8 @@ struct Look {
                caption_alpha == o.caption_alpha && scroll_cps == o.scroll_cps &&
                caption_in == o.caption_in && caption_out == o.caption_out &&
                keycap_rgb == o.keycap_rgb && keycap_text_rgb == o.keycap_text_rgb &&
-               keycap_alpha == o.keycap_alpha;
+               keycap_alpha == o.keycap_alpha && record_rgb == o.record_rgb &&
+               record_blink_s == o.record_blink_s;
     }
 };
 
@@ -218,6 +224,7 @@ private:
         bool top = false;                     /* the band's place */
         unsigned box_y = 0, box_h = 0, font_h = 16;   /* guest pixels */
         unsigned pause_x0 = 0;
+        unsigned rec_x0 = 0, rec_y0 = 0;      /* the record mark's box, guest pixels */
         unsigned cap_x0 = 0, cap_x1 = 0, cap_offset = 0;
         bool cap_scrolls = false;
         int cap_level = 0;                    /* the caption's fade, of CAPTION_LEVELS */
@@ -245,9 +252,10 @@ private:
     void Coalesce(const std::vector<Rect> &in, std::vector<Rect> &out, std::vector<uint8_t> *marks);
     void Prepare(const Scene &s);
     void PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1);
+    /* `text` in the font `s` uses, its glyphs' top row at guest row `gy0`. */
     void PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, uint32_t *row,
-                   unsigned gx0, unsigned gx1, const std::string &text, unsigned offset,
-                   unsigned period, uint32_t ink) const;
+                   unsigned gx0, unsigned gx1, unsigned gy0, const std::string &text,
+                   unsigned offset, unsigned period, uint32_t ink) const;
     uint32_t Blend(uint32_t under, uint32_t over) const;
     uint32_t Read(const uint8_t *p) const;
     void Write(uint8_t *p, uint32_t v) const;
@@ -257,7 +265,7 @@ private:
     unsigned look_generation_ = 0;
     State state_ = State::Off;
     bool pointer_ = false;
-    bool layers_[LAYER_COUNT] = {true, true, true, true, true};
+    bool layers_[LAYER_COUNT] = {true, true, true, true, true, true};
     Place place_ = Place::Auto;
     Place band_ = Place::Bottom;            /* where `auto` put the band */
     unsigned streak_ = 0;
@@ -275,6 +283,8 @@ private:
     unsigned caption_generation_ = 0;
     std::vector<std::string> keys_;
     unsigned keys_generation_ = 0;
+    Recording recording_ = Recording::None;
+    uint32_t recording_since_ms_ = 0;       /* the blink's phase starts at the last change */
 
     unsigned width_ = 0, height_ = 0;
     unsigned guest_width_ = 0, guest_height_ = 0;

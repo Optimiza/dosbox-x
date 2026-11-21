@@ -298,7 +298,7 @@ value:
   glide     the seconds the arrow takes to ease out to a new place, 0 to jump
   pointer   1 to draw the arrow (with a sprite given), 0 not to
   layers    the layers to draw, comma separated, from `edge`, `pointer`,
-            `keys`, `calls`, `pause`; all of them unless told
+            `keys`, `calls`, `pause`, `record`; all of them unless told
   place     where the caption, the keycaps and the pause mark go: `top` or
             `bottom` band of the picture, or `auto`, the band showing less
   caption   the call's caption, at most 160 bytes, one word: `%XX` for a
@@ -310,6 +310,7 @@ value:
   tint      the caption box's colour, six hex digits
   keys      the names of the keys down now, comma separated, at most 8 of at
             most 12 bytes each, encoded as `caption`; empty for none
+  rec       what the client records: `none`, `video`, `audio` or `both`
   caption_text_rgb, keycap_rgb, keycap_text_rgb
             the caption's text, the keycaps' box and text, six hex digits
   caption_alpha, keycap_alpha
@@ -318,6 +319,11 @@ value:
             the seconds a caption takes to fade in and out
   scroll_cps
             characters a second a caption too wide for its room scrolls at
+  record_rgb
+            the record mark's dot, six hex digits
+  record_blink_s
+            the record mark's blink, 0.1 to 10 seconds: shown for the first
+            half, hidden for the second
 
 Each sprite cell and each glyph pixel is one guest pixel, scaled with the
 picture, so a sprite the size of the guest's own pointer is drawn at that size
@@ -337,12 +343,22 @@ eighth of the picture), scores each band by how many samples differ from its mos
 common colour, and moves to the other band once that one scored 4 lower on 2
 samples running.
 
+While `rec` is not `none`, the record mark sits in the top right corner of the
+picture, inset from the edge, whatever `place` says: a box of the keycaps'
+colours holding a dot in `record_rgb` and `REC` for video, a dot and the VGA
+font's double note for audio, both side by side for `both`. It blinks with the
+period `record_blink_s` gives, counted from the last change of `rec`, so a new
+recording shows at once. A band at the top keeps the room for it in both halves
+of the blink, so the keycaps and the caption never move with it. A blink
+repaints the mark's box alone: on the OpenGL output it uploads that box and
+sends none of the frame.
+
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
 
   PRESENCE held frames=1234 pointer=1 output=640x400x32 px_read=51245 px_written=51744
            bytes_presented=1026560 uploads=0 upload_bytes=0
-           layers=edge,pointer,keys,calls,pause place=bottom
+           layers=edge,pointer,keys,calls,pause,record place=bottom
 
 (one line). `frames` counts the frames the overlay was drawn on, and `output` is
 the output it is drawn on: `none` while there is no output yet, `undrawable`

@@ -4,8 +4,8 @@
  *  on the inner sides only, taken off before the scaler writes and drawn anew
  *  after, so a scaler that rewrites part of a line never gets the overlay
  *  blended onto itself; restored when turned off; and an arrow at the guest's
- *  pointer; the layers of protocol 3 (keycaps, caption, pause mark) and where `auto` puts
- *  them. The cost cases print what each case costs and hold it at its floor.
+ *  pointer; the layers of protocol 3 (keycaps, caption, pause mark, record mark) and where
+ *  `auto` puts them. The cost cases print what each case costs and hold it at its floor.
  */
 
 #include <algorithm>
@@ -432,6 +432,77 @@ TEST(PresenceLayers, ThePauseMarkIsDrawnOnlyWhilePaused) {
     EXPECT_EQ(b.frame.at(x0 + 2, kBoxY + 2), 0u) << "held is not paused";
 }
 
+/* The record mark's box: from the top right inset, 20 rows from row 7; its dot is 10 guest
+   pixels, from 2 inside the box and 5 rows down. */
+const unsigned kRecY = 7, kRecDot = 10;
+const unsigned kRecVideoW = 2 + kRecDot + 2 + 3 * 8 + 2, kRecAudioW = 2 + kRecDot + 2 + 8 + 2;
+
+TEST(PresenceLayers, TheRecordMarkBlinksInTheTopRightCornerWhateverThePlace) {
+    Band b("held rec=video place=bottom");
+    b.Draw(0);
+    unsigned x0 = 320 - kInset - kRecVideoW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the dot, record_rgb";
+    const uint32_t cap = b.frame.at(x0 + 2, kRecY + 5);
+    EXPECT_NE(cap, 0u) << "the dot's corner is the box";
+    EXPECT_NE(cap, 0x00FF3B30u) << "and not the dot: a disc";
+    EXPECT_EQ(b.frame.at(x0 - 1, kRecY), 0u);
+    EXPECT_EQ(b.frame.at(x0, kRecY - 1), 0u);
+    unsigned col = 0, row = 0;
+    FirstInk('R', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC";
+    EXPECT_FALSE(b.o.NeedsRepaint(499, false, 0, 0)) << "on for the first half of the second";
+    EXPECT_TRUE(b.o.NeedsRepaint(500, false, 0, 0));
+    b.Draw(500);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "off for the second half";
+    b.Draw(1000);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u);
+
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held rec=audio", error, 1200));
+    b.Draw(1200);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "the video mark gone";
+    x0 = 320 - kInset - kRecAudioW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "a change shows at once";
+    FirstInk(0x0E, col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "the note";
+
+    ASSERT_TRUE(b.o.Configure("held rec=both", error, 2000));
+    b.Draw(2000);
+    x0 = 320 - kInset - (kRecVideoW + 2 + kRecAudioW - 2 * 2);
+    FirstInk('R', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC first";
+    const unsigned audio_x0 = x0 + kRecVideoW - 2 + 2;
+    FirstInk(0x0E, col, row);
+    EXPECT_EQ(b.frame.at(audio_x0 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "then the note";
+
+    ASSERT_TRUE(b.o.Configure("held rec=video record_blink_s=2", error, 3000));
+    b.Draw(3000);
+    EXPECT_FALSE(b.o.NeedsRepaint(3999, false, 0, 0)) << "the period the look gives";
+    EXPECT_TRUE(b.o.NeedsRepaint(4000, false, 0, 0));
+
+    x0 = 320 - kInset - kRecVideoW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the video mark, on";
+    ASSERT_TRUE(b.o.Configure("held rec=none", error, 3500));
+    b.Draw(3500);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "taken off mid blink";
+    EXPECT_FALSE(b.o.NeedsRepaint(9000, false, 0, 0)) << "nothing recorded, nothing blinks";
+}
+
+TEST(PresenceLayers, ABandAtTheTopLeavesTheRecordMarkItsCornerInBothHalvesOfTheBlink) {
+    Band b("held keys=A rec=video place=top");
+    b.Draw(0);
+    const unsigned a_x0 = 320 - kInset - kRecVideoW - 2 - 12;
+    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the keycap left of the mark";
+    EXPECT_EQ(b.frame.at(a_x0 + 12, 10), 0u) << "the gap after it";
+    b.Draw(500);
+    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the mark off, the keycap stays";
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held layers=edge,keys", error, 600));
+    b.Draw(600);
+    EXPECT_EQ(b.frame.at(a_x0, 10), 0u) << "no record layer asked: the keycap at the inset";
+    EXPECT_NE(b.frame.at(320 - kInset - 12, 10), 0u);
+}
+
 TEST(PresenceLayers, ACaptionThatFitsIsCentredInItsTint) {
     Band b("held caption=hi%20there tint=5AC8FA serial=1 place=bottom");
     b.Draw(0);
@@ -526,6 +597,13 @@ TEST(PresenceLayers, TheProtocolRefusesWhatItCannotDrawAndChangesNothing) {
     EXPECT_FALSE(o.Configure("held serial=-1", error, 0));
     EXPECT_FALSE(o.Configure("held caption_alpha=2", error, 0));
     EXPECT_FALSE(o.Configure("paused place=top caption=%ZZ", error, 0));
+    EXPECT_FALSE(o.Configure("paused rec=screen", error, 0)) << "an unknown recording";
+    EXPECT_FALSE(o.Configure("paused rec=", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_rgb=red", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_blink_s=0", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_blink_s=11", error, 0));
+    EXPECT_TRUE(o.Configure("held record_blink_s=0.1", error, 0)) << "a bound is a value it takes";
+    EXPECT_TRUE(o.Configure("held record_blink_s=10", error, 0));
     EXPECT_EQ(o.state(), State::Held) << "a refused command changes nothing";
     EXPECT_TRUE(o.Configure("paused layers= keys=%2C", error, 0)) << "no layer, a comma key";
 }
@@ -756,7 +834,7 @@ TEST(PresenceCost, TheReplyCarriesTheCounters) {
     EXPECT_NE(line.find(" px_read=" + std::to_string(c.read) + " "), std::string::npos) << line;
     EXPECT_NE(line.find(" px_written=" + std::to_string(c.written) + " "), std::string::npos) << line;
     EXPECT_NE(line.find(" bytes_presented=" + std::to_string(c.presented) + " "), std::string::npos) << line;
-    EXPECT_NE(line.find(" uploads=0 upload_bytes=0 layers=edge,pointer,keys,calls,pause place=bottom"),
+    EXPECT_NE(line.find(" uploads=0 upload_bytes=0 layers=edge,pointer,keys,calls,pause,record place=bottom"),
               std::string::npos) << line;
     EXPECT_GT(c.presented, 0u);
     const Format f = Rgb32();
@@ -891,6 +969,49 @@ TEST(PresenceCost, ACaptionIsDrawnOnceAndThenCostsNothing) {
     }
 }
 
+/* The video mark's box in output pixels, as kRecY and kRecVideoW lay it in the guest. */
+void RecBox(const Output &out, uint64_t &w, uint64_t &h) {
+    w = OutSpan(320 - 7 - kRecVideoW, 320 - 7, kGuestW, out.w);
+    h = OutSpan(kRecY, kRecY + 20, kGuestH, out.h);
+}
+
+TEST(PresenceCost, ABlinkRepaintsAndPresentsTheRecordMarksBoxAlone) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held rec=video", error, 0));
+        uint64_t w = 0, h = 0;
+        RecBox(out, w, h);
+        const presence::Cost shown = s.Still(0);
+        Print("rec", out, 1, shown);
+        EXPECT_EQ(shown.read, w * h) << "the box's pixels saved";
+        EXPECT_EQ(shown.written, w * h);
+        EXPECT_EQ(shown.presented, 4 * w * h);
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 1; ms <= 3000; ms++) {      /* the parked loop, once a millisecond */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.Still(ms);
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("recblink", out, repaints, c);
+        EXPECT_EQ(repaints, 6u) << "off and on again, each half second";
+        EXPECT_EQ(c.read, 3 * w * h) << "saved again each time it comes back";
+        EXPECT_EQ(c.written, repaints * w * h) << "put back, or blended";
+        EXPECT_EQ(c.presented, repaints * 4 * w * h) << "the box alone";
+        const uint16_t *rows = nullptr;
+        const std::vector<presence::Rect> *rects = nullptr;
+        ASSERT_TRUE(s.o.Columns(s.runs, rows, rects));
+        ASSERT_EQ(rects->size(), 1u);
+        EXPECT_EQ((uint64_t)((*rects)[0].x1 - (*rects)[0].x0) * ((*rects)[0].y1 - (*rects)[0].y0), w * h);
+        ASSERT_TRUE(s.o.Configure("held rec=none", error, 3000));
+        s.Still(3000);
+        const presence::Cost later = s.Still(10000);
+        EXPECT_EQ(later.read + later.written + later.presented, 0u) << "no recording costs nothing";
+    }
+}
+
 TEST(PresenceCost, AScrollingCaptionRepaintsItsBoxOncePerGuestPixel) {
     for (const Output &out : kOutputs) {
         Session s(out);
@@ -928,8 +1049,9 @@ struct FakeTexture final : presence::Texture {
     void Present() override {}
 };
 
-/* Everything the session draws at once: the edge, the arrow, keycaps, a caption, the pause mark. */
-const char *const kEveryLayer = " caption=start serial=1 keys=Esc,F1 tint=5AC8FA";
+/* Everything the session draws at once: the edge, the arrow, keycaps, a caption, the pause mark
+   and the record mark. */
+const char *const kEveryLayer = " caption=start serial=1 keys=Esc,F1 tint=5AC8FA rec=both";
 
 /* The same overlay drawn on the CPU over black and over white, and as a texture: the texture
    holds premultiplied ARGB, so over black the CPU path shows its colour, and over white what is
@@ -1111,6 +1233,37 @@ TEST(PresenceTexture, ACaptionIsUploadedOnceAndThenCostsNothing) {
         s.Still(5000);
         s.o.Upload();
         EXPECT_EQ(Delta(s.o.cost(), mid).upload_bytes, 0u) << "a still caption costs nothing";
+    }
+}
+
+TEST(PresenceTexture, ABlinkUploadsTheRecordMarksBoxAloneAndPresentsNoFrame) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held rec=video", error, 0));
+        uint64_t w = 0, h = 0;
+        RecBox(out, w, h);
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop, as PRESENCE_Repaint */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(nullptr, 0, nullptr, ms, true, 0.5f, 0.5f);
+            s.o.Upload();
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("trec", out, repaints, c);
+        EXPECT_EQ(repaints, 7u) << "shown, then off and on again each half second";
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.uploads, repaints);
+        EXPECT_EQ(c.upload_bytes, repaints * 4 * w * h) << "the box alone";
+        ASSERT_TRUE(s.o.Configure("held rec=none", error, 3000));
+        s.o.Compose(nullptr, 0, nullptr, 3000, true, 0.5f, 0.5f);
+        s.o.Upload();
+        const presence::Cost mid = s.o.cost();
+        for (uint32_t ms = 3001; ms <= 6000; ms++) EXPECT_FALSE(s.o.NeedsRepaint(ms, true, 0.5f, 0.5f));
+        EXPECT_EQ(Delta(s.o.cost(), mid).uploads, 0u);
     }
 }
 

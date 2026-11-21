@@ -26,6 +26,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <iterator>
 #include <locale>
 #include <sstream>
 
@@ -55,7 +56,12 @@ constexpr size_t MAX_CAPTION = 160, MAX_KEYS = 8, MAX_KEY = 12;
    comes round again. */
 constexpr unsigned GLYPH_W = 8, PAD = 2, GAP = 2, BAR_W = 3, PAUSE_W = 2 * PAD + 3 * BAR_W;
 constexpr unsigned SCROLL_GAP = 4 * GLYPH_W;
-const char *const LAYER_NAMES[LAYER_COUNT] = {"edge", "pointer", "keys", "calls", "pause"};
+/* The record mark: its dot is this many eighths of the font's height, and audio is the VGA
+   font's double note. */
+constexpr unsigned REC_DOT_EIGHTHS = 5;
+constexpr char NOTE_GLYPH = '\x0E';
+const char *const LAYER_NAMES[LAYER_COUNT] = {"edge", "pointer", "keys", "calls", "pause", "record"};
+const char *const RECORDING_NAMES[] = {"none", "video", "audio", "both"};
 
 unsigned LowestBit(uint32_t v) {
     unsigned n = 0;
@@ -225,6 +231,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     std::copy(layers_, layers_ + LAYER_COUNT, layers);
     Place place = place_;
     uint32_t tint = tint_;
+    Recording recording = recording_;
     bool have_caption = false, have_serial = false, have_keys = false;
     std::string caption;
     uint64_t serial = 0;
@@ -249,7 +256,15 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "keycap_rgb") ok = ParseHex(value, look.keycap_rgb);
         else if (key == "keycap_text_rgb") ok = ParseHex(value, look.keycap_text_rgb);
         else if (key == "keycap_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.keycap_alpha);
+        else if (key == "record_rgb") ok = ParseHex(value, look.record_rgb);
+        else if (key == "record_blink_s") ok = ParseFloat(value, 0.1, 10.0, look.record_blink_s);
         else if (key == "tint") ok = ParseHex(value, tint);
+        else if (key == "rec") {
+            const auto *at = std::find_if(std::begin(RECORDING_NAMES), std::end(RECORDING_NAMES),
+                                          [&](const char *n) { return value == n; });
+            ok = at != std::end(RECORDING_NAMES);
+            if (ok) recording = (Recording)(at - std::begin(RECORDING_NAMES));
+        }
         else if (key == "steps") {
             float steps = 0;
             ok = ParseFloat(value, 1.0f, 64.0f, steps) && steps == std::floor(steps);
@@ -343,6 +358,10 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     if (have_serial) {
         serial_known_ = true;
         serial_ = serial;
+    }
+    if (recording != recording_) {
+        recording_ = recording;
+        recording_since_ms_ = now_ms;
     }
     if (have_keys && keys != keys_) {
         keys_ = keys;
@@ -452,6 +471,31 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
         k.on = !k.r[0].empty();
         k.stamp = stamp;
     };
+
+    /* the record mark keeps the top right corner whatever the band; a band at the top makes
+       room for it in both halves of the blink, so the captions never move with it */
+    if (layers_[RECORD] && recording_ != Recording::None) {
+        const unsigned dot = s.font_h * REC_DOT_EIGHTHS / 8;
+        const bool video = recording_ != Recording::Audio, audio = recording_ != Recording::Video;
+        const unsigned w = 2 * PAD + (video ? dot + PAD + 3 * GLYPH_W : 0) +
+                           (audio ? dot + PAD + GLYPH_W : 0) + (video && audio ? GAP : 0);
+        const unsigned edge_y = (unsigned)(((uint64_t)EdgeBand() * gh + height_ - 1) / std::max(1u, height_));
+        const unsigned top = edge_y + 2;
+        if (right >= left + w && top + s.box_h <= gh) {
+            s.rec_x0 = right - w;
+            s.rec_y0 = top;
+            if (s.top && y0 < top + s.box_h && y1 > top)
+                right = s.rec_x0 > left + GAP ? s.rec_x0 - GAP : left;
+            const uint32_t period = std::max<uint32_t>(2, (uint32_t)std::lround(look_.record_blink_s * 1000.0f));
+            if ((uint32_t)(now_ms - recording_since_ms_) % period < period / 2) {
+                LayerKey &k = s.key[RECORD];
+                k.r[0] = OutRect(s.rec_x0, top, s.rec_x0 + w, top + s.box_h);
+                k.n = 1;
+                k.on = !k.r[0].empty();
+                k.stamp = ((uint64_t)recording_ << 32) | look_generation_;
+            }
+        }
+    }
 
     if (layers_[PAUSE] && s.state == State::Paused && left + PAUSE_W <= right) {
         s.pause_x0 = left;
@@ -631,11 +675,11 @@ void Overlay::Prepare(const Scene &s) {
 }
 
 void Overlay::PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, uint32_t *row,
-                        unsigned gx0, unsigned gx1, const std::string &text, unsigned offset,
-                        unsigned period, uint32_t ink) const {
+                        unsigned gx0, unsigned gx1, unsigned gy0, const std::string &text,
+                        unsigned offset, unsigned period, uint32_t ink) const {
     const unsigned gy = gy_of_y_[y];
-    if (gy < s.box_y + PAD || gy >= s.box_y + PAD + s.font_h) return;
-    const unsigned glyph_row = gy - s.box_y - PAD;
+    if (gy < gy0 || gy >= gy0 + s.font_h) return;
+    const unsigned glyph_row = gy - gy0;
     const uint8_t *font = s.font_h == 16 ? int10_font_16 : int10_font_08;
     const unsigned text_px = (unsigned)text.size() * GLYPH_W;
     for (unsigned x = x0; x < x1; x++) {
@@ -688,7 +732,7 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                     const unsigned gx0 = s.key_x0[n], gx1 = gx0 + (unsigned)name.size() * GLYPH_W + 2 * PAD;
                     for (unsigned x = a; x < b; x++)
                         if (gx_of_x_[x] >= gx0 && gx_of_x_[x] < gx1) row[x] = Over(row[x], cap);
-                    PaintText(s, y, a, b, row, gx0 + PAD, gx1 - PAD, name, 0, 0, ink);
+                    PaintText(s, y, a, b, row, gx0 + PAD, gx1 - PAD, s.box_y + PAD, name, 0, 0, ink);
                 }
                 break;
             }
@@ -698,7 +742,8 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                 const uint32_t ink = Premul(look_.caption_text_rgb, 255 * level / CAPTION_LEVELS);
                 for (unsigned x = a; x < b; x++) row[x] = Over(row[x], box);
                 const unsigned period = s.cap_scrolls ? (unsigned)caption_.size() * GLYPH_W + SCROLL_GAP : 0;
-                PaintText(s, y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, caption_, s.cap_offset, period, ink);
+                PaintText(s, y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, s.box_y + PAD, caption_,
+                          s.cap_offset, period, ink);
                 break;
             }
             case PAUSE: {
@@ -712,6 +757,33 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                     if (bars && ((lx >= PAD && lx < PAD + BAR_W) || (lx >= PAD + 2 * BAR_W && lx < PAD + 3 * BAR_W)))
                         row[x] = Over(row[x], ink);
                 }
+                break;
+            }
+            case RECORD: {
+                const uint32_t cap = Premul(look_.keycap_rgb, Alpha255(look_.keycap_alpha));
+                const uint32_t ink = Premul(look_.keycap_text_rgb, 255);
+                const uint32_t red = Premul(look_.record_rgb, 255);
+                const unsigned dot = s.font_h * REC_DOT_EIGHTHS / 8, gy = gy_of_y_[y];
+                const unsigned dot_y0 = s.rec_y0 + (s.box_h - dot) / 2;
+                for (unsigned x = a; x < b; x++) row[x] = Over(row[x], cap);
+                unsigned gx0 = s.rec_x0 + PAD;
+                /* a disc: a pixel whose centre lies within the dot's diameter of the cell's */
+                auto mark = [&](const std::string &label) {
+                    if (gy >= dot_y0 && gy < dot_y0 + dot) {
+                        const int uy = 2 * (int)(gy - dot_y0) + 1 - (int)dot;
+                        for (unsigned x = a; x < b; x++) {
+                            const unsigned gx = gx_of_x_[x];
+                            if (gx < gx0 || gx >= gx0 + dot) continue;
+                            const int ux = 2 * (int)(gx - gx0) + 1 - (int)dot;
+                            if (ux * ux + uy * uy <= (int)(dot * dot)) row[x] = Over(row[x], red);
+                        }
+                    }
+                    const unsigned tx = gx0 + dot + PAD, tw = (unsigned)label.size() * GLYPH_W;
+                    PaintText(s, y, a, b, row, tx, tx + tw, s.rec_y0 + PAD, label, 0, 0, ink);
+                    gx0 = tx + tw + GAP;
+                };
+                if (recording_ != Recording::Audio) mark("REC");
+                if (recording_ != Recording::Video) mark(std::string(1, NOTE_GLYPH));
                 break;
             }
             default: break;
