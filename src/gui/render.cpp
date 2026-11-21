@@ -52,6 +52,10 @@
 
 #include <output/output_tools_xbrz.h>
 #include <output/output_opengl.h>
+#if C_DIRECT3D
+/* (its header brings in windows.h) */
+presence::Texture *OUTPUT_DIRECT3D_PresenceTexture(void);
+#endif
 
 extern bool video_debug_overlay;
 bool useTraditionalRenderCache = false;
@@ -987,8 +991,8 @@ forcenormal:
 	const bool ttf_text = false;
 #endif
 	/* the outputs that present a rectangle of the frame, not only whole rows; xBRZ rescales
-	   whole rows. OpenGL draws the overlay as a texture of its own instead, so the frame's
-	   pixels are never touched, with or without a pixel buffer object or xBRZ. */
+	   whole rows. OpenGL and Direct3D 9 draw the overlay as a texture of its own instead, so
+	   the frame's pixels are never touched, with or without a pixel buffer object or xBRZ. */
 	bool presence_columns = sdl.desktop.type == SCREEN_SURFACE;
 #if C_XBRZ
 	presence_columns = presence_columns && !(sdl_xbrz.enable && sdl_xbrz.scale_on);
@@ -996,6 +1000,9 @@ forcenormal:
 	presence::Texture *presence_texture = nullptr;
 #if C_OPENGL
 	if (sdl.desktop.type == SCREEN_OPENGL) presence_texture = OUTPUT_OPENGL_PresenceTexture();
+#endif
+#if C_DIRECT3D
+	if (sdl.desktop.type == SCREEN_DIRECT3D) presence_texture = OUTPUT_DIRECT3D_PresenceTexture();
 #endif
 	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
 	                       ttf_text ? 0u :

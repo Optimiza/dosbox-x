@@ -6,7 +6,7 @@
  *  blinking mark while it records.
  *
  *  It is drawn into the scaled output buffer just before it is presented, or
- *  on OpenGL as a texture of its own over the frame, after the frame has been
+ *  on OpenGL and Direct3D 9 as a texture of its own over the frame, after the frame has been
  *  handed to capture: screenshots, video capture and the VGA memory never see
  *  it. See README.debugger, "Presence".
  */

@@ -350,8 +350,8 @@ font's double note for audio, both side by side for `both`. It blinks with the
 period `record_blink_s` gives, counted from the last change of `rec`, so a new
 recording shows at once. A band at the top keeps the room for it in both halves
 of the blink, so the keycaps and the caption never move with it. A blink
-repaints the mark's box alone: on the OpenGL output it uploads that box and
-sends none of the frame.
+repaints the mark's box alone: on the OpenGL and Direct3D 9 outputs it uploads
+that box and sends none of the frame.
 
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
@@ -371,8 +371,8 @@ it saves before drawing, and the guest pixels `auto` samples), `px_written` the
 output pixels it wrote (put back or blended), `bytes_presented` the bytes it
 handed on to be presented, the scaler's own rows included, and `uploads` and
 `upload_bytes` the rectangles uploaded to the overlay's own texture and their
-bytes, 0 where it is drawn into the frame. On the OpenGL output the overlay is
-that texture, so `px_read` counts only `auto`'s samples and `px_written` and
+bytes, 0 where it is drawn into the frame. On the OpenGL and Direct3D 9 outputs
+the overlay is that texture, so `px_read` counts only `auto`'s samples and `px_written` and
 `bytes_presented` stay 0. `layers` names the layers asked for and `place` the band in use; on an
 output it cannot draw on, `layers` is empty and `lacks` names the layers asked
 for. Two replies with no output made between them give the cost between them. An unknown
@@ -386,12 +386,15 @@ with `version=3` appended, so a client can refuse a build older than it expects
 
 The overlay is drawn after the frame was handed to capture: screenshots, video
 capture and the VGA memory never contain it. Its layers are composited once per
-change into a buffer of their own. On the OpenGL output that buffer is a texture
-of its own, drawn as a second quad over the frame's with every swap of the
-window, and only its rectangles that changed are uploaded; the frame's pixels
-are never read or written for it, and a change over a still picture shows the
-frame as it stands with the new overlay over it, sending none of the frame
-again. On every other output it is drawn into the scaled output just before it
+change into a buffer of their own. On the OpenGL and Direct3D 9 outputs that
+buffer is a texture of its own, drawn as a second quad over the frame's with
+every swap of the window, and only its rectangles that changed are uploaded; the
+frame's pixels are never read or written for it, and a change over a still
+picture shows the frame as it stands with the new overlay over it, sending none
+of the frame again. On Direct3D 9 a frame the scaler is still writing is never
+presented early, so a change made while the debugger holds the machine in the
+middle of one shows with that frame's own present; a lost device or a resize
+makes the texture again, by one whole upload. On every other output it is drawn into the scaled output just before it
 is presented, and a frame blends that buffer onto the picture only where it has
 to. The scaler writes the output in place, rewriting only the blocks of a line
 that changed, so before it writes a line the overlay puts the picture back on

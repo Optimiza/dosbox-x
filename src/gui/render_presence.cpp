@@ -13,7 +13,7 @@
  *  The layers are composited once per change into a premultiplied ARGB buffer
  *  the size of the output, so a frame blends one ready pixel onto the picture
  *  and never asks the look again. An output with a texture of its own for the
- *  overlay (OpenGL) takes that buffer as it is, uploads only its changed
+ *  overlay (OpenGL, Direct3D 9) takes that buffer as it is, uploads only its changed
  *  rectangles, and the picture is never read or written at all: GLQuake's 2D
  *  over the 3D view, a quad that costs the GPU a blend and the CPU nothing.
  */
