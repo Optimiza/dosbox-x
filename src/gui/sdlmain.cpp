@@ -3360,6 +3360,7 @@ void GFX_OpenGLRedrawScreen(void) {
             glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
             glCallList(sdl_opengl.displaylist);
         }
+        OUTPUT_OPENGL_DrawPresence();
     }
 #endif
 }

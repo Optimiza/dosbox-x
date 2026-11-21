@@ -701,14 +701,17 @@ presence::Cost Delta(const presence::Cost &after, const presence::Cost &before) 
     d.read = after.read - before.read;
     d.written = after.written - before.written;
     d.presented = after.presented - before.presented;
+    d.uploads = after.uploads - before.uploads;
+    d.upload_bytes = after.upload_bytes - before.upload_bytes;
     return d;
 }
 
 void Print(const char *name, const Output &out, uint64_t frames, const presence::Cost &c) {
     std::printf("[presence-cost] case=%-7s output=%ux%u frames=%llu px_read=%llu"
-                " px_written=%llu bytes_presented=%llu\n",
+                " px_written=%llu bytes_presented=%llu uploads=%llu upload_bytes=%llu\n",
                 name, out.w, out.h, (unsigned long long)frames, (unsigned long long)c.read,
-                (unsigned long long)c.written, (unsigned long long)c.presented);
+                (unsigned long long)c.written, (unsigned long long)c.presented,
+                (unsigned long long)c.uploads, (unsigned long long)c.upload_bytes);
 }
 
 /* An overlay on a session's output with the arrow mid-picture, its first frame already shown,
@@ -716,14 +719,16 @@ void Print(const char *name, const Output &out, uint64_t frames, const presence:
 struct Session {
     Overlay o;
     Frame frame;
-    explicit Session(const Output &out, const char *state = "held", bool columns = true)
+    explicit Session(const Output &out, const char *state = "held", bool columns = true,
+                     presence::Texture *texture = nullptr)
         : frame(out.w, out.h, 0x00204060u) {
         std::string error;
         EXPECT_TRUE(o.Configure(std::string(state) + kSessionLook, error, 0)) << error;
         const Format f = Rgb32();
-        o.Resize(out.w, out.h, &f, columns);
+        o.Resize(out.w, out.h, &f, columns, texture);
         o.Guest(kGuestW, kGuestH);
         o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+        o.Upload();
     }
     /* A running guest's frame: the scaler takes the overlay off row 100, rewrites it, and the
        frame is drawn. */
@@ -899,6 +904,270 @@ TEST(PresenceCost, AScrollingCaptionRepaintsItsBoxOncePerGuestPixel) {
         EXPECT_EQ(c.read, 0u);
         EXPECT_EQ(c.written, w * h) << "the box, as wide as the room";
         EXPECT_EQ(c.presented, 4 * w * h);
+    }
+}
+
+/* An output's texture in memory, as the fake backend of decision 15 (b): what the texture would
+   hold, and what it was asked to do. Allocated garbage, so a pixel never uploaded shows. */
+struct FakeTexture final : presence::Texture {
+    unsigned w = 0, h = 0;
+    std::vector<uint32_t> px;
+    unsigned allocations = 0, uploads = 0;
+    void Allocate(unsigned width, unsigned height) override {
+        w = width;
+        h = height;
+        px.assign((size_t)w * h, 0xDEADBEEFu);
+        allocations++;
+    }
+    void Upload(const uint32_t *pixels, size_t pitch, const presence::Rect &r) override {
+        ASSERT_TRUE(r.x1 <= w && r.y1 <= h && !r.empty());
+        for (unsigned y = r.y0; y < r.y1; y++)
+            for (unsigned x = r.x0; x < r.x1; x++) px[(size_t)y * w + x] = pixels[(size_t)y * pitch + x];
+        uploads++;
+    }
+    void Present() override {}
+};
+
+/* Everything the session draws at once: the edge, the arrow, keycaps, a caption, the pause mark. */
+const char *const kEveryLayer = " caption=start serial=1 keys=Esc,F1 tint=5AC8FA";
+
+/* The same overlay drawn on the CPU over black and over white, and as a texture: the texture
+   holds premultiplied ARGB, so over black the CPU path shows its colour, and over white what is
+   left of the white is its alpha. */
+struct ThreeWays {
+    FakeTexture texture;             /* before the session that draws into it */
+    Session black, white, tex;
+    explicit ThreeWays(const char *state)
+        : black(kOutputs[0], state, true), white(kOutputs[0], state, true),
+          tex(kOutputs[0], state, true, &texture) {
+        std::fill(black.frame.px.begin(), black.frame.px.end(), 0x00000000u);
+        std::fill(white.frame.px.begin(), white.frame.px.end(), 0x00FFFFFFu);
+        Draw(0, "", 0.5f, 0.5f);
+    }
+    /* Every row rewritten by the scaler, so the CPU path draws the whole overlay afresh. */
+    void Draw(uint32_t now_ms, const std::string &words, float fx, float fy) {
+        for (Session *s : {&black, &white, &tex}) {
+            std::string error;
+            if (!words.empty()) ASSERT_TRUE(s->o.Configure(words, error, now_ms)) << error;
+            s->o.Undraw(s->frame.buf(), s->frame.pitch());
+            if (s == &black) std::fill(s->frame.px.begin(), s->frame.px.end(), 0x00000000u);
+            if (s == &white) std::fill(s->frame.px.begin(), s->frame.px.end(), 0x00FFFFFFu);
+            s->o.Compose(s->frame.buf(), s->frame.pitch(), nullptr, now_ms, true, fx, fy);
+            s->o.Upload();
+        }
+    }
+    /* How many pixels differ from what the CPU path drew, and how many the overlay covers. */
+    void Compare(unsigned &wrong, unsigned &covered) const {
+        wrong = covered = 0;
+        ASSERT_EQ(texture.px.size(), black.frame.px.size());
+        for (size_t i = 0; i < texture.px.size(); i++) {
+            const uint32_t t = texture.px[i], a = t >> 24;
+            const uint32_t left = 255u * (256u - (a + (a >> 7))) >> 8;   /* of white, under alpha a */
+            const uint32_t on_white = white.frame.px[i];
+            bool ok = (t & 0xFFFFFFu) == black.frame.px[i];
+            for (unsigned c = 0; c < 3; c++) {
+                const uint32_t premul = (t >> (8 * c)) & 0xFF;
+                ok = ok && premul <= a && ((on_white >> (8 * c)) & 0xFF) == premul + left;
+            }
+            wrong += !ok;
+            covered += a != 0;
+        }
+    }
+};
+
+TEST(PresenceCompositor, TheTextureHoldsEveryLayerAsTheCpuPathBlendsIt) {
+    ThreeWays w((std::string("paused") + kEveryLayer).c_str());
+    unsigned wrong = 0, covered = 0;
+    w.Compare(wrong, covered);
+    EXPECT_EQ(wrong, 0u);
+    const Expected e(kOutputs[0]);
+    EXPECT_GT(covered, e.edge) << "the edge and the band's boxes and the arrow";
+    EXPECT_EQ(w.texture.allocations, 1u);
+    EXPECT_EQ(w.texture.w, kOutputs[0].w);
+    EXPECT_EQ(w.texture.h, kOutputs[0].h);
+
+    /* a fade step, the arrow moved, a new caption, keys let go: uploaded only where they changed */
+    w.Draw(0, "held" + std::string(kSessionLook) + " caption=dir serial=2 keys=", 0.25f, 0.75f);
+    w.Draw(1250, "", 0.25f, 0.75f);
+    w.Compare(wrong, covered);
+    EXPECT_EQ(wrong, 0u);
+    EXPECT_EQ(w.texture.allocations, 1u);
+}
+
+TEST(PresenceCompositor, TheTexturePathNeverTouchesTheFrame) {
+    FakeTexture texture;
+    Session s(kOutputs[0], "acting", true, &texture);
+    const std::vector<uint32_t> picture = Frame(kOutputs[0].w, kOutputs[0].h, 0x00204060u).px;
+    EXPECT_TRUE(s.frame.px == picture) << "the first frame drawn left it as the scaler wrote it";
+    std::string error;
+    ASSERT_TRUE(s.o.Configure(std::string("paused") + kEveryLayer, error, 0));
+    EXPECT_FALSE(s.o.in_buffer()) << "the scaler has nothing to take off a line";
+    s.o.UndrawRows(s.frame.buf(), s.frame.pitch(), 0, kOutputs[0].h);
+    s.o.Undraw(s.frame.buf(), s.frame.pitch());
+    s.Running(500, 0.75f, 0.25f);
+    EXPECT_EQ(s.runs, s.one_line) << "the scaler's own rows are presented, and nothing else";
+    const uint16_t *rows = nullptr;
+    const std::vector<presence::Rect> *rects = nullptr;
+    EXPECT_FALSE(s.o.Columns(s.runs, rows, rects));
+    s.Still(3000);
+    EXPECT_EQ(s.runs, nullptr);
+    EXPECT_TRUE(s.frame.px == picture);
+    EXPECT_TRUE(s.o.drawn());
+    EXPECT_GT(s.o.cost().upload_bytes, 0u);
+}
+
+TEST(PresenceTexture, AStillOverlayOnARunningGameCostsNothing) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        const presence::Cost before = s.o.cost();
+        s.Running(0, 0.5f, 0.5f);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tstill", out, 1, c);
+        EXPECT_EQ(c.read + c.written + c.presented + c.uploads + c.upload_bytes, 0u);
+        EXPECT_FALSE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f));
+        EXPECT_FALSE(s.o.upload_pending());
+    }
+}
+
+TEST(PresenceTexture, AFadeUploadsTheEdgesPixelsAlone) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "acting", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        s.Running(1250, 0.5f, 0.5f);
+        EXPECT_TRUE(s.o.upload_pending()) << "a frame with no new lines is still to be shown";
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tfade", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u) << "the frame is not touched or re-sent";
+        EXPECT_EQ(c.upload_bytes, 4 * e.edge);
+        EXPECT_EQ(c.uploads, 4u) << "the top and bottom bands, and the two side strips";
+        EXPECT_NE(s.o.Describe().find(" uploads=" + std::to_string(s.o.cost().uploads) +
+                                      " upload_bytes=" + std::to_string(s.o.cost().upload_bytes) + " "),
+                  std::string::npos) << s.o.Describe();
+    }
+}
+
+TEST(PresenceTexture, AMovingArrowUploadsItsTwoBoxes) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        const presence::Cost before = s.o.cost();
+        s.Running(0, 0.5f + 1.0f / kGuestW, 0.5f);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tarrow", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, 4 * (e.box_w + e.sx) * e.box_h) << "the union of the two boxes";
+        EXPECT_EQ(c.uploads, 1u);
+    }
+}
+
+TEST(PresenceTexture, AParkedFadeUploadsTheEdgeAtEveryAlphaStepAndPresentsNoFrame) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "acting", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop, as PRESENCE_Repaint */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(nullptr, 0, nullptr, ms, true, 0.5f, 0.5f);
+            s.o.Upload();
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tparked", out, repaints, c);
+        const Expected e(out);
+        EXPECT_EQ(repaints, 54u - 18u);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, repaints * 4 * e.edge);
+    }
+}
+
+TEST(PresenceTexture, ACaptionIsUploadedOnceAndThenCostsNothing) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held caption=start serial=1", error, 0));
+        const presence::Cost before = s.o.cost();
+        s.Still(0);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tcaption", out, 1, c);
+        const uint64_t gx0 = 7 + (320 - 14 - 44) / 2;
+        const uint64_t w = OutSpan(gx0, gx0 + 44, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, 4 * w * h) << "the caption's box";
+        const presence::Cost mid = s.o.cost();
+        s.Still(5000);
+        s.o.Upload();
+        EXPECT_EQ(Delta(s.o.cost(), mid).upload_bytes, 0u) << "a still caption costs nothing";
+    }
+}
+
+TEST(PresenceTexture, ANewOrLostTextureIsUploadedWholeOnce) {
+    FakeTexture texture;
+    const Output &out = kOutputs[0];
+    Session s(out, "held", true, &texture);
+    EXPECT_EQ(texture.allocations, 1u);
+    EXPECT_EQ(s.o.cost().upload_bytes, 4ull * out.w * out.h) << "a new texture holds nothing yet";
+    const presence::Cost before = s.o.cost();
+    s.o.TextureLost();
+    EXPECT_TRUE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f)) << "the overlay must come back";
+    s.Still(0);
+    s.o.Upload();
+    const presence::Cost c = Delta(s.o.cost(), before);
+    EXPECT_EQ(texture.allocations, 2u);
+    EXPECT_EQ(c.uploads, 1u);
+    EXPECT_EQ(c.upload_bytes, 4ull * out.w * out.h);
+    EXPECT_EQ(std::count(texture.px.begin(), texture.px.end(), 0xDEADBEEFu), 0)
+        << "every pixel of the new texture uploaded";
+
+    /* lost while nothing is drawn: nothing to upload until something is */
+    std::string error;
+    ASSERT_TRUE(s.o.Configure("off", error, 0));
+    s.Still(0);
+    s.o.Upload();
+    const presence::Cost off = s.o.cost();
+    s.o.TextureLost();
+    EXPECT_FALSE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f));
+    s.o.Upload();
+    EXPECT_EQ(Delta(s.o.cost(), off).uploads, 0u);
+    EXPECT_EQ(texture.allocations, 2u);
+}
+
+uint32_t Grey(const void *, unsigned, unsigned) { return 0x808080u; }
+
+TEST(PresenceTexture, AutoReadsItsSamplesOnceASecondAndNothingElse) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held place=auto", error, 0));
+        presence::Picture picture;
+        picture.width = kGuestW;
+        picture.height = kGuestH;
+        picture.pixel = Grey;
+        const presence::Cost before = s.o.cost();
+        for (unsigned frame = 0; frame < 60; frame++) {   /* one second of a running game */
+            const uint32_t ms = frame * 1000 / 60;
+            s.o.Sample(ms, picture);
+            s.Running(ms, 0.5f, 0.5f);
+            s.o.Upload();
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tauto", out, 60, c);
+        EXPECT_EQ(c.read, 2u * presence::placement::SAMPLES) << "one sample of both bands";
+        EXPECT_EQ(c.written + c.presented + c.uploads + c.upload_bytes, 0u);
     }
 }
 

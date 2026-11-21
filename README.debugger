@@ -354,8 +354,10 @@ format, scaler or window mode, and `frames` does not), the same on any host: `px
 it saves before drawing, and the guest pixels `auto` samples), `px_written` the
 output pixels it wrote (put back or blended), `bytes_presented` the bytes it
 handed on to be presented, the scaler's own rows included, and `uploads` and
-`upload_bytes` the uploads of an overlay texture, 0 where it is drawn into the
-frame. `layers` names the layers asked for and `place` the band in use; on an
+`upload_bytes` the rectangles uploaded to the overlay's own texture and their
+bytes, 0 where it is drawn into the frame. On the OpenGL output the overlay is
+that texture, so `px_read` counts only `auto`'s samples and `px_written` and
+`bytes_presented` stay 0. `layers` names the layers asked for and `place` the band in use; on an
 output it cannot draw on, `layers` is empty and `lacks` names the layers asked
 for. Two replies with no output made between them give the cost between them. An unknown
 state or key, or a value out of its range, answers ERR naming it and changes
@@ -366,17 +368,21 @@ The bare command, `PRESENCE` with no state, changes nothing and answers the same
 with `version=3` appended, so a client can refuse a build older than it expects
 (version 1 was implicit, version 2 drew the edge and the arrow only).
 
-The overlay is drawn into the scaled output just before it is presented, after
-the frame was handed to capture: screenshots, video capture and the VGA memory
-never contain it. Its layers are composited once per change into a buffer of
-their own, and a frame blends that buffer onto the picture only where it has
+The overlay is drawn after the frame was handed to capture: screenshots, video
+capture and the VGA memory never contain it. Its layers are composited once per
+change into a buffer of their own. On the OpenGL output that buffer is a texture
+of its own, drawn as a second quad over the frame's with every swap of the
+window, and only its rectangles that changed are uploaded; the frame's pixels
+are never read or written for it, and a change over a still picture shows the
+frame as it stands with the new overlay over it, sending none of the frame
+again. On every other output it is drawn into the scaled output just before it
+is presented, and a frame blends that buffer onto the picture only where it has
 to. The scaler writes the output in place, rewriting only the blocks of a line
 that changed, so before it writes a line the overlay puts the picture back on
 that line's rows, and after the frame it draws itself again on those rows; every
 other row keeps the overlay as it was, and only a layer that changed (a fade, the
 arrow moving, a new caption, a scroll step) is redrawn and presented, and on an
-output that presents rectangles (the surface output, OpenGL without a pixel
-buffer object) only its rectangles are. The complex scalers (hq2x, the SaI
+output that presents rectangles (the surface output) only its rectangles are. The complex scalers (hq2x, the SaI
 family, advmame) and a frame that rewrites everything take the overlay off every
 row first. A still overlay over a still picture costs nothing but a check per
 frame. While the debugger holds the machine, its loop repaints the window when the

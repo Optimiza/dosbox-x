@@ -549,10 +549,7 @@ void RENDER_EndUpdate( bool abort ) {
             render.frameskip.hadSkip[render.frameskip.index] = 0;
         } else if (!abort && PRESENCE_WantsRepaint()) {
             /* Nothing changed on screen, but the overlay did (a fade, the pointer). */
-            uint8_t *pixels = nullptr;
-            Bitu pitch = 0;
-            if (GFX_StartUpdate(pixels, pitch))
-                GFX_EndUpdate(PRESENCE_EndFrame(pixels, pitch, nullptr));
+            PRESENCE_Repaint();
         } else {
 #if 0
             Bitu total = 0, i;
@@ -990,20 +987,21 @@ forcenormal:
 	const bool ttf_text = false;
 #endif
 	/* the outputs that present a rectangle of the frame, not only whole rows; xBRZ rescales
-	   whole rows and a pixel buffer object uploads the whole frame */
+	   whole rows. OpenGL draws the overlay as a texture of its own instead, so the frame's
+	   pixels are never touched, with or without a pixel buffer object or xBRZ. */
 	bool presence_columns = sdl.desktop.type == SCREEN_SURFACE;
-#if C_OPENGL
-	presence_columns = presence_columns ||
-	                   (sdl.desktop.type == SCREEN_OPENGL && !sdl_opengl.pixel_buffer_object);
-#endif
 #if C_XBRZ
 	presence_columns = presence_columns && !(sdl_xbrz.enable && sdl_xbrz.scale_on);
+#endif
+	presence::Texture *presence_texture = nullptr;
+#if C_OPENGL
+	if (sdl.desktop.type == SCREEN_OPENGL) presence_texture = OUTPUT_OPENGL_PresenceTexture();
 #endif
 	PRESENCE_OutputChanged((unsigned)width, (unsigned)height,
 	                       ttf_text ? 0u :
 	                       render.scale.outMode == scalerMode32 ? 4u :
 	                       render.scale.outMode == scalerMode8 ? 0u : 2u,
-	                       presence_columns);
+	                       presence_columns, presence_texture);
 	ScalerLineBlock_t *lineBlock;
 
 	/* how many bytes will be needed in the write cache?

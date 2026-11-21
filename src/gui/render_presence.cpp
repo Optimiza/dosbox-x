@@ -12,7 +12,10 @@
  *
  *  The layers are composited once per change into a premultiplied ARGB buffer
  *  the size of the output, so a frame blends one ready pixel onto the picture
- *  and never asks the look again.
+ *  and never asks the look again. An output with a texture of its own for the
+ *  overlay (OpenGL) takes that buffer as it is, uploads only its changed
+ *  rectangles, and the picture is never read or written at all: GLQuake's 2D
+ *  over the 3D view, a quad that costs the GPU a blend and the CPU nothing.
  */
 
 #include "render_presence.h"
@@ -348,11 +351,15 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     return true;
 }
 
-void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, bool columns) {
+void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, bool columns,
+                     Texture *texture) {
     width_ = width;
     height_ = height;
     fmt_ = fmt ? *fmt : Format();
-    columns_ = columns;
+    columns_ = columns && texture == nullptr;
+    texture_ = texture;
+    allocate_ = true;
+    uploads_.clear();
     rgb32_ = fmt_.bytes == 4 && fmt_.mask[0] == 0xFF0000u && fmt_.mask[1] == 0xFF00u &&
              fmt_.mask[2] == 0xFFu;
     for (int i = 0; i < 3; i++) {
@@ -367,8 +374,9 @@ void Overlay::Resize(unsigned width, unsigned height, const Format *fmt, bool co
     }
     const size_t pixels = drawable() ? (size_t)width * height : 0;
     over_.assign(pixels, 0);
-    under_.assign(pixels, 0);
-    row_drawn_.assign(drawable() ? height : 0, 1);  /* a new buffer holds no overlay: nothing to take off */
+    /* the texture path never touches the frame, so it keeps no clean copy of it */
+    under_.assign(texture_ ? 0 : pixels, 0);
+    row_drawn_.assign(drawable() && !texture_ ? height : 0, 1);  /* a new buffer holds no overlay: nothing to take off */
     marks_.assign(drawable() ? height : 0, 0);
     drawn_ = Scene();
     cover_old_.clear();
@@ -577,7 +585,7 @@ bool Overlay::drawn() const {
 
 bool Overlay::NeedsRepaint(uint32_t now_ms, bool have_pointer, float fx, float fy) const {
     if (!drawable()) return false;
-    if (!pending_.empty()) return true;
+    if (!pending_.empty() || !uploads_.empty()) return true;
     const Scene s = SceneAt(now_ms, have_pointer, fx, fy);
     for (int l = 0; l < LAYER_COUNT; l++)
         if (!(s.key[l] == drawn_.key[l])) return true;
@@ -741,7 +749,7 @@ uint32_t Overlay::Blend(uint32_t under, uint32_t over) const {
 }
 
 void Overlay::UndrawRows(uint8_t *buf, size_t pitch, unsigned y, unsigned rows) {
-    if (!drawable() || buf == nullptr) return;
+    if (!drawable() || buf == nullptr || texture_) return;
     const unsigned bytes = fmt_.bytes;
     for (unsigned row = y; row < std::min(height_, y + rows); row++) {
         if (!row_drawn_[row]) continue;
@@ -760,7 +768,7 @@ void Overlay::UndrawRows(uint8_t *buf, size_t pitch, unsigned y, unsigned rows) 
 const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *changed,
                                  uint32_t now_ms, bool have_pointer, float fx, float fy,
                                  bool shown) {
-    if (!drawable() || buf == nullptr) return changed;
+    if (!drawable() || (buf == nullptr && texture_ == nullptr)) return changed;
     const Scene s = SceneAt(now_ms, have_pointer, fx, fy);
     const unsigned bytes = fmt_.bytes;
 
@@ -781,6 +789,12 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
             RowIntervals(y, dirty.data(), dirty.size(), iv_a_);
             for (const Interval &iv : iv_a_) PaintRow(s, y, iv.x0, iv.x1);
         }
+    }
+    if (texture_) {
+        uploads_.insert(uploads_.end(), dirty.begin(), dirty.end());
+        drawn_ = s;
+        if (s.state != State::Off) frames_++;
+        return changed;
     }
     std::vector<Rect> &cover = cover_now_;
     Cover(s, cover);
@@ -862,25 +876,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
         }
     }
     present_.clear();
-    unsigned py0 = height_, py1 = 0;
-    for (const Rect &r : pending_) { py0 = std::min(py0, r.y0); py1 = std::max(py1, r.y1); }
-    size_t open = 0;                         /* the last `open` rectangles grow down */
-    iv_b_.clear();
-    for (unsigned y = py0; y < py1; y++) {
-        RowIntervals(y, pending_.data(), pending_.size(), iv_a_);
-        if (marks_[y] == 1 || iv_a_.empty()) { open = 0; iv_b_.clear(); continue; }
-        const bool same = iv_a_.size() == iv_b_.size() &&
-                          std::equal(iv_a_.begin(), iv_a_.end(), iv_b_.begin(),
-                                     [](const Interval &p, const Interval &q) { return p.x0 == q.x0 && p.x1 == q.x1; });
-        if (same && open) {
-            for (size_t i = present_.size() - open; i < present_.size(); i++) present_[i].y1 = y + 1;
-        } else {
-            for (const Interval &iv : iv_a_) present_.push_back({iv.x0, y, iv.x1, y + 1});
-            open = iv_a_.size();
-            iv_b_ = iv_a_;
-        }
-        marks_[y] = 2;
-    }
+    Coalesce(pending_, present_, &marks_);
     runs_.clear();
     bool on = false;
     unsigned count = 0;
@@ -902,6 +898,53 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
     }
     pending_.clear();
     return runs_.data();
+}
+
+void Overlay::Coalesce(const std::vector<Rect> &in, std::vector<Rect> &out, std::vector<uint8_t> *marks) {
+    unsigned y0 = height_, y1 = 0;
+    for (const Rect &r : in) { y0 = std::min(y0, r.y0); y1 = std::max(y1, r.y1); }
+    size_t open = 0;                         /* the last `open` rectangles grow down */
+    iv_b_.clear();
+    for (unsigned y = y0; y < y1; y++) {
+        RowIntervals(y, in.data(), in.size(), iv_a_);
+        if ((marks && (*marks)[y] == 1) || iv_a_.empty()) { open = 0; iv_b_.clear(); continue; }
+        const bool same = iv_a_.size() == iv_b_.size() &&
+                          std::equal(iv_a_.begin(), iv_a_.end(), iv_b_.begin(),
+                                     [](const Interval &p, const Interval &q) { return p.x0 == q.x0 && p.x1 == q.x1; });
+        if (same && open) {
+            for (size_t i = out.size() - open; i < out.size(); i++) out[i].y1 = y + 1;
+        } else {
+            for (const Interval &iv : iv_a_) out.push_back({iv.x0, y, iv.x1, y + 1});
+            open = iv_a_.size();
+            iv_b_ = iv_a_;
+        }
+        if (marks) (*marks)[y] = 2;
+    }
+}
+
+void Overlay::Upload() {
+    if (texture_ == nullptr || !drawable() || uploads_.empty()) return;
+    if (allocate_) {
+        texture_->Allocate(width_, height_);
+        allocate_ = false;
+        uploads_.assign(1, Rect{0, 0, width_, height_});
+    }
+    upload_rects_.clear();
+    Coalesce(uploads_, upload_rects_, nullptr);
+    uploads_.clear();
+    for (const Rect &r : upload_rects_) {
+        texture_->Upload(over_.data(), width_, r);
+        cost_.uploads++;
+        cost_.upload_bytes += (uint64_t)(r.x1 - r.x0) * (r.y1 - r.y0) * 4;
+    }
+}
+
+void Overlay::TextureLost() {
+    if (texture_ == nullptr) return;
+    allocate_ = true;
+    uploads_.clear();
+    /* nothing drawn: the texture is allocated with the next change, not uploaded empty */
+    if (drawn() && drawable()) uploads_.push_back({0, 0, width_, height_});
 }
 
 bool Overlay::Columns(const uint16_t *runs, const uint16_t *&rows, const std::vector<Rect> *&rects) const {
@@ -1044,12 +1087,13 @@ bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines) 
     return true;
 }
 
-void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes, bool columns) {
+void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes, bool columns,
+                            presence::Texture *texture) {
     presence::Format fmt;
     const bool ok = bytes != 0 && presence::FormatFromPixels(
             bytes, (uint32_t)GFX_GetRGB(0, 0, 0), (uint32_t)GFX_GetRGB(255, 0, 0),
             (uint32_t)GFX_GetRGB(0, 255, 0), (uint32_t)GFX_GetRGB(0, 0, 255), fmt);
-    presence::Instance().Resize(width, height, ok ? &fmt : nullptr, columns);
+    presence::Instance().Resize(width, height, ok ? &fmt : nullptr, columns, ok ? texture : nullptr);
     frame_buf = nullptr;
 }
 
@@ -1060,7 +1104,7 @@ void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch, bool whole) {
 }
 
 bool PRESENCE_Drawn() {
-    return presence::Instance().drawn();
+    return presence::Instance().in_buffer();
 }
 
 void PRESENCE_UndrawRows(unsigned y, unsigned rows) {
@@ -1095,10 +1139,37 @@ bool PRESENCE_WantsRepaint() {
     return presence::Instance().NeedsRepaint(now, pointer, fx, fy);
 }
 
-void PRESENCE_ParkedTick() {
-    if (!PRESENCE_WantsRepaint()) return;
+void PRESENCE_Repaint() {
+    presence::Texture *texture = presence::Instance().texture();
+    if (texture) {
+        /* the frame stays as it was shown: only the overlay's texture changes */
+        PRESENCE_EndFrame(nullptr, 0, nullptr);
+        texture->Present();
+        return;
+    }
     uint8_t *pixels = nullptr;
     Bitu pitch = 0;
     if (!GFX_StartUpdate(pixels, pitch)) return;
     GFX_EndUpdate(PRESENCE_EndFrame(pixels, (size_t)pitch, nullptr));
+}
+
+void PRESENCE_ParkedTick() {
+    if (PRESENCE_WantsRepaint()) PRESENCE_Repaint();
+}
+
+bool PRESENCE_TextureDraw(const presence::Texture *texture) {
+    presence::Overlay &o = presence::Instance();
+    if (texture == nullptr || o.texture() != texture) return false;
+    o.Upload();
+    return o.drawn();
+}
+
+bool PRESENCE_TexturePending(const presence::Texture *texture) {
+    const presence::Overlay &o = presence::Instance();
+    return texture != nullptr && o.texture() == texture && o.upload_pending();
+}
+
+void PRESENCE_TextureLost(const presence::Texture *texture) {
+    presence::Overlay &o = presence::Instance();
+    if (texture != nullptr && o.texture() == texture) o.TextureLost();
 }

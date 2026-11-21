@@ -4,9 +4,10 @@
  *  inner sides and, as asked, the guest's mouse pointer, the keys held down, a
  *  caption naming the call and a mark while the session holds the machine.
  *
- *  It is drawn into the scaled output buffer just before it is presented,
- *  after the frame has been handed to capture: screenshots, video capture and
- *  the VGA memory never see it. See README.debugger, "Presence".
+ *  It is drawn into the scaled output buffer just before it is presented, or
+ *  on OpenGL as a texture of its own over the frame, after the frame has been
+ *  handed to capture: screenshots, video capture and the VGA memory never see
+ *  it. See README.debugger, "Presence".
  */
 
 #ifndef DOSBOX_RENDER_PRESENCE_H
@@ -81,8 +82,9 @@ bool FormatFromPixels(unsigned bytes, uint32_t black, uint32_t r, uint32_t g, ui
 
 /* What drawing the overlay has cost, counted since the output was made: the output pixels it read
    (saved, sampled for placement), the output pixels it wrote (put back, blended), the bytes it
-   handed on to be presented, and the uploads of an overlay texture (none on this path). Pixels
-   and bytes, so the same on any host. */
+   handed on to be presented, and the rectangles uploaded to an overlay texture (none on the CPU
+   path, and nothing read, written or presented of the frame on the texture path). Pixels and
+   bytes, so the same on any host. */
 struct Cost {
     uint64_t read = 0;
     uint64_t written = 0;
@@ -96,6 +98,19 @@ struct Rect {
     unsigned x0 = 0, y0 = 0, x1 = 0, y1 = 0;
     bool empty() const { return x0 >= x1 || y0 >= y1; }
     bool operator==(const Rect &o) const { return x0 == o.x0 && y0 == o.y0 && x1 == o.x1 && y1 == o.y1; }
+};
+
+/* An output that draws the overlay as a texture of its own, a second quad over the frame, so
+   the frame's pixels are never touched. The overlay hands it what changed and asks it to show. */
+class Texture {
+public:
+    virtual ~Texture() = default;
+    /* A texture of `width` by `height` pixels, its content undefined until uploaded. */
+    virtual void Allocate(unsigned width, unsigned height) = 0;
+    /* Rectangle `r` of `pixels`, premultiplied ARGB as 0xAARRGGBB, `pitch` pixels a row. */
+    virtual void Upload(const uint32_t *pixels, size_t pitch, const Rect &r) = 0;
+    /* Show the frame as it last stood with the overlay over it, uploading nothing of the frame. */
+    virtual void Present() = 0;
 };
 
 /* Decision 13's sampling, the rules scry_core.placement states and its test vectors replay. */
@@ -127,9 +142,11 @@ public:
     bool Configure(const std::string &args, std::string &error, uint32_t now_ms);
 
     /* The output the overlay is drawn on; `fmt` null when it cannot be (an 8-bit or text
-       output, no output yet). `columns`: the output presents rectangles, not only rows. A new
-       output holds no overlay. */
-    void Resize(unsigned width, unsigned height, const Format *fmt, bool columns = false);
+       output, no output yet). `columns`: the output presents rectangles, not only rows.
+       `texture`: the output draws the overlay as that texture, and the buffer Compose is
+       handed is never touched. A new output holds no overlay. */
+    void Resize(unsigned width, unsigned height, const Format *fmt, bool columns = false,
+                Texture *texture = nullptr);
 
     /* The guest picture the output is scaled from, in the guest's own pixels
        (0 for none: one output pixel a guest pixel). A new size repaints every layer. */
@@ -160,12 +177,24 @@ public:
        False when `runs` carries everything, as it does when no layer changed. */
     bool Columns(const uint16_t *runs, const uint16_t *&rows, const std::vector<Rect> *&rects) const;
 
+    /* On the texture path: hand the texture every rectangle changed since the last call,
+       allocating it first when it is new or was lost. Each rectangle is one upload. */
+    void Upload();
+    /* The texture lost its content (a device reset, a new context): allocated and uploaded
+       whole again before it is next drawn. */
+    void TextureLost();
+    Texture *texture() const { return texture_; }
+    /* Whether a change waits to be uploaded to the texture. */
+    bool upload_pending() const { return !uploads_.empty(); }
+
     /* Placement `auto`: score the guest's two bands once every SAMPLE_MS. */
     void Sample(uint32_t now_ms, const Picture &picture);
 
     State state() const { return state_; }
     Place place() const { return band_; }
     bool drawn() const;
+    /* Whether the output buffer holds the overlay, so the scaler must take it off a line. */
+    bool in_buffer() const { return texture_ == nullptr && drawn(); }
     uint64_t frames() const { return frames_; }
     const Cost &cost() const { return cost_; }
     bool drawable() const { return fmt_.bytes != 0 && width_ != 0 && height_ != 0; }
@@ -211,6 +240,9 @@ private:
     /* The merged intervals of row `y` inside `rects`. */
     static void RowIntervals(unsigned y, const Rect *rects, size_t n, std::vector<Interval> &out);
     static void Cover(const Scene &s, std::vector<Rect> &out);
+    /* The per-row union of `in`, coalesced over rows alike, appended to `out`; with `marks`,
+       a row marked 1 is left out and a covered one is marked 2. */
+    void Coalesce(const std::vector<Rect> &in, std::vector<Rect> &out, std::vector<uint8_t> *marks);
     void Prepare(const Scene &s);
     void PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1);
     void PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, uint32_t *row,
@@ -251,6 +283,10 @@ private:
     Format fmt_;
     bool rgb32_ = false;                    /* 0x00RRGGBB: two channels a multiply */
     bool columns_ = false;
+    Texture *texture_ = nullptr;
+    bool allocate_ = false;                 /* the texture is new or lost: allocate, upload whole */
+    std::vector<Rect> uploads_;             /* changed since the texture was last uploaded */
+    std::vector<Rect> upload_rects_;
     /* each channel's value as 8 bits, and 8 bits as the channel's value */
     std::vector<uint8_t> to8_[3];
     std::vector<uint32_t> from8_[3];
@@ -288,8 +324,10 @@ Overlay &Instance();
 /* The debugger's PRESENCE command: the reply lines, or false and the error. */
 bool PRESENCE_Command(const std::string &args, std::vector<std::string> &lines);
 /* The render's output changed size or format: `bytes` per pixel, 0 for one it cannot be drawn
-   on; `columns` when the output presents rectangles (PRESENCE_Columns). */
-void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes, bool columns);
+   on; `columns` when the output presents rectangles (PRESENCE_Columns); `texture` when it draws
+   the overlay as a texture of its own. */
+void PRESENCE_OutputChanged(unsigned width, unsigned height, unsigned bytes, bool columns,
+                            presence::Texture *texture = nullptr);
 /* The scaler is about to write the output buffer `buf`; `whole` when it rewrites every row. */
 void PRESENCE_BeginFrame(uint8_t *buf, size_t pitch, bool whole);
 /* Whether the overlay is in the buffer, so a scaler line has to ask before writing. */
@@ -304,7 +342,16 @@ bool PRESENCE_Columns(const uint16_t *changed, const uint16_t *&rows,
                       const std::vector<presence::Rect> *&rects);
 /* Whether a frame the scaler did not write should still be presented. */
 bool PRESENCE_WantsRepaint();
+/* Show the overlay as it is now over a frame the scaler did not write. */
+void PRESENCE_Repaint();
 /* The debugger holds the machine: repaint if the overlay moved (a fade, a new state). */
 void PRESENCE_ParkedTick();
+/* For the output `texture`: upload what changed, and whether there is an overlay to draw. */
+bool PRESENCE_TextureDraw(const presence::Texture *texture);
+/* Whether the overlay changed since `texture` was last uploaded, so a frame with no new
+   picture is still to be shown. */
+bool PRESENCE_TexturePending(const presence::Texture *texture);
+/* `texture` lost its content: see Overlay::TextureLost. */
+void PRESENCE_TextureLost(const presence::Texture *texture);
 
 #endif

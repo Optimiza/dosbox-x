@@ -652,6 +652,129 @@ static void OPENGL_RestoreContext(void)
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 }
 
+/* The presence overlay's own texture, drawn as a second quad over the frame's with
+   premultiplied blending, so the frame's pixels are never touched for it. It has the size of
+   the frame's used part and is stretched onto the same rectangle of the window. */
+class OpenGLPresence final : public presence::Texture {
+public:
+    void Allocate(unsigned width, unsigned height) override {
+        unsigned side = 1;
+        while (side < std::max(width, height)) side <<= 1;
+        if (texture == 0) glGenTextures(1, &texture);
+        const GLint unpack = UnbindPixelBuffer();
+        glBindTexture(GL_TEXTURE_2D, texture);
+        const GLint interp = (sdl_opengl.kind == GLNearest || sdl_opengl.kind == GLPerfect) ? GL_NEAREST : GL_LINEAR;
+        /* a filtered quad samples half a texel past the part in use: transparent there, never
+           the border colour or whatever the allocation held */
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, interp);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, interp);
+        const std::vector<uint32_t> clear((size_t)side * side, 0u);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)side, (GLsizei)side, 0, GL_BGRA_EXT,
+                     GL_UNSIGNED_INT_8_8_8_8_REV, clear.data());
+        glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+        RebindPixelBuffer(unpack);
+        w = width;
+        h = height;
+        size = side;
+    }
+    void Upload(const uint32_t *pixels, size_t pitch, const presence::Rect &r) override {
+        const GLint unpack = UnbindPixelBuffer();
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)pitch);
+        /* 0xAARRGGBB words whatever the CPU's byte order, unlike the frame's SDL 1 pixels */
+        glTexSubImage2D(GL_TEXTURE_2D, 0, (GLint)r.x0, (GLint)r.y0, (GLsizei)(r.x1 - r.x0),
+                        (GLsizei)(r.y1 - r.y0), GL_BGRA_EXT, GL_UNSIGNED_INT_8_8_8_8_REV,
+                        pixels + (size_t)r.y0 * pitch + r.x0);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+        RebindPixelBuffer(unpack);
+    }
+    void Present() override { OUTPUT_OPENGL_Present(); }
+    /* The context was made again, or the frame's texture with it: ours is made anew. */
+    void Lost() {
+        if (texture != 0) glDeleteTextures(1, &texture);
+        texture = 0;
+        PRESENCE_TextureLost(this);
+    }
+    void Draw() {
+        if (!PRESENCE_TextureDraw(this) || texture == 0 || size == 0) return;
+        /* the shader, when there is one, draws the frame only: the quad is fixed function, over
+           the same rectangle, in the viewport's own coordinates */
+        if (sdl_opengl.program_object) glUseProgram(0);
+        glMatrixMode(GL_TEXTURE);
+        glPushMatrix();
+        glLoadIdentity();
+        glMatrixMode(GL_PROJECTION);
+        glPushMatrix();
+        glMatrixMode(GL_MODELVIEW);
+        glPushMatrix();
+        GLfloat x0, y0, x1, y1;
+        if (sdl_opengl.program_object) {
+            glMatrixMode(GL_PROJECTION);
+            glLoadIdentity();
+            glMatrixMode(GL_MODELVIEW);
+            glLoadIdentity();
+            x0 = -1.0f; y0 = 1.0f; x1 = 1.0f; y1 = -1.0f;
+        } else {
+            x0 = (GLfloat)sdl.clip.x;
+            y0 = (GLfloat)sdl.clip.y;
+            x1 = x0 + (GLfloat)sdl.clip.w;
+            y1 = y0 + (GLfloat)sdl.clip.h;
+        }
+        const GLfloat u = (GLfloat)w / (GLfloat)size, v = (GLfloat)h / (GLfloat)size;
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+        glBegin(GL_QUADS);
+        glTexCoord2f(0, 0); glVertex2f(x0, y0);
+        glTexCoord2f(u, 0); glVertex2f(x1, y0);
+        glTexCoord2f(u, v); glVertex2f(x1, y1);
+        glTexCoord2f(0, v); glVertex2f(x0, y1);
+        glEnd();
+        glBlendFunc(GL_ONE, GL_ZERO);
+        glDisable(GL_BLEND);
+        glMatrixMode(GL_MODELVIEW);
+        glPopMatrix();
+        glMatrixMode(GL_PROJECTION);
+        glPopMatrix();
+        glMatrixMode(GL_TEXTURE);
+        glPopMatrix();
+        glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+        if (sdl_opengl.program_object) glUseProgram(sdl_opengl.program_object);
+    }
+
+private:
+    /* The frame's pixel buffer object can be bound, and mapped, between frames: a texture
+       upload with it bound would read from it. */
+    static GLint UnbindPixelBuffer() {
+        GLint unpack = 0;
+        if (!sdl_opengl.pixel_buffer_object) return 0;
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING_EXT, &unpack);
+        glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, 0);
+        return unpack;
+    }
+    static void RebindPixelBuffer(GLint unpack) {
+        if (sdl_opengl.pixel_buffer_object) glBindBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT, (GLuint)unpack);
+    }
+
+    GLuint texture = 0;
+    unsigned w = 0, h = 0, size = 0;
+};
+
+static OpenGLPresence opengl_presence;
+
+presence::Texture *OUTPUT_OPENGL_PresenceTexture(void)
+{
+    return &opengl_presence;
+}
+
+void OUTPUT_OPENGL_DrawPresence(void)
+{
+    opengl_presence.Draw();
+}
+
 Bitu OUTPUT_OPENGL_SetSize()
 {
     Bitu retFlags = 0;
@@ -840,6 +963,7 @@ Bitu OUTPUT_OPENGL_SetSize()
     else
         glViewport(0, 0, win_w, win_h);
     if (sdl_opengl.texture > 0) glDeleteTextures(1, &sdl_opengl.texture);
+    opengl_presence.Lost();
     glGenTextures(1, &sdl_opengl.texture);
     glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
     glTexEnvi(GL_TEXTURE_ENV, GL_TEXTURE_ENV_MODE, GL_REPLACE);
@@ -1090,14 +1214,18 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
             }
             CheckManagement();
             glCallList(sdl_opengl.displaylist);
+            OUTPUT_OPENGL_DrawPresence();
             SDL_GL_SwapBuffers();
         }
         else
 #endif /*C_XBRZ*/
         if (sdl_opengl.pixel_buffer_object) 
         {
-            if (changedLines && (changedLines[0] == sdl.draw.height))
+            if (changedLines && (changedLines[0] == sdl.draw.height)) {
+                /* no new picture, but the overlay over it may have changed */
+                if (PRESENCE_TexturePending(&opengl_presence)) OUTPUT_OPENGL_Present();
                 return;
+            }
 
             glUnmapBufferARB(GL_PIXEL_UNPACK_BUFFER_EXT);
             glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
@@ -1111,34 +1239,23 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
         }
         else if (changedLines) 
         {
-            if (changedLines[0] == sdl.draw.height)
+            if (changedLines[0] == sdl.draw.height) {
+                if (PRESENCE_TexturePending(&opengl_presence)) OUTPUT_OPENGL_Present();
                 return;
+            }
 
-            /* the presence overlay's changes come as rectangles beside the frame's own rows,
-               and only the rectangle is uploaded */
-            const uint16_t *rows = changedLines;
-            const std::vector<presence::Rect> *columns = nullptr;
-            if (!PRESENCE_Columns(changedLines, rows, columns)) columns = nullptr;
             Bitu y = 0, index = 0;
             glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
-            if (columns && !columns->empty()) {
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(sdl_opengl.pitch / 4));
-                for (const presence::Rect &r : *columns)
-                    glTexSubImage2D(GL_TEXTURE_2D, 0, (int)r.x0, (int)r.y0, (int)(r.x1 - r.x0),
-                        (int)(r.y1 - r.y0), GL_BGRA_EXT, OPENGL_PixelType(),
-                        (uint8_t *)sdl_opengl.framebuf + r.y0 * sdl_opengl.pitch + r.x0 * 4);
-                glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-            }
-            while (rows && y < sdl.draw.height) 
+            while (y < sdl.draw.height) 
             {
                 if (!(index & 1)) 
                 {
-                    y += rows[index];
+                    y += changedLines[index];
                 }
                 else 
                 {
                     uint8_t *pixels = (uint8_t *)sdl_opengl.framebuf + y * sdl_opengl.pitch;
-                    Bitu height = rows[index];
+                    Bitu height = changedLines[index];
 
                     // FIXME: This is causing libgallium crashes by sometimes getting y+height > sdl.draw.height.
                     //        It seems to happen on VGA mode changes.
@@ -1158,8 +1275,10 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
                 }
                 index++;
             }
-        } else
+        } else {
+            if (PRESENCE_TexturePending(&opengl_presence)) OUTPUT_OPENGL_Present();
             return;
+        }
 
         CheckManagement();
         if (sdl_opengl.program_object) {
@@ -1199,6 +1318,7 @@ void OUTPUT_OPENGL_EndUpdate(const uint16_t *changedLines)
 	glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
 #endif
 
+	OUTPUT_OPENGL_DrawPresence();
 	SDL_GL_SwapBuffers();
 
         if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
@@ -1420,10 +1540,33 @@ void OUTPUT_OPENGL_PresentExternal(void)
     CheckClearing();
     if (sdl_opengl.clear_countdown > 0) sdl_opengl.clear_countdown--;
     OUTPUT_OPENGL_DrawExternal();
+    OUTPUT_OPENGL_DrawPresence();
     CheckMenuDrawing();
     SDL_GL_SwapBuffers();
 
     if (!menu.hidecycles && !sdl.desktop.fullscreen) frames++;
+}
+
+/* show the frame texture as it stands with the presence overlay over it: what an overlay that
+   changed over a still picture needs, which EndUpdate does not do without new lines */
+void OUTPUT_OPENGL_Present(void)
+{
+    if (!sdl_opengl.inited || !OUTPUT_OPENGL_Active()) return;
+
+    GFX_OpenGL_MakeCurrent();
+    CheckManagement();
+    if (OUTPUT_OPENGL_HasExternalTexture()) {
+        OUTPUT_OPENGL_DrawExternal();
+    } else {
+        glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
+        if (sdl_opengl.program_object) {
+            glUniform1i(sdl_opengl.ruby.frame_count, sdl_opengl.actual_frame_count++);
+            glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+        } else
+            glCallList(sdl_opengl.displaylist);
+    }
+    OUTPUT_OPENGL_DrawPresence();
+    SDL_GL_SwapBuffers();
 }
 
 #endif
