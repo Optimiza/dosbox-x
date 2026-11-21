@@ -540,7 +540,9 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
                 s.cap_x1 = right;
                 const double moved = (double)(uint32_t)(now_ms - caption_since_ms_) / 1000.0 *
                                      (double)look_.scroll_cps * GLYPH_W;
-                s.cap_offset = (unsigned)((uint64_t)moved % (text + SCROLL_GAP));
+                /* floored first: 32-bit MSVC's double to uint64_t conversion rounds to nearest,
+                   so a step would land half a pixel early */
+                s.cap_offset = (unsigned)((uint64_t)std::floor(moved) % (text + SCROLL_GAP));
             } else {
                 s.cap_x0 = left + (room - text - 2 * PAD) / 2;
                 s.cap_x1 = s.cap_x0 + text + 2 * PAD;
