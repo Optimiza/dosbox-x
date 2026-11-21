@@ -69,7 +69,7 @@ bool ParseHex(const std::string &s, uint32_t &out) {
 }
 
 /* A decimal number in [lo, hi], read the same whatever the process's locale. */
-bool ParseFloat(const std::string &s, float lo, float hi, float &out) {
+bool ParseFloat(const std::string &s, double lo, double hi, float &out) {
     if (s.empty() || s.find_first_not_of("0123456789.") != std::string::npos) return false;
     std::istringstream in(s);
     in.imbue(std::locale::classic());
@@ -233,7 +233,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         bool ok = true;
         if (key == "rgb") ok = ParseHex(value, look.rgb);
         else if (key == "outline") ok = ParseHex(value, look.outline);
-        else if (key == "edge") ok = ParseFloat(value, 0.001f, 0.25f, look.edge);
+        else if (key == "edge") ok = ParseFloat(value, 0.001, 0.25, look.edge);
         else if (key == "acting") ok = ParseFloat(value, 0.0f, 1.0f, look.acting);
         else if (key == "held") ok = ParseFloat(value, 0.0f, 1.0f, look.held);
         else if (key == "fade") ok = ParseFloat(value, 0.0f, 60.0f, look.fade);

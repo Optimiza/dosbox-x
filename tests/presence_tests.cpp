@@ -56,6 +56,8 @@ TEST(Presence, TakesAStateAndALookAndRefusesWhatItDoesNotKnow) {
     EXPECT_FALSE(o.Configure("held colour=FFFFFF", error, 0));
     EXPECT_FALSE(o.Configure("held edge=2", error, 0));
     EXPECT_FALSE(o.Configure("held edge=0x1p-3", error, 0));
+    EXPECT_TRUE(o.Configure("held edge=0.001", error, 0)) << "a bound is a value it takes";
+    EXPECT_FALSE(o.Configure("held edge=0.0009", error, 0));
     EXPECT_FALSE(o.Configure("held rgb=+12345", error, 0));
     EXPECT_FALSE(o.Configure("held steps=1.5", error, 0));
     EXPECT_FALSE(o.Configure("held sprite=Xo/X", error, 0));
