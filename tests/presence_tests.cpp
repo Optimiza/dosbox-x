@@ -4,15 +4,23 @@
  *  on the inner sides only, taken off before the scaler writes and drawn anew
  *  after, so a scaler that rewrites part of a line never gets the overlay
  *  blended onto itself; restored when turned off; and an arrow at the guest's
- *  pointer.
+ *  pointer; the layers of protocol 3 (keycaps, caption, pause mark, record mark) and where
+ *  `auto` puts them. The cost cases print what each case costs and hold it at its floor.
  */
 
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include "gtest/gtest.h"
 #include "render_presence.h"
+
+extern uint8_t int10_font_16[256 * 16];
 
 namespace {
 
@@ -48,6 +56,8 @@ TEST(Presence, TakesAStateAndALookAndRefusesWhatItDoesNotKnow) {
     EXPECT_FALSE(o.Configure("held colour=FFFFFF", error, 0));
     EXPECT_FALSE(o.Configure("held edge=2", error, 0));
     EXPECT_FALSE(o.Configure("held edge=0x1p-3", error, 0));
+    EXPECT_TRUE(o.Configure("held edge=0.001", error, 0)) << "a bound is a value it takes";
+    EXPECT_FALSE(o.Configure("held edge=0.0009", error, 0));
     EXPECT_FALSE(o.Configure("held rgb=+12345", error, 0));
     EXPECT_FALSE(o.Configure("held steps=1.5", error, 0));
     EXPECT_FALSE(o.Configure("held sprite=Xo/X", error, 0));
@@ -75,9 +85,9 @@ TEST(Presence, TheBareCommandAnnouncesItsVersion) {
     std::vector<std::string> lines;
     EXPECT_TRUE(PRESENCE_Command("", lines));
     ASSERT_EQ(lines.size(), 1u);
-    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_NE(lines[0].find(" version=3"), std::string::npos) << lines[0];
     EXPECT_TRUE(PRESENCE_Command("  ", lines));
-    EXPECT_NE(lines[0].find(" version=2"), std::string::npos) << lines[0];
+    EXPECT_NE(lines[0].find(" version=3"), std::string::npos) << lines[0];
     EXPECT_EQ(presence::Overlay().Describe().find("version="), std::string::npos)
         << "only the bare command announces it";
 }
@@ -344,6 +354,7 @@ TEST(Presence, AFrameDrawnButNeverShownIsDrawnAgain) {
     Frame frame(20, 20, 0x00000000u);
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0, false);
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0)) << "an aborted frame showed nothing";
+    EXPECT_EQ(o.cost().presented, 0u) << "and presented nothing";
     o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
     EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0));
 }
@@ -362,6 +373,955 @@ TEST(Presence, TheSameLookSentAgainIsNotANewOne) {
     EXPECT_FALSE(o.NeedsRepaint(0, false, 0, 0)) << "an unchanged look repaints the whole frame";
     ASSERT_TRUE(o.Configure(std::string("acting") + kLook + " rgb=00FF00", error, 0));
     EXPECT_TRUE(o.NeedsRepaint(0, false, 0, 0));
+}
+
+/* A 320x200 output of a 320x200 guest, one output pixel a guest pixel, so the band's layout
+   reads in guest pixels: the edge is 5 wide, the band is the bottom 25 rows, its boxes are 20
+   rows from row 177, inset 7 from each side. */
+struct Band {
+    Overlay o;
+    Frame frame;
+    explicit Band(const std::string &words, uint32_t picture = 0x00000000u) : frame(320, 200, picture) {
+        std::string error;
+        EXPECT_TRUE(o.Configure(words + " edge=0.025 caption_in=0 caption_out=0", error, 0)) << error;
+        const Format f = Rgb32();
+        o.Resize(320, 200, &f);
+        o.Guest(320, 200);
+    }
+    void Draw(uint32_t now_ms) { o.Compose(frame.buf(), frame.pitch(), nullptr, now_ms, false, 0, 0); }
+};
+const unsigned kBoxY = 177, kBoxH = 20, kInset = 7;
+
+/* The first lit pixel of a glyph in the VGA 8x16 font, as (column, row). */
+void FirstInk(unsigned char c, unsigned &col, unsigned &row) {
+    for (row = 0; row < 16; row++)
+        for (col = 0; col < 8; col++)
+            if (int10_font_16[c * 16 + row] & (0x80u >> col)) return;
+}
+
+TEST(PresenceLayers, AKeycapIsABoxPerKeyWithTheKeysGlyphs) {
+    Band b("held keys=A,Shift place=bottom");
+    b.Draw(0);
+    /* laid from the right inset: "Shift" is 5 x 8 + 4 wide, "A" 12 and a gap before it */
+    const unsigned shift_x0 = 320 - kInset - 44, a_x0 = shift_x0 - 2 - 12;
+    unsigned col = 0, row = 0;
+    FirstInk('A', col, row);
+    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kBoxY + 2 + row), 0x00FFFFFFu) << "the glyph's ink";
+    const uint32_t cap = b.frame.at(a_x0, kBoxY);
+    EXPECT_NE(cap, 0u) << "the keycap's box";
+    EXPECT_EQ(cap & 0xFFu, (cap >> 16) & 0xFFu) << "grey, as keycap_rgb is";
+    EXPECT_EQ(b.frame.at(a_x0 - 1, kBoxY), 0u) << "nothing between the boxes";
+    EXPECT_EQ(b.frame.at(a_x0, kBoxY - 1), 0u) << "nothing above them";
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held keys=", error, 0));
+    b.Draw(0);
+    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kBoxY + 2 + row), 0u) << "no key down, no keycap";
+}
+
+TEST(PresenceLayers, ThePauseMarkIsDrawnOnlyWhilePaused) {
+    Band b("paused place=bottom");
+    b.Draw(0);
+    const unsigned x0 = kInset;
+    EXPECT_EQ(b.frame.at(x0 + 2, kBoxY + 2), 0x00FFFFFFu) << "the first bar";
+    EXPECT_EQ(b.frame.at(x0 + 8, kBoxY + 2), 0x00FFFFFFu) << "the second bar";
+    EXPECT_NE(b.frame.at(x0 + 5, kBoxY + 2), 0x00FFFFFFu) << "the gap between them";
+    EXPECT_NE(b.frame.at(x0 + 5, kBoxY + 2), 0u);
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held", error, 0));
+    b.Draw(0);
+    EXPECT_EQ(b.frame.at(x0 + 2, kBoxY + 2), 0u) << "held is not paused";
+}
+
+/* The record mark's box: from the top right inset, 20 rows from row 7; its dot is 10 guest
+   pixels, from 2 inside the box and 5 rows down. */
+const unsigned kRecY = 7, kRecDot = 10;
+const unsigned kRecVideoW = 2 + kRecDot + 2 + 3 * 8 + 2, kRecAudioW = 2 + kRecDot + 2 + 8 + 2;
+
+TEST(PresenceLayers, TheRecordMarkBlinksInTheTopRightCornerWhateverThePlace) {
+    Band b("held rec=video place=bottom");
+    b.Draw(0);
+    unsigned x0 = 320 - kInset - kRecVideoW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the dot, record_rgb";
+    const uint32_t cap = b.frame.at(x0 + 2, kRecY + 5);
+    EXPECT_NE(cap, 0u) << "the dot's corner is the box";
+    EXPECT_NE(cap, 0x00FF3B30u) << "and not the dot: a disc";
+    EXPECT_EQ(b.frame.at(x0 - 1, kRecY), 0u);
+    EXPECT_EQ(b.frame.at(x0, kRecY - 1), 0u);
+    unsigned col = 0, row = 0;
+    FirstInk('R', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC";
+    EXPECT_FALSE(b.o.NeedsRepaint(499, false, 0, 0)) << "on for the first half of the second";
+    EXPECT_TRUE(b.o.NeedsRepaint(500, false, 0, 0));
+    b.Draw(500);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "off for the second half";
+    b.Draw(1000);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u);
+
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held rec=audio", error, 1200));
+    b.Draw(1200);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "the video mark gone";
+    x0 = 320 - kInset - kRecAudioW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "a change shows at once";
+    FirstInk(0x0E, col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "the note";
+
+    ASSERT_TRUE(b.o.Configure("held rec=both", error, 2000));
+    b.Draw(2000);
+    x0 = 320 - kInset - (kRecVideoW + 2 + kRecAudioW - 2 * 2);
+    FirstInk('R', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC first";
+    const unsigned audio_x0 = x0 + kRecVideoW - 2 + 2;
+    FirstInk(0x0E, col, row);
+    EXPECT_EQ(b.frame.at(audio_x0 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "then the note";
+
+    ASSERT_TRUE(b.o.Configure("held rec=video record_blink_s=2", error, 3000));
+    b.Draw(3000);
+    EXPECT_FALSE(b.o.NeedsRepaint(3999, false, 0, 0)) << "the period the look gives";
+    EXPECT_TRUE(b.o.NeedsRepaint(4000, false, 0, 0));
+
+    x0 = 320 - kInset - kRecVideoW;
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the video mark, on";
+    ASSERT_TRUE(b.o.Configure("held rec=none", error, 3500));
+    b.Draw(3500);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "taken off mid blink";
+    EXPECT_FALSE(b.o.NeedsRepaint(9000, false, 0, 0)) << "nothing recorded, nothing blinks";
+}
+
+TEST(PresenceLayers, ABandAtTheTopLeavesTheRecordMarkItsCornerInBothHalvesOfTheBlink) {
+    Band b("held keys=A rec=video place=top");
+    b.Draw(0);
+    const unsigned a_x0 = 320 - kInset - kRecVideoW - 2 - 12;
+    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the keycap left of the mark";
+    EXPECT_EQ(b.frame.at(a_x0 + 12, 10), 0u) << "the gap after it";
+    b.Draw(500);
+    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the mark off, the keycap stays";
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held layers=edge,keys", error, 600));
+    b.Draw(600);
+    EXPECT_EQ(b.frame.at(a_x0, 10), 0u) << "no record layer asked: the keycap at the inset";
+    EXPECT_NE(b.frame.at(320 - kInset - 12, 10), 0u);
+}
+
+TEST(PresenceLayers, ACaptionThatFitsIsCentredInItsTint) {
+    Band b("held caption=hi%20there tint=5AC8FA serial=1 place=bottom");
+    b.Draw(0);
+    /* "hi there" is 8 x 8 + 4 wide, centred in the 306 between the insets */
+    const unsigned x0 = kInset + (320 - 2 * kInset - 68) / 2;
+    const uint32_t box = b.frame.at(x0, kBoxY);
+    EXPECT_GT(box & 0xFFu, (box >> 16) & 0xFFu) << "the read tint, more blue than red";
+    EXPECT_EQ(b.frame.at(x0 - 1, kBoxY), 0u) << "the box ends where the text does";
+    EXPECT_EQ(b.frame.at(x0 + 68, kBoxY), 0u);
+    unsigned col = 0, row = 0;
+    FirstInk('h', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + col, kBoxY + 2 + row), 0x00FFFFFFu) << "the text, %20 a space";
+    FirstInk('t', col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + 3 * 8 + col, kBoxY + 2 + row), 0x00FFFFFFu);
+    EXPECT_FALSE(b.o.NeedsRepaint(5000, false, 0, 0)) << "a caption that fits stays still";
+}
+
+TEST(PresenceLayers, ACaptionTooWideForItsRoomScrollsAGuestPixelAtATime) {
+    const std::string text(60, 'W');
+    Band b("held scroll_cps=12 serial=1 place=bottom caption=" + text);
+    b.Draw(0);
+    std::vector<uint32_t> before(b.frame.px.begin() + (kBoxY + 8) * 320,
+                                 b.frame.px.begin() + (kBoxY + 9) * 320);
+    /* 12 characters a second is 96 guest pixels: one every 10.4 ms */
+    EXPECT_FALSE(b.o.NeedsRepaint(10, false, 0, 0)) << "less than a pixel is not a step";
+    EXPECT_TRUE(b.o.NeedsRepaint(11, false, 0, 0));
+    b.Draw(11);
+    for (unsigned x = kInset + 2; x + 1 < 320 - kInset - 2; x++)
+        ASSERT_EQ(b.frame.at(x, kBoxY + 8), before[x + 1]) << "moved one pixel left at " << x;
+}
+
+TEST(PresenceLayers, ACaptionLeavesWithItsFadeAndTheSameSerialRestartsNothing) {
+    Band b("held caption=go serial=7 place=bottom");
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held caption_in=0.2 caption_out=0.1", error, 0));
+    b.Draw(1000);
+    const unsigned x0 = kInset + (320 - 2 * kInset - 20) / 2;
+    const uint32_t shown = b.frame.at(x0, kBoxY);
+    ASSERT_NE(shown, 0u);
+    ASSERT_TRUE(b.o.Configure("held caption=go serial=7", error, 1000));
+    EXPECT_FALSE(b.o.NeedsRepaint(1000, false, 0, 0)) << "the writer's retry is not a new caption";
+    ASSERT_TRUE(b.o.Configure("held caption=go serial=8", error, 1000));
+    EXPECT_TRUE(b.o.NeedsRepaint(1000, false, 0, 0)) << "a new serial is";
+    b.Draw(1000);
+    EXPECT_EQ(b.frame.at(x0, kBoxY), 0u) << "and it fades in from nothing";
+    b.Draw(1100);
+    EXPECT_LT(b.frame.at(x0, kBoxY) >> 16, shown >> 16) << "half way in";
+    b.Draw(1200);
+    EXPECT_EQ(b.frame.at(x0, kBoxY), shown);
+    ASSERT_TRUE(b.o.Configure("held caption=", error, 2000));
+    b.Draw(2050);
+    EXPECT_LT(b.frame.at(x0, kBoxY) >> 16, shown >> 16) << "leaving";
+    b.Draw(2100);
+    EXPECT_EQ(b.frame.at(x0, kBoxY), 0u) << "gone";
+    EXPECT_FALSE(b.o.NeedsRepaint(3000, false, 0, 0));
+}
+
+TEST(PresenceLayers, TheLayersWordTurnsLayersOffAndPlaceMovesTheBand) {
+    Band b("paused keys=A layers=edge,keys place=top");
+    b.Draw(0);
+    EXPECT_EQ(b.frame.at(kInset + 2, kBoxY + 2), 0u) << "no pause layer asked";
+    const unsigned a_x0 = 320 - kInset - 12;
+    /* the top band's boxes: 25 rows, the box in their middle */
+    EXPECT_NE(b.frame.at(a_x0, 2), 0u) << "the keycap at the top";
+    EXPECT_EQ(b.frame.at(a_x0, kBoxY), 0u) << "and not at the bottom";
+    EXPECT_NE(b.o.Describe().find(" layers=edge,keys place=top"), std::string::npos) << b.o.Describe();
+}
+
+TEST(PresenceLayers, AnOutputItCannotDrawOnSaysWhichLayersItLacks) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure("held layers=edge,calls", error, 0));
+    o.Resize(20, 20, nullptr);
+    EXPECT_NE(o.Describe().find(" output=undrawable layers= place=bottom lacks=edge,calls"),
+              std::string::npos) << o.Describe();
+}
+
+TEST(PresenceLayers, TheProtocolRefusesWhatItCannotDrawAndChangesNothing) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure("held caption=a serial=1 keys=Esc", error, 0)) << error;
+    EXPECT_FALSE(o.Configure("held layers=edge,captions", error, 0)) << "an unknown layer";
+    EXPECT_FALSE(o.Configure("held caption=%2", error, 0)) << "a cut escape";
+    EXPECT_FALSE(o.Configure("held caption=%G0", error, 0));
+    EXPECT_FALSE(o.Configure("held caption=" + std::string(161, 'x'), error, 0)) << "over 160 bytes";
+    EXPECT_TRUE(o.Configure("held caption=" + std::string(160, 'x') + " serial=2", error, 0));
+    EXPECT_FALSE(o.Configure("held keys=a,b,c,d,e,f,g,h,i", error, 0)) << "over 8 keys";
+    EXPECT_FALSE(o.Configure("held keys=ThirteenBytes", error, 0)) << "a key over 12 bytes";
+    EXPECT_FALSE(o.Configure("held keys=a,,b", error, 0)) << "an empty key";
+    EXPECT_FALSE(o.Configure("held place=left", error, 0));
+    EXPECT_FALSE(o.Configure("held tint=red", error, 0));
+    EXPECT_FALSE(o.Configure("held serial=-1", error, 0));
+    EXPECT_FALSE(o.Configure("held caption_alpha=2", error, 0));
+    EXPECT_FALSE(o.Configure("paused place=top caption=%ZZ", error, 0));
+    EXPECT_FALSE(o.Configure("paused rec=screen", error, 0)) << "an unknown recording";
+    EXPECT_FALSE(o.Configure("paused rec=", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_rgb=red", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_blink_s=0", error, 0));
+    EXPECT_FALSE(o.Configure("paused record_blink_s=11", error, 0));
+    EXPECT_TRUE(o.Configure("held record_blink_s=0.1", error, 0)) << "a bound is a value it takes";
+    EXPECT_TRUE(o.Configure("held record_blink_s=10", error, 0));
+    EXPECT_EQ(o.state(), State::Held) << "a refused command changes nothing";
+    EXPECT_TRUE(o.Configure("paused layers= keys=%2C", error, 0)) << "no layer, a comma key";
+}
+
+/* scry_core's src/scry_core/placement_vectors.txt, verbatim: the three renderers replay it. */
+const char *const kPlacementVectors = R"(# The placement rules of scry_core.placement, for a renderer in any language to replay.
+# Words are separated by one space; colours are 6 hex digits; points are x,y.
+# points <width> <height> top <x,y>... bottom <x,y>...
+# score <colour>... = <count>
+# walk <start band> <top>/<bottom>... = <band after each sample>...
+constants band_divisor=8 columns=16 rows=2 margin=4 consecutive=2 start=bottom sample_s=1
+points 320 200 top 10,6 30,6 50,6 70,6 90,6 110,6 130,6 150,6 170,6 190,6 210,6 230,6 250,6 270,6 290,6 310,6 10,18 30,18 50,18 70,18 90,18 110,18 130,18 150,18 170,18 190,18 210,18 230,18 250,18 270,18 290,18 310,18 bottom 10,181 30,181 50,181 70,181 90,181 110,181 130,181 150,181 170,181 190,181 210,181 230,181 250,181 270,181 290,181 310,181 10,193 30,193 50,193 70,193 90,193 110,193 130,193 150,193 170,193 190,193 210,193 230,193 250,193 270,193 290,193 310,193
+points 640 480 top 20,15 60,15 100,15 140,15 180,15 220,15 260,15 300,15 340,15 380,15 420,15 460,15 500,15 540,15 580,15 620,15 20,45 60,45 100,45 140,45 180,45 220,45 260,45 300,45 340,45 380,45 420,45 460,45 500,45 540,45 580,45 620,45 bottom 20,435 60,435 100,435 140,435 180,435 220,435 260,435 300,435 340,435 380,435 420,435 460,435 500,435 540,435 580,435 620,435 20,465 60,465 100,465 140,465 180,465 220,465 260,465 300,465 340,465 380,465 420,465 460,465 500,465 540,465 580,465 620,465
+points 256 224 top 8,7 24,7 40,7 56,7 72,7 88,7 104,7 120,7 136,7 152,7 168,7 184,7 200,7 216,7 232,7 248,7 8,21 24,21 40,21 56,21 72,21 88,21 104,21 120,21 136,21 152,21 168,21 184,21 200,21 216,21 232,21 248,21 bottom 8,203 24,203 40,203 56,203 72,203 88,203 104,203 120,203 136,203 152,203 168,203 184,203 200,203 216,203 232,203 248,203 8,217 24,217 40,217 56,217 72,217 88,217 104,217 120,217 136,217 152,217 168,217 184,217 200,217 216,217 232,217 248,217
+points 384 224 top 12,7 36,7 60,7 84,7 108,7 132,7 156,7 180,7 204,7 228,7 252,7 276,7 300,7 324,7 348,7 372,7 12,21 36,21 60,21 84,21 108,21 132,21 156,21 180,21 204,21 228,21 252,21 276,21 300,21 324,21 348,21 372,21 bottom 12,203 36,203 60,203 84,203 108,203 132,203 156,203 180,203 204,203 228,203 252,203 276,203 300,203 324,203 348,203 372,203 12,217 36,217 60,217 84,217 108,217 132,217 156,217 180,217 204,217 228,217 252,217 276,217 300,217 324,217 348,217 372,217
+points 16 8 top 0,0 1,0 2,0 3,0 4,0 5,0 6,0 7,0 8,0 9,0 10,0 11,0 12,0 13,0 14,0 15,0 0,0 1,0 2,0 3,0 4,0 5,0 6,0 7,0 8,0 9,0 10,0 11,0 12,0 13,0 14,0 15,0 bottom 0,7 1,7 2,7 3,7 4,7 5,7 6,7 7,7 8,7 9,7 10,7 11,7 12,7 13,7 14,7 15,7 0,7 1,7 2,7 3,7 4,7 5,7 6,7 7,7 8,7 9,7 10,7 11,7 12,7 13,7 14,7 15,7
+points 1 1 top 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 bottom 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0 0,0
+score 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 = 0
+score 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 000000 FFFFFF FF0000 = 2
+score 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 101010 202020 = 16
+score 000000 000001 000002 000003 000004 000005 000006 000007 000008 000009 00000A 00000B 00000C 00000D 00000E 00000F 000010 000011 000012 000013 000014 000015 000016 000017 000018 000019 00001A 00001B 00001C 00001D 00001E 00001F = 31
+score 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 00AA00 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA 0000AA = 12
+walk bottom 0/10 0/10 0/10 = bottom top top
+walk bottom 0/10 9/10 0/10 0/10 = bottom bottom bottom top
+walk bottom 6/10 7/10 6/10 = bottom bottom bottom
+walk bottom 7/10 6/10 = bottom bottom
+walk top 20/0 20/0 0/20 0/20 = top bottom bottom top
+walk top 0/0 32/0 0/0 32/0 = top top top top
+)";
+
+std::vector<std::string> Words(const std::string &line) {
+    std::vector<std::string> words;
+    std::istringstream in(line);
+    std::string w;
+    while (in >> w) words.push_back(w);
+    return words;
+}
+
+presence::placement::Point PointWord(const std::string &w) {
+    const size_t comma = w.find(',');
+    return {(unsigned)std::stoul(w.substr(0, comma)), (unsigned)std::stoul(w.substr(comma + 1))};
+}
+
+TEST(PresencePlacement, ReplaysScryCoresVectors) {
+    namespace pl = presence::placement;
+    std::istringstream in(kPlacementVectors);
+    std::string line;
+    unsigned checked = 0;
+    while (std::getline(in, line)) {
+        if (line.empty() || line[0] == '#') continue;
+        const std::vector<std::string> w = Words(line);
+        if (w[0] == "constants") {
+            EXPECT_EQ(line, "constants band_divisor=" + std::to_string(pl::BAND_DIVISOR) +
+                            " columns=" + std::to_string(pl::COLUMNS) + " rows=" + std::to_string(pl::ROWS) +
+                            " margin=" + std::to_string(pl::MARGIN) + " consecutive=" +
+                            std::to_string(pl::CONSECUTIVE) + " start=bottom sample_s=" +
+                            std::to_string(pl::SAMPLE_MS / 1000));
+            EXPECT_EQ(Overlay().place(), presence::Place::Bottom) << "the start band";
+        } else if (w[0] == "points") {
+            pl::Point top[pl::SAMPLES], bottom[pl::SAMPLES];
+            pl::Points((unsigned)std::stoul(w[1]), (unsigned)std::stoul(w[2]), top, bottom);
+            ASSERT_EQ(w.size(), 5u + 2 * pl::SAMPLES) << line;
+            for (unsigned i = 0; i < pl::SAMPLES; i++) {
+                const pl::Point t = PointWord(w[4 + i]), b = PointWord(w[5 + pl::SAMPLES + i]);
+                EXPECT_EQ(top[i].x, t.x) << line;
+                EXPECT_EQ(top[i].y, t.y) << line;
+                EXPECT_EQ(bottom[i].x, b.x) << line;
+                EXPECT_EQ(bottom[i].y, b.y) << line;
+            }
+        } else if (w[0] == "score") {
+            ASSERT_EQ(w.size(), 3u + pl::SAMPLES) << line;
+            uint32_t colours[pl::SAMPLES];
+            for (unsigned i = 0; i < pl::SAMPLES; i++) colours[i] = (uint32_t)std::stoul(w[1 + i], nullptr, 16);
+            EXPECT_EQ(pl::Score(colours), (unsigned)std::stoul(w.back())) << line;
+        } else if (w[0] == "walk") {
+            presence::Place band = w[1] == "top" ? presence::Place::Top : presence::Place::Bottom;
+            unsigned streak = 0;
+            const size_t eq = (size_t)(std::find(w.begin(), w.end(), "=") - w.begin());
+            ASSERT_EQ(w.size() - eq - 1, eq - 2) << line;
+            for (size_t i = 2; i < eq; i++) {
+                const size_t slash = w[i].find('/');
+                band = pl::Step(band, streak, (unsigned)std::stoul(w[i].substr(0, slash)),
+                                (unsigned)std::stoul(w[i].substr(slash + 1)));
+                EXPECT_EQ(band == presence::Place::Top ? "top" : "bottom", w[eq + 1 + i - 2]) << line << " at " << i;
+            }
+        } else {
+            ADD_FAILURE() << "a vector this replay does not know: " << line;
+        }
+        checked++;
+    }
+    EXPECT_GT(checked, 10u) << "the vectors were read";
+}
+
+/* A picture whose bottom band is busy and whose top band is one colour. */
+uint32_t BusyBottom(const void *, unsigned x, unsigned y) { return y >= 175 ? x * 0x010101u : 0x123456u; }
+
+TEST(PresencePlacement, AutoMovesTheBandOnceTheOtherShowsLessOnTwoSamples) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure("held place=auto", error, 0));
+    const Format f = Rgb32();
+    o.Resize(32, 20, &f);
+    presence::Picture picture;
+    picture.width = 320;
+    picture.height = 200;
+    picture.pixel = BusyBottom;
+    o.Sample(0, picture);
+    EXPECT_EQ(o.place(), presence::Place::Bottom) << "one sample is not enough";
+    EXPECT_EQ(o.cost().read, 64u) << "a sample reads 32 pixels a band";
+    o.Sample(500, picture);
+    EXPECT_EQ(o.cost().read, 64u) << "once a second, no more";
+    o.Sample(1000, picture);
+    EXPECT_EQ(o.place(), presence::Place::Top);
+    EXPECT_NE(o.Describe().find(" place=top"), std::string::npos) << o.Describe();
+    ASSERT_TRUE(o.Configure("held place=bottom", error, 0));
+    o.Sample(5000, picture);
+    EXPECT_EQ(o.cost().read, 128u) << "a fixed place samples nothing";
+}
+
+TEST(PresenceRows, ARowTheScalerRewroteGetsTheOverlayOnceAndTheOthersKeepIt) {
+    Overlay o;
+    std::string error;
+    ASSERT_TRUE(o.Configure(std::string("held") + kLook, error, 0));
+    const Format f = Rgb32();
+    o.Resize(20, 20, &f);
+    o.Guest(10, 10);
+    Frame frame(20, 20, 0x00000000u);
+    o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
+    const uint32_t once = frame.at(0, 5);
+    for (int n = 0; n < 3; n++) {
+        o.UndrawRows(frame.buf(), frame.pitch(), 5, 1);   /* the scaler is about to write row 5 */
+        EXPECT_EQ(frame.at(0, 5), 0x00000000u) << "row 5 holds the picture alone";
+        EXPECT_EQ(frame.at(0, 6), once) << "row 6 keeps the overlay";
+        for (unsigned x = 8; x < 12; x++) frame.px[5 * 20 + x] = 0x00102030u;   /* one block */
+        const presence::Cost before = o.cost();
+        const uint16_t changed[] = {5, 1, 14};
+        EXPECT_EQ(o.Compose(frame.buf(), frame.pitch(), changed, 0, false, 0, 0), changed);
+        EXPECT_EQ(frame.at(0, 5), once) << "blended once, however often the line changed";
+        EXPECT_EQ(frame.at(0, 6), once);
+        EXPECT_EQ(frame.at(10, 5), 0x00102030u);
+        EXPECT_EQ(o.cost().read - before.read, 4u) << "the row's two strips, 2 wide each, saved";
+    }
+}
+
+/* The look and the arrow the DOSBox-X server sends, so the cases price what a session draws. */
+const char *const kSessionLook =
+    " rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283 fade=2.5 outline=2A1400 glide=0"
+    " pointer=1 place=bottom caption_in=0 sprite=XX........./XoX......../XooX......./XoooX....../XooooX...../XoooooX...."
+    "/XooooooX.../XoooooooX../XooooooooX./XoooooXXXXX/XooXooX..../XoXXXooX.../XX..XooX..."
+    "/.....XooX../.....XooX../......XX...";
+
+struct Output { unsigned w, h; };
+/* Mode 13h doubled, and the same picture on a large window. */
+const Output kOutputs[] = {{640, 400}, {1920, 1200}};
+const unsigned kGuestW = 320, kGuestH = 200;
+
+/* What one frame of a case costs, worked out from the geometry, not from the overlay's code. */
+struct Expected {
+    uint64_t band, edge, sx, box_w, box_h;
+    explicit Expected(const Output &out) {
+        band = (uint64_t)std::lround(0.025 * std::min(out.w, out.h));
+        edge = (uint64_t)out.w * out.h - (uint64_t)(out.w - 2 * band) * (out.h - 2 * band);
+        sx = out.w / kGuestW;
+        box_w = 11 * sx;
+        box_h = 16 * (out.h / kGuestH);
+    }
+    /* the covered pixels of a row in the edge's side strips */
+    uint64_t strips() const { return 2 * band; }
+};
+
+presence::Cost Delta(const presence::Cost &after, const presence::Cost &before) {
+    presence::Cost d;
+    d.read = after.read - before.read;
+    d.written = after.written - before.written;
+    d.presented = after.presented - before.presented;
+    d.uploads = after.uploads - before.uploads;
+    d.upload_bytes = after.upload_bytes - before.upload_bytes;
+    return d;
+}
+
+void Print(const char *name, const Output &out, uint64_t frames, const presence::Cost &c) {
+    std::printf("[presence-cost] case=%-7s output=%ux%u frames=%llu px_read=%llu"
+                " px_written=%llu bytes_presented=%llu uploads=%llu upload_bytes=%llu\n",
+                name, out.w, out.h, (unsigned long long)frames, (unsigned long long)c.read,
+                (unsigned long long)c.written, (unsigned long long)c.presented,
+                (unsigned long long)c.uploads, (unsigned long long)c.upload_bytes);
+}
+
+/* An overlay on a session's output with the arrow mid-picture, its first frame already shown,
+   on an output that presents rectangles unless told otherwise. */
+struct Session {
+    Overlay o;
+    Frame frame;
+    explicit Session(const Output &out, const char *state = "held", bool columns = true,
+                     presence::Texture *texture = nullptr)
+        : frame(out.w, out.h, 0x00204060u) {
+        std::string error;
+        EXPECT_TRUE(o.Configure(std::string(state) + kSessionLook, error, 0)) << error;
+        const Format f = Rgb32();
+        o.Resize(out.w, out.h, &f, columns, texture);
+        o.Guest(kGuestW, kGuestH);
+        o.Compose(frame.buf(), frame.pitch(), nullptr, 0, true, 0.5f, 0.5f);
+        o.Upload();
+    }
+    /* A running guest's frame: the scaler takes the overlay off row 100, rewrites it, and the
+       frame is drawn. */
+    uint16_t one_line[3] = {100, 1, 0};
+    const uint16_t *runs = nullptr;
+    presence::Cost Running(uint32_t now_ms, float fx, float fy) {
+        const presence::Cost before = o.cost();
+        o.UndrawRows(frame.buf(), frame.pitch(), 100, 1);
+        one_line[2] = (uint16_t)(frame.h - 101);
+        runs = o.Compose(frame.buf(), frame.pitch(), one_line, now_ms, true, fx, fy);
+        return Delta(o.cost(), before);
+    }
+    /* A frame the scaler did not write: the debugger holds the machine, or the picture is still. */
+    presence::Cost Still(uint32_t now_ms, float fx = 0.5f, float fy = 0.5f) {
+        const presence::Cost before = o.cost();
+        runs = o.Compose(frame.buf(), frame.pitch(), nullptr, now_ms, true, fx, fy);
+        return Delta(o.cost(), before);
+    }
+};
+
+TEST(PresenceCost, TheReplyCarriesTheCounters) {
+    Session s(kOutputs[0]);
+    const presence::Cost &c = s.o.cost();
+    const std::string line = s.o.Describe();
+    EXPECT_NE(line.find(" px_read=" + std::to_string(c.read) + " "), std::string::npos) << line;
+    EXPECT_NE(line.find(" px_written=" + std::to_string(c.written) + " "), std::string::npos) << line;
+    EXPECT_NE(line.find(" bytes_presented=" + std::to_string(c.presented) + " "), std::string::npos) << line;
+    EXPECT_NE(line.find(" uploads=0 upload_bytes=0 layers=edge,pointer,keys,calls,pause,record place=bottom"),
+              std::string::npos) << line;
+    EXPECT_GT(c.presented, 0u);
+    const Format f = Rgb32();
+    s.o.Resize(640, 400, &f);
+    EXPECT_EQ(s.o.cost().read + s.o.cost().written + s.o.cost().presented, 0u)
+        << "a new output starts its own count";
+}
+
+TEST(PresenceCost, AStillOverlayOnAStillPictureCostsNothing) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        EXPECT_FALSE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f));
+        const presence::Cost c = s.Still(0);
+        EXPECT_EQ(s.runs, nullptr) << "nothing to present";
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+    }
+}
+
+TEST(PresenceCost, AStillOverlayOnARunningGameTouchesOnlyTheRowTheScalerRewrote) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        const presence::Cost c = s.Running(0, 0.5f, 0.5f);
+        Print("still", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read, e.strips()) << "the row's covered pixels, saved";
+        EXPECT_EQ(c.written, 2 * e.strips()) << "put back, then blended";
+        EXPECT_EQ(c.presented, 1ull * out.w * 4) << "only the scaler's row";
+        EXPECT_EQ(s.runs, s.one_line);
+    }
+}
+
+TEST(PresenceCost, AFadeFramePresentsTheEdgesPixelsAlone) {
+    for (const Output &out : kOutputs) {
+        Session s(out, "acting");
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost c = s.Running(1250, 0.5f, 0.5f);
+        Print("fade", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read, e.strips());
+        EXPECT_EQ(c.written, e.strips() + e.edge) << "the row put back, the edge blended once";
+        EXPECT_EQ(c.presented, 1ull * out.w * 4 + 4 * (e.edge - e.strips()))
+            << "the scaler's row whole, the edge's pixels off it";
+        const uint16_t *rows = nullptr;
+        const std::vector<presence::Rect> *rects = nullptr;
+        ASSERT_TRUE(s.o.Columns(s.runs, rows, rects));
+        EXPECT_EQ(rows, s.one_line);
+        uint64_t area = 0;
+        for (const presence::Rect &r : *rects) {
+            area += (uint64_t)(r.x1 - r.x0) * (r.y1 - r.y0);
+            EXPECT_FALSE(r.y0 <= 100 && r.y1 > 100) << "no rectangle on the scaler's row";
+        }
+        EXPECT_EQ(area, e.edge - e.strips());
+        EXPECT_FALSE(s.o.Columns(s.one_line, rows, rects)) << "only for the runs it handed on";
+    }
+}
+
+TEST(PresenceCost, AFadeOnAnOutputOfRowsPresentsEveryRowTheEdgeLiesOn) {
+    for (const Output &out : kOutputs) {
+        Session s(out, "acting", false);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost c = s.Running(1250, 0.5f, 0.5f);
+        Print("faderow", out, 1, c);
+        EXPECT_EQ(c.presented, (uint64_t)out.w * out.h * 4) << "the side strips lie on every row";
+        const uint16_t *rows = nullptr;
+        const std::vector<presence::Rect> *rects = nullptr;
+        EXPECT_FALSE(s.o.Columns(s.runs, rows, rects));
+    }
+}
+
+TEST(PresenceCost, AMovingArrowPresentsItsTwoBoxes) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        const presence::Cost c = s.Running(0, 0.5f + 1.0f / kGuestW, 0.5f);
+        Print("arrow", out, 1, c);
+        const Expected e(out);
+        const uint64_t both = (e.box_w + e.sx) * e.box_h;      /* one guest pixel apart */
+        EXPECT_EQ(c.read, e.strips() + e.sx * e.box_h) << "the row, and the columns the arrow entered";
+        EXPECT_EQ(c.written, 2 * e.strips() + both);
+        EXPECT_EQ(c.presented, 1ull * out.w * 4 + 4 * both);
+    }
+}
+
+TEST(PresenceCost, AParkedFadeRepaintsTheEdgeAtEveryAlphaStep) {
+    for (const Output &out : kOutputs) {
+        Session s(out, "acting");
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop ticks once a millisecond */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(s.frame.buf(), s.frame.pitch(), nullptr, ms, true, 0.5f, 0.5f);
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("parked", out, repaints, c);
+        /* one alpha level at a time from acting's 54 to held's 18: the state's own change
+           leaves the alpha where it was and repaints nothing */
+        EXPECT_EQ(repaints, 54u - 18u);
+        const Expected e(out);
+        EXPECT_EQ(c.read, 0u) << "the blend reads the clean copy";
+        EXPECT_EQ(c.written, repaints * e.edge);
+        EXPECT_EQ(c.presented, repaints * 4 * e.edge);
+    }
+}
+
+/* The output pixels of a guest box [gx0, gx1) by [gy0, gy1): each guest pixel's first output
+   pixel is the first whose guest pixel it is. */
+uint64_t OutSpan(uint64_t g0, uint64_t g1, uint64_t guest, uint64_t out) {
+    return (g1 * out + guest - 1) / guest - (g0 * out + guest - 1) / guest;
+}
+
+TEST(PresenceCost, ACaptionIsDrawnOnceAndThenCostsNothing) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held caption=start serial=1", error, 0));
+        const presence::Cost c = s.Still(0);
+        Print("caption", out, 1, c);
+        const Expected e(out);
+        /* "start" is 5 x 8 + 4 guest pixels, centred between insets of the edge's 5 plus 2 */
+        const uint64_t gx0 = 7 + (320 - 14 - 44) / 2;
+        const uint64_t w = OutSpan(gx0, gx0 + 44, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        const uint64_t on_edge = w * (OutSpan(0, 197, kGuestH, out.h) - (out.h - e.band));
+        EXPECT_EQ(c.written, w * h);
+        EXPECT_EQ(c.read, w * h - on_edge) << "the box's pixels the edge had not saved already";
+        EXPECT_EQ(c.presented, 4 * w * h);
+        const presence::Cost later = s.Still(5000);
+        EXPECT_EQ(later.read + later.written + later.presented, 0u) << "a still caption costs nothing";
+    }
+}
+
+/* The video mark's box in output pixels, as kRecY and kRecVideoW lay it in the guest. */
+void RecBox(const Output &out, uint64_t &w, uint64_t &h) {
+    w = OutSpan(320 - 7 - kRecVideoW, 320 - 7, kGuestW, out.w);
+    h = OutSpan(kRecY, kRecY + 20, kGuestH, out.h);
+}
+
+TEST(PresenceCost, ABlinkRepaintsAndPresentsTheRecordMarksBoxAlone) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held rec=video", error, 0));
+        uint64_t w = 0, h = 0;
+        RecBox(out, w, h);
+        const presence::Cost shown = s.Still(0);
+        Print("rec", out, 1, shown);
+        EXPECT_EQ(shown.read, w * h) << "the box's pixels saved";
+        EXPECT_EQ(shown.written, w * h);
+        EXPECT_EQ(shown.presented, 4 * w * h);
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 1; ms <= 3000; ms++) {      /* the parked loop, once a millisecond */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.Still(ms);
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("recblink", out, repaints, c);
+        EXPECT_EQ(repaints, 6u) << "off and on again, each half second";
+        EXPECT_EQ(c.read, 3 * w * h) << "saved again each time it comes back";
+        EXPECT_EQ(c.written, repaints * w * h) << "put back, or blended";
+        EXPECT_EQ(c.presented, repaints * 4 * w * h) << "the box alone";
+        const uint16_t *rows = nullptr;
+        const std::vector<presence::Rect> *rects = nullptr;
+        ASSERT_TRUE(s.o.Columns(s.runs, rows, rects));
+        ASSERT_EQ(rects->size(), 1u);
+        EXPECT_EQ((uint64_t)((*rects)[0].x1 - (*rects)[0].x0) * ((*rects)[0].y1 - (*rects)[0].y0), w * h);
+        ASSERT_TRUE(s.o.Configure("held rec=none", error, 3000));
+        s.Still(3000);
+        const presence::Cost later = s.Still(10000);
+        EXPECT_EQ(later.read + later.written + later.presented, 0u) << "no recording costs nothing";
+    }
+}
+
+TEST(PresenceCost, AScrollingCaptionRepaintsItsBoxOncePerGuestPixel) {
+    for (const Output &out : kOutputs) {
+        Session s(out);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held scroll_cps=12 serial=1 caption=" + std::string(60, 'x'), error, 0));
+        s.Still(0);
+        EXPECT_FALSE(s.o.NeedsRepaint(10, true, 0.5f, 0.5f));
+        const presence::Cost c = s.Still(11);
+        Print("scroll", out, 1, c);
+        const uint64_t w = OutSpan(7, 313, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        EXPECT_EQ(c.read, 0u);
+        EXPECT_EQ(c.written, w * h) << "the box, as wide as the room";
+        EXPECT_EQ(c.presented, 4 * w * h);
+    }
+}
+
+/* An output's texture in memory, as the fake backend of decision 15 (b): what the texture would
+   hold, and what it was asked to do. Allocated garbage, so a pixel never uploaded shows. */
+struct FakeTexture final : presence::Texture {
+    unsigned w = 0, h = 0;
+    std::vector<uint32_t> px;
+    unsigned allocations = 0, uploads = 0;
+    void Allocate(unsigned width, unsigned height) override {
+        w = width;
+        h = height;
+        px.assign((size_t)w * h, 0xDEADBEEFu);
+        allocations++;
+    }
+    void Upload(const uint32_t *pixels, size_t pitch, const presence::Rect &r) override {
+        ASSERT_TRUE(r.x1 <= w && r.y1 <= h && !r.empty());
+        for (unsigned y = r.y0; y < r.y1; y++)
+            for (unsigned x = r.x0; x < r.x1; x++) px[(size_t)y * w + x] = pixels[(size_t)y * pitch + x];
+        uploads++;
+    }
+    void Present() override {}
+};
+
+/* Everything the session draws at once: the edge, the arrow, keycaps, a caption, the pause mark
+   and the record mark. */
+const char *const kEveryLayer = " caption=start serial=1 keys=Esc,F1 tint=5AC8FA rec=both";
+
+/* The same overlay drawn on the CPU over black and over white, and as a texture: the texture
+   holds premultiplied ARGB, so over black the CPU path shows its colour, and over white what is
+   left of the white is its alpha. */
+struct ThreeWays {
+    FakeTexture texture;             /* before the session that draws into it */
+    Session black, white, tex;
+    explicit ThreeWays(const char *state)
+        : black(kOutputs[0], state, true), white(kOutputs[0], state, true),
+          tex(kOutputs[0], state, true, &texture) {
+        std::fill(black.frame.px.begin(), black.frame.px.end(), 0x00000000u);
+        std::fill(white.frame.px.begin(), white.frame.px.end(), 0x00FFFFFFu);
+        Draw(0, "", 0.5f, 0.5f);
+    }
+    /* Every row rewritten by the scaler, so the CPU path draws the whole overlay afresh. */
+    void Draw(uint32_t now_ms, const std::string &words, float fx, float fy) {
+        for (Session *s : {&black, &white, &tex}) {
+            std::string error;
+            if (!words.empty()) ASSERT_TRUE(s->o.Configure(words, error, now_ms)) << error;
+            s->o.Undraw(s->frame.buf(), s->frame.pitch());
+            if (s == &black) std::fill(s->frame.px.begin(), s->frame.px.end(), 0x00000000u);
+            if (s == &white) std::fill(s->frame.px.begin(), s->frame.px.end(), 0x00FFFFFFu);
+            s->o.Compose(s->frame.buf(), s->frame.pitch(), nullptr, now_ms, true, fx, fy);
+            s->o.Upload();
+        }
+    }
+    /* How many pixels differ from what the CPU path drew, and how many the overlay covers. */
+    void Compare(unsigned &wrong, unsigned &covered) const {
+        wrong = covered = 0;
+        ASSERT_EQ(texture.px.size(), black.frame.px.size());
+        for (size_t i = 0; i < texture.px.size(); i++) {
+            const uint32_t t = texture.px[i], a = t >> 24;
+            const uint32_t left = 255u * (256u - (a + (a >> 7))) >> 8;   /* of white, under alpha a */
+            const uint32_t on_white = white.frame.px[i];
+            bool ok = (t & 0xFFFFFFu) == black.frame.px[i];
+            for (unsigned c = 0; c < 3; c++) {
+                const uint32_t premul = (t >> (8 * c)) & 0xFF;
+                ok = ok && premul <= a && ((on_white >> (8 * c)) & 0xFF) == premul + left;
+            }
+            wrong += !ok;
+            covered += a != 0;
+        }
+    }
+};
+
+TEST(PresenceCompositor, TheTextureHoldsEveryLayerAsTheCpuPathBlendsIt) {
+    ThreeWays w((std::string("paused") + kEveryLayer).c_str());
+    unsigned wrong = 0, covered = 0;
+    w.Compare(wrong, covered);
+    EXPECT_EQ(wrong, 0u);
+    const Expected e(kOutputs[0]);
+    EXPECT_GT(covered, e.edge) << "the edge and the band's boxes and the arrow";
+    EXPECT_EQ(w.texture.allocations, 1u);
+    EXPECT_EQ(w.texture.w, kOutputs[0].w);
+    EXPECT_EQ(w.texture.h, kOutputs[0].h);
+
+    /* a fade step, the arrow moved, a new caption, keys let go: uploaded only where they changed */
+    w.Draw(0, "held" + std::string(kSessionLook) + " caption=dir serial=2 keys=", 0.25f, 0.75f);
+    w.Draw(1250, "", 0.25f, 0.75f);
+    w.Compare(wrong, covered);
+    EXPECT_EQ(wrong, 0u);
+    EXPECT_EQ(w.texture.allocations, 1u);
+}
+
+TEST(PresenceCompositor, TheTexturePathNeverTouchesTheFrame) {
+    FakeTexture texture;
+    Session s(kOutputs[0], "acting", true, &texture);
+    const std::vector<uint32_t> picture = Frame(kOutputs[0].w, kOutputs[0].h, 0x00204060u).px;
+    EXPECT_TRUE(s.frame.px == picture) << "the first frame drawn left it as the scaler wrote it";
+    std::string error;
+    ASSERT_TRUE(s.o.Configure(std::string("paused") + kEveryLayer, error, 0));
+    EXPECT_FALSE(s.o.in_buffer()) << "the scaler has nothing to take off a line";
+    s.o.UndrawRows(s.frame.buf(), s.frame.pitch(), 0, kOutputs[0].h);
+    s.o.Undraw(s.frame.buf(), s.frame.pitch());
+    s.Running(500, 0.75f, 0.25f);
+    EXPECT_EQ(s.runs, s.one_line) << "the scaler's own rows are presented, and nothing else";
+    const uint16_t *rows = nullptr;
+    const std::vector<presence::Rect> *rects = nullptr;
+    EXPECT_FALSE(s.o.Columns(s.runs, rows, rects));
+    s.Still(3000);
+    EXPECT_EQ(s.runs, nullptr);
+    EXPECT_TRUE(s.frame.px == picture);
+    EXPECT_TRUE(s.o.drawn());
+    EXPECT_GT(s.o.cost().upload_bytes, 0u);
+}
+
+TEST(PresenceTexture, AStillOverlayOnARunningGameCostsNothing) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        const presence::Cost before = s.o.cost();
+        s.Running(0, 0.5f, 0.5f);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tstill", out, 1, c);
+        EXPECT_EQ(c.read + c.written + c.presented + c.uploads + c.upload_bytes, 0u);
+        EXPECT_FALSE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f));
+        EXPECT_FALSE(s.o.upload_pending());
+    }
+}
+
+TEST(PresenceTexture, AFadeUploadsTheEdgesPixelsAlone) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "acting", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        s.Running(1250, 0.5f, 0.5f);
+        EXPECT_TRUE(s.o.upload_pending()) << "a frame with no new lines is still to be shown";
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tfade", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u) << "the frame is not touched or re-sent";
+        EXPECT_EQ(c.upload_bytes, 4 * e.edge);
+        EXPECT_EQ(c.uploads, 4u) << "the top and bottom bands, and the two side strips";
+        EXPECT_NE(s.o.Describe().find(" uploads=" + std::to_string(s.o.cost().uploads) +
+                                      " upload_bytes=" + std::to_string(s.o.cost().upload_bytes) + " "),
+                  std::string::npos) << s.o.Describe();
+    }
+}
+
+TEST(PresenceTexture, AMovingArrowUploadsItsTwoBoxes) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        const presence::Cost before = s.o.cost();
+        s.Running(0, 0.5f + 1.0f / kGuestW, 0.5f);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tarrow", out, 1, c);
+        const Expected e(out);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, 4 * (e.box_w + e.sx) * e.box_h) << "the union of the two boxes";
+        EXPECT_EQ(c.uploads, 1u);
+    }
+}
+
+TEST(PresenceTexture, AParkedFadeUploadsTheEdgeAtEveryAlphaStepAndPresentsNoFrame) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "acting", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held", error, 0));
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop, as PRESENCE_Repaint */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(nullptr, 0, nullptr, ms, true, 0.5f, 0.5f);
+            s.o.Upload();
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tparked", out, repaints, c);
+        const Expected e(out);
+        EXPECT_EQ(repaints, 54u - 18u);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, repaints * 4 * e.edge);
+    }
+}
+
+TEST(PresenceTexture, ACaptionIsUploadedOnceAndThenCostsNothing) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held caption=start serial=1", error, 0));
+        const presence::Cost before = s.o.cost();
+        s.Still(0);
+        s.o.Upload();
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tcaption", out, 1, c);
+        const uint64_t gx0 = 7 + (320 - 14 - 44) / 2;
+        const uint64_t w = OutSpan(gx0, gx0 + 44, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.upload_bytes, 4 * w * h) << "the caption's box";
+        const presence::Cost mid = s.o.cost();
+        s.Still(5000);
+        s.o.Upload();
+        EXPECT_EQ(Delta(s.o.cost(), mid).upload_bytes, 0u) << "a still caption costs nothing";
+    }
+}
+
+TEST(PresenceTexture, ABlinkUploadsTheRecordMarksBoxAloneAndPresentsNoFrame) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held rec=video", error, 0));
+        uint64_t w = 0, h = 0;
+        RecBox(out, w, h);
+        const presence::Cost before = s.o.cost();
+        uint64_t repaints = 0;
+        for (uint32_t ms = 0; ms <= 3000; ms++) {      /* the parked loop, as PRESENCE_Repaint */
+            if (!s.o.NeedsRepaint(ms, true, 0.5f, 0.5f)) continue;
+            s.o.Compose(nullptr, 0, nullptr, ms, true, 0.5f, 0.5f);
+            s.o.Upload();
+            repaints++;
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("trec", out, repaints, c);
+        EXPECT_EQ(repaints, 7u) << "shown, then off and on again each half second";
+        EXPECT_EQ(c.read + c.written + c.presented, 0u);
+        EXPECT_EQ(c.uploads, repaints);
+        EXPECT_EQ(c.upload_bytes, repaints * 4 * w * h) << "the box alone";
+        ASSERT_TRUE(s.o.Configure("held rec=none", error, 3000));
+        s.o.Compose(nullptr, 0, nullptr, 3000, true, 0.5f, 0.5f);
+        s.o.Upload();
+        const presence::Cost mid = s.o.cost();
+        for (uint32_t ms = 3001; ms <= 6000; ms++) EXPECT_FALSE(s.o.NeedsRepaint(ms, true, 0.5f, 0.5f));
+        EXPECT_EQ(Delta(s.o.cost(), mid).uploads, 0u);
+    }
+}
+
+TEST(PresenceTexture, ANewOrLostTextureIsUploadedWholeOnce) {
+    FakeTexture texture;
+    const Output &out = kOutputs[0];
+    Session s(out, "held", true, &texture);
+    EXPECT_EQ(texture.allocations, 1u);
+    EXPECT_EQ(s.o.cost().upload_bytes, 4ull * out.w * out.h) << "a new texture holds nothing yet";
+    const presence::Cost before = s.o.cost();
+    s.o.TextureLost();
+    EXPECT_TRUE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f)) << "the overlay must come back";
+    s.Still(0);
+    s.o.Upload();
+    const presence::Cost c = Delta(s.o.cost(), before);
+    EXPECT_EQ(texture.allocations, 2u);
+    EXPECT_EQ(c.uploads, 1u);
+    EXPECT_EQ(c.upload_bytes, 4ull * out.w * out.h);
+    EXPECT_EQ(std::count(texture.px.begin(), texture.px.end(), 0xDEADBEEFu), 0)
+        << "every pixel of the new texture uploaded";
+
+    /* lost while nothing is drawn: nothing to upload until something is */
+    std::string error;
+    ASSERT_TRUE(s.o.Configure("off", error, 0));
+    s.Still(0);
+    s.o.Upload();
+    const presence::Cost off = s.o.cost();
+    s.o.TextureLost();
+    EXPECT_FALSE(s.o.NeedsRepaint(0, true, 0.5f, 0.5f));
+    s.o.Upload();
+    EXPECT_EQ(Delta(s.o.cost(), off).uploads, 0u);
+    EXPECT_EQ(texture.allocations, 2u);
+}
+
+uint32_t Grey(const void *, unsigned, unsigned) { return 0x808080u; }
+
+TEST(PresenceTexture, AutoReadsItsSamplesOnceASecondAndNothingElse) {
+    for (const Output &out : kOutputs) {
+        FakeTexture texture;
+        Session s(out, "held", true, &texture);
+        std::string error;
+        ASSERT_TRUE(s.o.Configure("held place=auto", error, 0));
+        presence::Picture picture;
+        picture.width = kGuestW;
+        picture.height = kGuestH;
+        picture.pixel = Grey;
+        const presence::Cost before = s.o.cost();
+        for (unsigned frame = 0; frame < 60; frame++) {   /* one second of a running game */
+            const uint32_t ms = frame * 1000 / 60;
+            s.o.Sample(ms, picture);
+            s.Running(ms, 0.5f, 0.5f);
+            s.o.Upload();
+        }
+        const presence::Cost c = Delta(s.o.cost(), before);
+        Print("tauto", out, 60, c);
+        EXPECT_EQ(c.read, 2u * presence::placement::SAMPLES) << "one sample of both bands";
+        EXPECT_EQ(c.written + c.presented + c.uploads + c.upload_bytes, 0u);
+    }
 }
 
 } /* namespace */

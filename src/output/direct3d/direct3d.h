@@ -137,6 +137,16 @@ private:
     DWORD			dwExternalWidth = 0, dwExternalHeight = 0;
     bool			externalDirty = false;	// the 3dfx emulation changed the device's state
     void RestoreOutputState(void);
+    // the presence overlay's own texture (render_presence.h), a second quad over the frame:
+    // written by the emulation thread only while the worker thread is idle
+    LPDIRECT3DTEXTURE9		lpPresence = NULL;
+    DWORD			dwPresenceWidth = 0, dwPresenceHeight = 0;	// the part in use
+    DWORD			dwPresenceTexWidth = 0, dwPresenceTexHeight = 0;
+    bool			presenceShown = false;
+    bool			presenceLost = true;	// a new device holds no overlay texture
+    void DrawPresence(void);
+    void HoldWorker(void);
+    void ReleaseWorker(void);
 
     // function declarations
     HRESULT InitD3D(void);
@@ -247,6 +257,14 @@ public:
     void SetExternalTexture(LPDIRECT3DTEXTURE9 tex, DWORD width, DWORD height);
     bool PresentExternal(void);
 
+    // the presence overlay's texture: `width` by `height` premultiplied ARGB, cleared
+    void PresenceAllocate(DWORD width, DWORD height);
+    // [x0, x1) by [y0, y1) of `pixels`, `pitch` pixels a row
+    void PresenceUpload(const uint32_t *pixels, size_t pitch, DWORD x0, DWORD y0, DWORD x1, DWORD y1);
+    // whether every present draws it
+    void PresenceShow(bool show);
+    // true once after the texture went with the device's objects (a reset, a resize)
+    bool TakePresenceLost(void) { const bool lost = presenceLost; presenceLost = false; return lost; }
     void UpdateRectFromSDLSurface(int x,int y,int w,int h);
     void UpdateRectToSDLSurface(int x,int y,int w,int h);
 

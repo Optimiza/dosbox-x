@@ -14,6 +14,7 @@
 #include <output/output_tools_xbrz.h>
 
 #include "sdlmain.h"
+#include "render_presence.h"
 
 using namespace std;
 
@@ -34,6 +35,46 @@ bool OUTPUT_DIRECT3D_Active(void)
 {
     return d3d != NULL && sdl.desktop.type == SCREEN_DIRECT3D && d3d->GetDevice() != NULL;
 }
+/* The presence overlay as a texture of its own, a second quad over the frame drawn by every
+   present (CDirect3D::DrawPresence), so the frame's pixels are never touched for it. Uploads run
+   on this thread before the present is handed to the worker thread. */
+class Direct3DPresence final : public presence::Texture {
+public:
+    void Allocate(unsigned width, unsigned height) override {
+        if (d3d) d3d->PresenceAllocate(width, height);
+    }
+    void Upload(const uint32_t *pixels, size_t pitch, const presence::Rect &r) override {
+        if (d3d) d3d->PresenceUpload(pixels, pitch, r.x0, r.y0, r.x1, r.y1);
+    }
+    void Present() override { OUTPUT_DIRECT3D_Present(); }
+};
+
+static Direct3DPresence d3d_presence;
+
+presence::Texture *OUTPUT_DIRECT3D_PresenceTexture(void)
+{
+    return &d3d_presence;
+}
+
+/* before every present: a texture gone with the device is made again, then what changed goes up */
+void OUTPUT_DIRECT3D_PresenceSync(void)
+{
+    if (d3d == NULL) return;
+    if (d3d->TakePresenceLost()) PRESENCE_TextureLost(&d3d_presence);
+    d3d->PresenceShow(PRESENCE_TextureDraw(&d3d_presence));
+}
+
+void OUTPUT_DIRECT3D_Present(void)
+{
+    if (d3d == NULL || d3d->GetDevice() == NULL) return;
+    OUTPUT_DIRECT3D_PresenceSync();
+    /* the frame's texture stays locked while the scaler writes into it: the change shows with
+       that frame's own present */
+    if (sdl.updating) return;
+    /* with no lock held, the unlock presents the frame as it stands */
+    d3d->UnlockTexture(NULL);
+}
+
 void ResolvePath(std::string& in);
 void d3d_init(void)
 {
@@ -385,6 +426,7 @@ void OUTPUT_DIRECT3D_EndUpdate(const uint16_t *changedLines)
 #endif
 
     if (!menu.hidecycles) frames++; //implemented
+    OUTPUT_DIRECT3D_PresenceSync();
     if (GCC_UNLIKELY(!d3d->UnlockTexture(changedLines)))
         E_Exit("Failed to draw screen!");
 }

@@ -152,6 +152,13 @@ bool OUTPUT_OPENGL_HasExternalTexture(void);
 void OUTPUT_OPENGL_DrawExternal(void);
 void OUTPUT_OPENGL_PresentExternal(void);
 
+/* The presence overlay as a texture of its own (render_presence.h): the output's texture, the
+ * quad drawn over the frame before every swap, and a present of the frame as it stands. */
+namespace presence { class Texture; }
+presence::Texture *OUTPUT_OPENGL_PresenceTexture(void);
+void OUTPUT_OPENGL_DrawPresence(void);
+void OUTPUT_OPENGL_Present(void);
+
 #endif //C_OPENGL
 
 #endif /*DOSBOX_OUTPUT_OPENGL_H*/

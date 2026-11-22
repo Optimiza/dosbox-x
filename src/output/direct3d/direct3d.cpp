@@ -56,6 +56,8 @@ void CDirect3D::EnterLOGCriticalSection(LPCRITICAL_SECTION lpCriticalSection, in
 /* the Direct3D 3dfx emulation (voodoo_d3d.cpp) */
 void voodoo_d3d_device_reset(bool before);
 void voodoo_d3d_device_lost(void);
+/* the presence overlay's texture brought up to date (output_direct3d.cpp) */
+void OUTPUT_DIRECT3D_PresenceSync(void);
 
 /* Most DOSBox forks incorporating the "D3D patch" expect the pixelshader filename
    to exist in a shaders\ subdirectory. */
@@ -322,15 +324,18 @@ lock_texture:
 
 bool CDirect3D::UnlockTexture(const uint16_t *changed)
 {
-	changedLines = changed;
 #if D3D_THREAD
+	/* the worker may still be reading the last frame's lines: a present without a lock
+	   (OUTPUT_DIRECT3D_Present) can follow it at once */
 	Wait(false);
+	changedLines = changed;
 	thread_command = D3D_UNLOCK;
 	LeaveCriticalSection(&cs);
 
 	SDL_SemPost(thread_sem);
 	return true;
 #else
+	changedLines = changed;
 	return UnlockTexture();
 #endif
 }
@@ -892,6 +897,8 @@ pass2:
 	pD3DDevice9->DrawPrimitive(D3DPT_TRIANGLESTRIP, 0, 2);
     }
 
+    DrawPresence();
+
     // end rendering
     pD3DDevice9->EndScene();
 
@@ -950,6 +957,7 @@ void CDirect3D::SetExternalTexture(LPDIRECT3DTEXTURE9 tex, DWORD width, DWORD he
 /* draw the window with the 3dfx emulation's frame, now */
 bool CDirect3D::PresentExternal(void)
 {
+    OUTPUT_DIRECT3D_PresenceSync();
 #if D3D_THREAD
     Wait(false);
 #endif
@@ -959,6 +967,112 @@ bool CDirect3D::PresentExternal(void)
     LeaveCriticalSection(&cs);
 #endif
     return ok;
+}
+
+/* Between the two, the worker thread is idle and does not touch the device. */
+void CDirect3D::HoldWorker(void)
+{
+#if D3D_THREAD
+    Wait(false);
+#endif
+}
+
+void CDirect3D::ReleaseWorker(void)
+{
+#if D3D_THREAD
+    LeaveCriticalSection(&cs);
+#endif
+}
+
+void CDirect3D::PresenceAllocate(DWORD width, DWORD height)
+{
+    HoldWorker();
+    SAFE_RELEASE(lpPresence);
+    DWORD tw = width, th = height;
+    if (square || pow2) {
+        for (tw = 1; tw < width; tw <<= 1);
+        for (th = 1; th < height; th <<= 1);
+        if (square) tw = th = (tw > th ? tw : th);
+    }
+    /* managed: it survives a Reset, though InvalidateDeviceObjects lets it go with the frame's */
+    if (pD3DDevice9 && width && height &&
+        SUCCEEDED(pD3DDevice9->CreateTexture(tw, th, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &lpPresence, NULL))) {
+        /* the filtered quad samples past the part in use: transparent there */
+        D3DLOCKED_RECT lr;
+        if (SUCCEEDED(lpPresence->LockRect(0, &lr, NULL, 0))) {
+            for (DWORD y = 0; y < th; y++) memset((uint8_t *)lr.pBits + (size_t)y * lr.Pitch, 0, (size_t)tw * 4);
+            lpPresence->UnlockRect(0);
+        }
+        dwPresenceWidth = width;
+        dwPresenceHeight = height;
+        dwPresenceTexWidth = tw;
+        dwPresenceTexHeight = th;
+    } else {
+        LOG_MSG("D3D:Failed to create the presence overlay's texture");
+        lpPresence = NULL;
+    }
+    ReleaseWorker();
+}
+
+void CDirect3D::PresenceUpload(const uint32_t *pixels, size_t pitch, DWORD x0, DWORD y0, DWORD x1, DWORD y1)
+{
+    HoldWorker();
+    D3DLOCKED_RECT lr;
+    const RECT rect = { (LONG)x0, (LONG)y0, (LONG)x1, (LONG)y1 };
+    /* locking a rectangle of a managed texture marks it for the next draw */
+    if (lpPresence && x1 > x0 && y1 > y0 && x1 <= dwPresenceWidth && y1 <= dwPresenceHeight &&
+        SUCCEEDED(lpPresence->LockRect(0, &lr, &rect, 0))) {
+        for (DWORD y = y0; y < y1; y++)
+            memcpy((uint8_t *)lr.pBits + (size_t)(y - y0) * lr.Pitch, pixels + (size_t)y * pitch + x0, (size_t)(x1 - x0) * 4);
+        lpPresence->UnlockRect(0);
+    }
+    ReleaseWorker();
+}
+
+void CDirect3D::PresenceShow(bool show)
+{
+    if (show == presenceShown) return;
+    HoldWorker();
+    presenceShown = show;
+    ReleaseWorker();
+}
+
+/* over the frame, on the same rectangle, premultiplied: the frame's pixels are never touched */
+void CDirect3D::DrawPresence(void)
+{
+    if (!presenceShown || lpPresence == NULL) return;
+    const float u = (float)dwPresenceWidth / (float)dwPresenceTexWidth;
+    const float v = (float)dwPresenceHeight / (float)dwPresenceTexHeight;
+    struct { float x, y, z, rhw, u, v; } quad[4] = {
+        { (float)dwX - 0.5f,                   (float)dwY - 0.5f,                    0.0f, 1.0f, 0.0f, 0.0f },
+        { (float)(dwX + dwScaledWidth) - 0.5f, (float)dwY - 0.5f,                    0.0f, 1.0f, u,    0.0f },
+        { (float)dwX - 0.5f,                   (float)(dwY + dwScaledHeight) - 0.5f, 0.0f, 1.0f, 0.0f, v    },
+        { (float)(dwX + dwScaledWidth) - 0.5f, (float)(dwY + dwScaledHeight) - 0.5f, 0.0f, 1.0f, u,    v    } };
+    DWORD address_u = D3DTADDRESS_WRAP, address_v = D3DTADDRESS_WRAP, src = D3DBLEND_ONE, dest = D3DBLEND_ZERO;
+    pD3DDevice9->GetRenderState(D3DRS_SRCBLEND, &src);
+    pD3DDevice9->GetRenderState(D3DRS_DESTBLEND, &dest);
+    pD3DDevice9->GetSamplerState(0, D3DSAMP_ADDRESSU, &address_u);
+    pD3DDevice9->GetSamplerState(0, D3DSAMP_ADDRESSV, &address_v);
+    pD3DDevice9->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+    pD3DDevice9->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+    /* a pixel shader, when there is one, draws the frame only */
+    pD3DDevice9->SetVertexShader(NULL);
+    pD3DDevice9->SetPixelShader(NULL);
+    pD3DDevice9->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+    pD3DDevice9->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_ONE);
+    pD3DDevice9->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+    pD3DDevice9->SetTexture(0, lpPresence);
+    pD3DDevice9->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+    pD3DDevice9->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(quad[0]));
+    /* (DrawPrimitiveUP unsets the stream source) */
+    pD3DDevice9->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+    pD3DDevice9->SetRenderState(D3DRS_SRCBLEND, src);
+    pD3DDevice9->SetRenderState(D3DRS_DESTBLEND, dest);
+    pD3DDevice9->SetSamplerState(0, D3DSAMP_ADDRESSU, address_u);
+    pD3DDevice9->SetSamplerState(0, D3DSAMP_ADDRESSV, address_v);
+    pD3DDevice9->SetFVF(D3DFVF_TLVERTEX);
+    pD3DDevice9->SetStreamSource(0, vertexBuffer, 0, sizeof(TLVERTEX));
+    pD3DDevice9->SetTexture(0, lpTexture);
 }
 
 /* what RestoreDeviceObjects() set up, after the 3dfx emulation changed it */
@@ -999,6 +1113,10 @@ void CDirect3D::RestoreOutputState(void)
 HRESULT CDirect3D::InvalidateDeviceObjects(void)
 {
     SAFE_RELEASE(lpTexture);
+    /* the overlay's texture goes with the frame's, so a reset or a resize shows it again by
+       one whole upload at the overlay's new size */
+    SAFE_RELEASE(lpPresence);
+    presenceLost = true;
 #if C_D3DSHADERS
     SAFE_RELEASE(lpWorkTexture1);
     SAFE_RELEASE(lpWorkTexture2);

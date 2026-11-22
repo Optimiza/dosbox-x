@@ -16,15 +16,16 @@
  *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
  */
 
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 
-#include <string.h>
-#include <stdlib.h>
-#include <time.h>
-#include "dosbox.h"
-#include "mem.h"
 #include "dos_inc.h"
-#include "support.h"
+#include "dosbox.h"
 #include "drives.h"
+#include "mem.h"
 
 uint8_t sdriv[260], sattr[260], fattr;
 char sname[260][LFN_NAMELENGTH+1],storect[CTBUF];
@@ -458,20 +459,42 @@ void DOS_PSP::SetFCB2(RealPt src) {
 	if (src) MEM_BlockCopy(PhysMake(seg,offsetof(sPSP,fcb2)),Real2Phys(src),16);
 }
 
-bool DOS_PSP::SetNumFiles(uint16_t fileNum) {
-	//20 minimum. clipper program.
-	if (fileNum < 20) fileNum = 20;
-	 
-	if (fileNum > 20 && ((uint32_t)(fileNum+2) > sGet(sPSP,max_files))) {
-		// Allocate needed paragraphs
-		fileNum+=2;	// Add a few more files for safety
-		uint16_t para = (fileNum/16)+((fileNum%16)>0);
-		RealPt data	= RealMake(DOS_GetMemory(para,"SetNumFiles data"),0);
-		for (uint16_t i=0; i<fileNum; i++) mem_writeb(Real2Phys(data)+i,(i<20)?GetFileHandle(i):0xFF);
-		sSave(sPSP,file_table,data);
+// This replicates the behavior found in the MS-DOS 4.0 source code on GitHub
+uint16_t DOS_PSP::SetNumFiles(uint16_t fileNum) {
+	fileNum = std::max<uint16_t>(fileNum, 20);
+
+	const uint16_t curNum = sGet(sPSP, max_files);
+	if (fileNum == curNum) return DOSERR_NONE;
+    else if (fileNum == 0xffff) return DOSERR_FUNCTION_NUMBER_INVALID;
+
+	const auto oldTable = sGet(sPSP,file_table);
+	const auto pspTable = RealMake(seg,offsetof(sPSP, files));
+	const auto oldPhys = Real2Phys(oldTable);
+
+	if (fileNum < curNum) {
+		for (uint16_t i=fileNum; i < curNum; i++)
+			if (mem_readb(oldPhys+i) != 0xff) return DOSERR_TOO_MANY_OPEN_FILES;
 	}
-	sSave(sPSP,max_files,fileNum);
-	return true;
+
+	RealPt newTable;
+	if (fileNum == 20) {
+		newTable = pspTable;
+	} else {
+		uint16_t newseg = 0, paras = (uint16_t)(((uint32_t)fileNum+15)>>4);
+		if (!DOS_AllocateMemory(&newseg, &paras)) return DOSERR_INSUFFICIENT_MEMORY;
+		newTable = RealMake(newseg, 0);
+	}
+
+	const auto newPhys = Real2Phys(newTable);
+	const auto copyNum = std::min(fileNum, curNum);
+	for (uint16_t i=0; i<copyNum; i++) mem_writeb(newPhys+i, mem_readb(oldPhys+i));
+	for (uint16_t i=copyNum; i<fileNum; i++) mem_writeb(newPhys+i, 0xff);
+
+	sSave(sPSP, file_table, newTable);
+	sSave(sPSP, max_files, fileNum);
+
+	if (oldTable != pspTable) DOS_FreeMemory(RealSeg(oldTable));
+	return DOSERR_NONE;
 }
 
 void DOS_DTA::SetupSearch(uint8_t _sdrive,uint8_t _sattr,const char * pattern) {
@@ -488,7 +511,8 @@ void DOS_DTA::SetupSearch(uint8_t _sdrive,uint8_t _sattr,const char * pattern) {
 	}
     for (i=0;i<11;i++) mem_writeb(pt+offsetof(sDTA,spname)+i,0);
 	
-	sSave(sDTA,sdrive,_sdrive);
+	/* MS-DOS counts the drive from 1 here (A: is 1) */
+	sSave(sDTA,sdrive,(uint8_t)(_sdrive+1u));
 	sSave(sDTA,sattr,_sattr);
     const char* find_ext;
     find_ext=strchr(pattern,'.');
@@ -513,7 +537,11 @@ void DOS_DTA::SetResult(const char * _name, const char * _lname, uint32_t _size,
 	strcpy(fd.sname,_name);
 	if (!strcmp(fd.lname,fd.sname)) fd.sname[0]=0;
 	if (lfn_filefind_handle>=LFN_FILEFIND_MAX) {
-		MEM_BlockWrite(pt+offsetof(sDTA,name),(void *)_name,strlen(_name)+1);
+		/* MS-DOS lays the entry's eight name bytes down first and writes the dot, the extension
+		 * and the zero over them, so a short name leaves spaces after its zero up to byte 8 */
+		size_t len=strlen(_name)+1;
+		MEM_BlockWrite(pt+offsetof(sDTA,name),(void *)_name,len);
+		for (size_t i=len;i<8;i++) mem_writeb(pt+offsetof(sDTA,name)+i,' ');
 		sSave(sDTA,size,_size);
 		sSave(sDTA,date,_date);
 		sSave(sDTA,time,_time);
@@ -574,7 +602,7 @@ int DOS_DTA::GetFindData(int fmt, char * fdstr, int *c) {
 }
 
 uint8_t DOS_DTA::GetSearchDrive(void) {
-	return lfn_filefind_handle>=LFN_FILEFIND_MAX?(uint8_t)sGet(sDTA,sdrive):sdriv[lfn_filefind_handle];
+	return lfn_filefind_handle>=LFN_FILEFIND_MAX?(uint8_t)(sGet(sDTA,sdrive)-1u):sdriv[lfn_filefind_handle];
 }
 
 void DOS_DTA::GetSearchParams(uint8_t & attr,char * pattern, bool lfn) {

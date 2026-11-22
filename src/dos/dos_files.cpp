@@ -811,6 +811,11 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
 		DOS_SetError(DOSERR_ACCESS_DENIED);
 		return false;
 	}
+	// Target directory must exist
+	if (!PathExists(newname)) {
+		DOS_SetError(DOSERR_PATH_NOT_FOUND);
+		return false;
+	}
 
 #if defined (WIN32)
 	if (clip) {
@@ -833,6 +838,90 @@ bool DOS_Rename(char const * const oldname,char const * const newname) {
 	return false;
 }
 
+static bool DOS_PathLeadByte(uint8_t c) {
+	return (IS_PC98_ARCH && shiftjis_lead_byte(c)) || (isDBCSCP() && isKanji1(c));
+}
+
+/* A CD's search goes to MSCDEX, which reads the path itself: a search for the label alone returns
+ * the label for any name in a directory that exists, then that directory's entries that match
+ * the name, and a path that ends in a backslash names a directory and no entry in it */
+static bool DOS_SearchIsOnCD(const char * search) {
+	const uint8_t drive=(search[0] && search[1]==':') ? (uint8_t)((search[0] | 0x20)-'a') : DOS_GetDefaultDrive();
+	return drive<DOS_DRIVES && dynamic_cast<isoDrive*>(Drives[drive])!=NULL;
+}
+
+/* What MS-DOS answers to the path of a program's AH=4Eh before it reads a directory, long names
+ * off: a name a directory entry cannot hold, or a path that climbs above the root, is error 3;
+ * a backslash that ends the path is 3 below the root and 18 at it; a path that resolves to the
+ * root itself is 18, the root having no entry for itself; an extension with a space inside it
+ * matches no entry. 0 lets the search go on. The emulator's own callers pass quoted paths to
+ * DOS_FindFirst and are not asked this. On a CD, a path that ends in a backslash or resolves to
+ * a directory is MSCDEX's to answer. */
+uint16_t DOS_FindFirstPathError(const char * search) {
+	if (strchr(search,'"')) return DOSERR_PATH_NOT_FOUND;
+	const char * p=search;
+	uint8_t drive=DOS_GetDefaultDrive();
+	if (p[0] && p[1]==':') {
+		drive=(p[0] | 0x20)-'a';
+		p+=2;
+		if (!*p) return DOSERR_PATH_NOT_FOUND;
+	}
+	if (drive>=DOS_DRIVES || !Drives[drive]) return 0;
+	const bool on_cd=DOS_SearchIsOnCD(search);
+
+	int depth=0;
+	bool lead=false;
+	if (*p!='\\' && *p!='/') {
+		bool sep=true;
+		for (const char * c=Drives[drive]->curdir;*c;c++) {
+			if (lead) lead=false;
+			else if (*c=='\\') { sep=true; continue; }
+			else if (DOS_PathLeadByte((uint8_t)*c)) lead=true;
+			if (sep) depth++;
+			sep=false;
+		}
+	}
+	bool dots_last=false;
+	lead=false;
+	for (const char * c=p, * start=p;;c++) {
+		if (lead) {
+			lead=false;
+			if (*c) continue;
+		}
+		const uint8_t ch=(uint8_t)*c;
+		if (ch && DOS_PathLeadByte(ch)) { lead=true; continue; }
+		if (ch && ch!='\\' && ch!='/') continue;
+		const size_t len=(size_t)(c-start);
+		if (!len) {
+			if (!ch && c>p && !on_cd) return depth==0 ? DOSERR_NO_MORE_FILES : DOSERR_PATH_NOT_FOUND;
+		} else if (*start==' ') {
+			return DOSERR_PATH_NOT_FOUND;
+		} else {
+			size_t dots=0;
+			const char * dot=NULL;
+			for (const char * d=start;d<c;d++) if (*d=='.') { dots++; if (!dot) dot=d; }
+			if (dots==len) {
+				if (len>2) return DOSERR_PATH_NOT_FOUND;
+				if (len==2 && --depth<0) return DOSERR_PATH_NOT_FOUND;
+				dots_last=true;
+			} else {
+				if (dot==start || dots>1) return DOSERR_PATH_NOT_FOUND;
+				if (dot) {
+					const char * ext_end=c;
+					while (ext_end>dot+1 && ext_end[-1]==' ') ext_end--;
+					if (memchr(dot+1,' ',(size_t)(ext_end-(dot+1)))) return ch ? DOSERR_PATH_NOT_FOUND : DOSERR_NO_MORE_FILES;
+				}
+				depth++;
+				dots_last=false;
+			}
+		}
+		if (!ch) break;
+		start=c+1;
+	}
+	if (dots_last && depth==0 && !on_cd) return DOSERR_NO_MORE_FILES;
+	return 0;
+}
+
 bool forcelfn = false;
 bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 	ReplaceCurrentFindSnapshot();
@@ -841,13 +930,14 @@ bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 	uint8_t drive;char fullsearch[DOS_PATHLENGTH];
 	char dir[DOS_PATHLENGTH];char pattern[DOS_PATHLENGTH];
 	size_t len = strlen(search);
-	if(len && check_last_split_char(search, len, '\\') && !( (len > 2) && (search[len - 2] == ':') && (attr == DOS_ATTR_VOLUME) )) { 
+	const bool cd_dir = len && check_last_split_char(search, len, '\\') && DOS_SearchIsOnCD(search);
+	if(len && check_last_split_char(search, len, '\\') && !( (len > 2) && (search[len - 2] == ':') && (attr == DOS_ATTR_VOLUME) ) && !cd_dir) { 
 		//Dark Forces installer, but c:\ is alright for volume labels(exclusively set)
 		DOS_SetError(DOSERR_NO_MORE_FILES);
 		return false;
 	}
 
-	if (attr == DOS_ATTR_VOLUME) {
+	if (attr == DOS_ATTR_VOLUME && !DOS_SearchIsOnCD(search)) {
 		const char* vol_pattern = search;
 
 		/* Optional drive specification */
@@ -863,7 +953,33 @@ bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 			return false;
 		}
 		sdrive = drive;
-		while (*vol_pattern == '\\') vol_pattern++; /* Creative Sound Blaster Pro 2.0 INSTALL uses "A:\*.*" to read volume label */
+		while (*vol_pattern == '\\' || *vol_pattern == '/') vol_pattern++; /* Creative Sound Blaster Pro 2.0 INSTALL uses "A:\*.*" to read volume label */
+		/* The label is the root's, whatever directory the path names once that directory exists:
+		 * only the last name is compared, and a last name of dots names a directory, not a label */
+		const char* vol_name = NULL;
+		bool lead = false;
+		for (const char* c = vol_pattern; *c; c++) {
+			if (lead) lead = false;
+			else if (DOS_PathLeadByte((uint8_t)*c)) lead = true;
+			else if (*c == '\\' || *c == '/') vol_name = c;
+		}
+		if (vol_name) {
+			char dir[DOS_PATHLENGTH], fulldir[DOS_PATHLENGTH];
+			uint8_t dir_drive;
+			const size_t dir_len = (size_t)(vol_name - search);
+			if (dir_len >= sizeof(dir)) { DOS_SetError(DOSERR_PATH_NOT_FOUND); return false; }
+			memcpy(dir, search, dir_len);
+			dir[dir_len] = 0;
+			if (!DOS_MakeName(dir, fulldir, &dir_drive) || !Drives[dir_drive]->TestDir(fulldir)) {
+				DOS_SetError(DOSERR_PATH_NOT_FOUND);
+				return false;
+			}
+			vol_pattern = vol_name + 1;
+		}
+		if (*vol_pattern && strspn(vol_pattern, ".") == strlen(vol_pattern)) {
+			DOS_SetError(DOSERR_NO_MORE_FILES);
+			return false;
+		}
 		dta.SetupSearch(drive, (uint8_t)attr, vol_pattern);
 
 		return Drives[drive]->FindFirst("", dta, fcb_findfirst);
@@ -886,7 +1002,15 @@ bool DOS_FindFirst(const char * search,uint16_t attr,bool fcb_findfirst) {
 #else
 	find_last = strrchr_dbcs(fullsearch,'\\');
 #endif
-	if (!find_last) {	/*No dir */
+	if (cd_dir) {
+		/* MSCDEX reads "X\" as directory X and no entry in it: only the label can follow */
+		if (attr != DOS_ATTR_VOLUME) {
+			DOS_SetError(Drives[drive]->TestDir(fullsearch) ? DOSERR_NO_MORE_FILES : DOSERR_FILE_NOT_FOUND);
+			return false;
+		}
+		strcpy(dir,fullsearch);
+		pattern[0]=0;
+	} else if (!find_last) {	/*No dir */
 		strcpy(pattern,fullsearch);
 		dir[0]=0;
 	} else {
@@ -959,17 +1083,21 @@ bool DOS_FindNext(void) {
 
 
 bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
+
+//#if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#if defined(WIN32)
+#if !defined(OSFREE)
+    if(Network_IsActiveResource(entry))
+        return Network_ReadFile(entry, data, amount);
+#endif
+#endif
+
 	uint32_t handle = fcb?entry:RealHandle(entry);
 	if (handle>=DOS_FILES) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
 		return false;
 	}
-#if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
- #if !defined(OSFREE)
-    if(Network_IsActiveResource(entry))
-		return Network_ReadFile(entry,data,amount);
- #endif
-#endif
+
 	if (!Files[handle] || !Files[handle]->IsOpen()) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
 		return false;
@@ -993,17 +1121,19 @@ bool DOS_ReadFile(uint16_t entry,uint8_t * data,uint16_t * amount,bool fcb) {
 bool DOS_WriteFile(uint16_t entry,const uint8_t * data,uint16_t * amount,bool fcb) {
 	if (dos_kernel_disabled) E_Exit("Attempt to write to DOS file handle while guest OS is running");
 
+#if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+#if !defined(OSFREE)
+    if(Network_IsActiveResource(entry))
+        return Network_WriteFile(entry, data, amount);
+#endif
+#endif
+
 	uint32_t handle = fcb?entry:RealHandle(entry);
 	if (handle>=DOS_FILES) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
 		return false;
 	}
-#if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
- #if !defined(OSFREE)
-    if(Network_IsActiveResource(entry))
-		return Network_WriteFile(entry,data,amount);
- #endif
-#endif
+
 	if (!Files[handle] || !Files[handle]->IsOpen()) {
 		DOS_SetError(DOSERR_INVALID_HANDLE);
 		return false;
@@ -1049,17 +1179,23 @@ bool DOS_SeekFile(uint16_t entry,uint32_t * pos,uint32_t type,bool fcb) {
 }
 
 /* ert, 20100711: Locking extensions */
-bool DOS_LockFile(uint16_t entry,uint8_t mode,uint32_t pos,uint32_t size) {
-	uint32_t handle=RealHandle(entry);
-	if (handle>=DOS_FILES) {
-		DOS_SetError(DOSERR_INVALID_HANDLE);
-		return false;
-	}
-	if (!Files[handle] || !Files[handle]->IsOpen()) {
-		DOS_SetError(DOSERR_INVALID_HANDLE);
-		return false;
-	}
-	return Files[handle]->LockFile(mode,pos,size);
+bool DOS_LockFile(uint16_t entry, uint8_t mode, uint32_t pos, uint32_t size) {
+#if defined(WIN32) && !(defined(__MINGW32__) && !defined(__MINGW64_VERSION_MAJOR))
+# if !defined(OSFREE)
+    if(Network_IsActiveResource(entry))
+        return Network_LockFile(entry, mode, pos, size);
+# endif
+#endif
+    uint32_t handle = RealHandle(entry);
+    if(handle >= DOS_FILES) {
+        DOS_SetError(DOSERR_INVALID_HANDLE);
+        return false;
+    }
+    if(!Files[handle] || !Files[handle]->IsOpen()) {
+        DOS_SetError(DOSERR_INVALID_HANDLE);
+        return false;
+    }
+    return Files[handle]->LockFile(mode, pos, size);
 }
 
 bool DOS_CloseFile(uint16_t entry, bool fcb, uint8_t * refcnt) {
