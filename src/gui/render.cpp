@@ -489,6 +489,18 @@ bool RENDER_StartUpdate(void) {
     return true;
 }
 
+/* The debugger parked the machine while the scaler was writing a frame: that frame never
+   ends, so its update is dropped unshown and the next writer starts one whole. Without it the
+   output keeps `updating` set while the machine is stopped and nothing (the presence overlay
+   included) can present until the guest runs again. */
+void RENDER_AbandonUpdate(void) {
+    if (!render.updating)
+        return;
+    RENDER_DrawLine = RENDER_EmptyLineHandler;
+    render.updating = false;
+    GFX_AbandonUpdate();
+}
+
 static void RENDER_Halt( void ) {
     RENDER_DrawLine = RENDER_EmptyLineHandler;
     GFX_EndUpdate(nullptr);

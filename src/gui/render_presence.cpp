@@ -1228,6 +1228,9 @@ void PRESENCE_Repaint() {
 }
 
 void PRESENCE_ParkedTick() {
+    /* a breakpoint can stop the guest in the middle of a frame the scaler was writing; the
+       update that frame left open would keep every repaint out until the guest runs again */
+    RENDER_AbandonUpdate();
     if (PRESENCE_WantsRepaint()) PRESENCE_Repaint();
 }
 

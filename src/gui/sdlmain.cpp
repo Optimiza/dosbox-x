@@ -3365,6 +3365,9 @@ void GFX_OpenGLRedrawScreen(void) {
 #endif
 }
 
+/* Drop the open update without presenting it: the frame it belongs to is not finished. */
+void GFX_AbandonUpdate(void) { sdl.updating = false; }
+
 void GFX_EndUpdate(const uint16_t *changedLines) {
 #if C_EMSCRIPTEN
     emscripten_sleep(0);

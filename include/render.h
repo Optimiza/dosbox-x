@@ -201,6 +201,7 @@ extern ScalerLineHandler_t RENDER_DrawLine;
 void RENDER_SetSize(Bitu width,Bitu height,Bitu bpp,float fps,double scrn_ratio);
 bool RENDER_StartUpdate(void);
 void RENDER_EndUpdate(bool abort);
+void RENDER_AbandonUpdate(void);
 void RENDER_SetPal(uint8_t entry,uint8_t red,uint8_t green,uint8_t blue);
 bool RENDER_GetForceUpdate(void);
 void RENDER_SetForceUpdate(bool);
