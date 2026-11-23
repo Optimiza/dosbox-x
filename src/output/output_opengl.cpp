@@ -652,32 +652,47 @@ static void OPENGL_RestoreContext(void)
     glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
 }
 
+/* Whether this context takes a texture whose sides are not powers of two: core since 2.0,
+   an extension before that. */
+static bool OPENGL_TakesAnyTextureSize(void)
+{
+    const char *version = (const char *)glGetString(GL_VERSION);
+    const char *extensions = (const char *)glGetString(GL_EXTENSIONS);
+    return (version != NULL && atof(version) >= 2.0) ||
+           (extensions != NULL && strstr(extensions, "GL_ARB_texture_non_power_of_two") != NULL);
+}
+
 /* The presence overlay's own texture, drawn as a second quad over the frame's with
    premultiplied blending, so the frame's pixels are never touched for it. It has the size of
    the frame's used part and is stretched onto the same rectangle of the window. */
 class OpenGLPresence final : public presence::Texture {
 public:
     void Allocate(unsigned width, unsigned height) override {
-        unsigned side = 1;
-        while (side < std::max(width, height)) side <<= 1;
+        /* The part in use must end at the texture's edge where the GL allows a texture of any
+           size: a filtered quad reaches half a texel past it, and clear texels there dim the
+           window's last row and column. An older GL keeps the square, cleared to transparent,
+           and the quad stays inside the part in use. */
+        unsigned tw = width, th = height;
+        if (!OPENGL_TakesAnyTextureSize()) {
+            tw = th = 1;
+            while (tw < std::max(width, height)) tw <<= 1;
+            th = tw;
+        }
         if (texture == 0) glGenTextures(1, &texture);
         const GLint unpack = UnbindPixelBuffer();
         glBindTexture(GL_TEXTURE_2D, texture);
         const GLint interp = (sdl_opengl.kind == GLNearest || sdl_opengl.kind == GLPerfect) ? GL_NEAREST : GL_LINEAR;
-        /* a filtered quad samples half a texel past the part in use: transparent there, never
-           the border colour or whatever the allocation held */
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, interp);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, interp);
-        const std::vector<uint32_t> clear((size_t)side * side, 0u);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)side, (GLsizei)side, 0, GL_BGRA_EXT,
+        const std::vector<uint32_t> clear((size_t)tw * th, 0u);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, (GLsizei)tw, (GLsizei)th, 0, GL_BGRA_EXT,
                      GL_UNSIGNED_INT_8_8_8_8_REV, clear.data());
         glBindTexture(GL_TEXTURE_2D, sdl_opengl.texture);
         RebindPixelBuffer(unpack);
-        w = width;
-        h = height;
-        size = side;
+        u = (float)width / (float)tw;
+        v = (float)height / (float)th;
     }
     void Upload(const uint32_t *pixels, size_t pitch, const presence::Rect &r) override {
         const GLint unpack = UnbindPixelBuffer();
@@ -699,7 +714,7 @@ public:
         PRESENCE_TextureLost(this);
     }
     void Draw() {
-        if (!PRESENCE_TextureDraw(this) || texture == 0 || size == 0) return;
+        if (!PRESENCE_TextureDraw(this) || texture == 0 || u == 0) return;
         /* the shader, when there is one, draws the frame only: the quad is fixed function, over
            the same rectangle, in the viewport's own coordinates */
         if (sdl_opengl.program_object) glUseProgram(0);
@@ -723,7 +738,6 @@ public:
             x1 = x0 + (GLfloat)sdl.clip.w;
             y1 = y0 + (GLfloat)sdl.clip.h;
         }
-        const GLfloat u = (GLfloat)w / (GLfloat)size, v = (GLfloat)h / (GLfloat)size;
         glBindTexture(GL_TEXTURE_2D, texture);
         glEnable(GL_BLEND);
         glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
@@ -760,7 +774,8 @@ private:
     }
 
     GLuint texture = 0;
-    unsigned w = 0, h = 0, size = 0;
+    /* the part in use, as texture coordinates: 1 where the texture ends at that edge */
+    float u = 0, v = 0;
 };
 
 static OpenGLPresence opengl_presence;
