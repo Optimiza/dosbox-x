@@ -20,6 +20,7 @@
 #include "gtest/gtest.h"
 #include "render_presence.h"
 
+extern uint8_t int10_font_08[256 * 8];
 extern uint8_t int10_font_16[256 * 16];
 
 namespace {
@@ -376,8 +377,8 @@ TEST(Presence, TheSameLookSentAgainIsNotANewOne) {
 }
 
 /* A 320x200 output of a 320x200 guest, one output pixel a guest pixel, so the band's layout
-   reads in guest pixels: the edge is 5 wide, the band is the bottom 25 rows, its boxes are 20
-   rows from row 177, inset 7 from each side. */
+   reads in guest pixels: the edge is 5 wide, the band is the bottom 25 rows, its boxes are 12
+   rows from row 181, inset 7 from each side. */
 struct Band {
     Overlay o;
     Frame frame;
@@ -390,32 +391,113 @@ struct Band {
     }
     void Draw(uint32_t now_ms) { o.Compose(frame.buf(), frame.pitch(), nullptr, now_ms, false, 0, 0); }
 };
-const unsigned kBoxY = 177, kBoxH = 20, kInset = 7;
+const unsigned kBoxY = 181, kBoxH = 12, kInset = 7;
 
-/* The first lit pixel of a glyph in the VGA 8x16 font, as (column, row). */
-void FirstInk(unsigned char c, unsigned &col, unsigned &row) {
-    for (row = 0; row < 16; row++)
+/* The first lit pixel of a glyph in the VGA font `rows` tall, as (column, row). */
+void FirstInk(unsigned char c, unsigned rows, unsigned &col, unsigned &row) {
+    const uint8_t *font = rows == 16 ? int10_font_16 : int10_font_08;
+    for (row = 0; row < rows; row++)
         for (col = 0; col < 8; col++)
-            if (int10_font_16[c * 16 + row] & (0x80u >> col)) return;
+            if (font[c * rows + row] & (0x80u >> col)) return;
 }
+
+/* Where the held keys' marks are drawn: on the edge the caption's band leaves free, at the
+   left inset, the newest key first. The band takes the bottom here, so the marks take the top,
+   one box tall from row `kInset`. The marks take the 8-row font on this picture, so their box
+   is 12 rows. */
+const unsigned kKeyY = kInset, kKeyH = 12;
 
 TEST(PresenceLayers, AKeycapIsABoxPerKeyWithTheKeysGlyphs) {
     Band b("held keys=A,Shift place=bottom");
     b.Draw(0);
-    /* laid from the right inset: "Shift" is 5 x 8 + 4 wide, "A" 12 and a gap before it */
-    const unsigned shift_x0 = 320 - kInset - 44, a_x0 = shift_x0 - 2 - 12;
+    /* the newest at the left: "Shift" is 5 x 8 + 4 wide, then a gap, then "A"'s 12 */
+    const unsigned shift_x0 = kInset, a_x0 = shift_x0 + 44 + 2;
     unsigned col = 0, row = 0;
-    FirstInk('A', col, row);
-    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kBoxY + 2 + row), 0x00FFFFFFu) << "the glyph's ink";
-    const uint32_t cap = b.frame.at(a_x0, kBoxY);
+    FirstInk('A', 8, col, row);
+    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kKeyY + 2 + row), 0x00FFFFFFu) << "the glyph's ink";
+    /* the box's last row, past the text, inside its outline */
+    const uint32_t cap = b.frame.at(a_x0 + 6, kKeyY + kKeyH - 2);
     EXPECT_NE(cap, 0u) << "the keycap's box";
     EXPECT_EQ(cap & 0xFFu, (cap >> 16) & 0xFFu) << "grey, as keycap_rgb is";
-    EXPECT_EQ(b.frame.at(a_x0 - 1, kBoxY), 0u) << "nothing between the boxes";
-    EXPECT_EQ(b.frame.at(a_x0, kBoxY - 1), 0u) << "nothing above them";
+    /* the outline the clip draws: half the text's brightness, over the fill */
+    const uint32_t line = b.frame.at(a_x0, kKeyY + kKeyH - 2);
+    EXPECT_GT(line & 0xFFu, cap & 0xFFu) << "the outline is brighter than the fill";
+    EXPECT_LT(line & 0xFFu, 0xF0u) << "and half bright, never the text's own white";
+    EXPECT_EQ(b.frame.at(a_x0, kKeyY), 0u) << "a rounded corner, not a square one";
+    EXPECT_EQ(b.frame.at(a_x0 - 1, kKeyY + 6), 0u) << "nothing between the boxes";
+    EXPECT_EQ(b.frame.at(a_x0 + 6, kKeyY - 1), 0u) << "nothing above them";
     std::string error;
     ASSERT_TRUE(b.o.Configure("held keys=", error, 0));
     b.Draw(0);
-    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kBoxY + 2 + row), 0u) << "no key down, no keycap";
+    EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kKeyY + 2 + row), 0u) << "no key down, no keycap";
+}
+
+TEST(PresenceLayers, AKeycapsBoxStaysUnderASeventhOfThePicture) {
+    /* one rule for the band and the keys: the 8-row font on a 200-row picture and the 16-row
+       one on a 300-row picture, so a 12- and a 20-row box, both under a seventh. */
+    const struct { unsigned rows, inset, box; } cases[] = {{200, 7, 12}, {300, 10, 20}};
+    for (const auto &c : cases) {
+        Overlay o;
+        Frame frame(320, c.rows, 0);
+        std::string error;
+        ASSERT_TRUE(o.Configure("held keys=A edge=0.025", error, 0)) << error;
+        const Format f = Rgb32();
+        o.Resize(320, c.rows, &f);
+        o.Guest(320, c.rows);
+        o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
+        /* the box's own column, between its outline and its text */
+        const unsigned x = c.inset + 1;
+        unsigned first = c.rows, last = 0;
+        for (unsigned y = c.inset; y < c.rows - c.inset; y++)
+            if (frame.at(x, y) != 0) { first = std::min(first, y); last = std::max(last, y); }
+        EXPECT_EQ(last - first + 1, c.box) << c.rows << " rows of picture";
+        EXPECT_LE((float)(last - first + 1), 0.07f * (float)c.rows) << c.rows;
+    }
+}
+
+TEST(PresenceLayers, TheFontsSizeIsTheLooksShareOfThePicture) {
+    /* The share the client sends picks the BIOS font nearest it: 1/24 of 200 rows is 8.3 and of
+       400 is 16.7, so 8 rows and 16 rows, a 12- and a 20-row box. A share well under 1/24 on the
+       same 400-row picture takes the 8-row font, so the share decides and no picture height. */
+    const struct { unsigned rows, inset, box; const char *share; } cases[] = {
+        {200, 7, 12, " font_share=0.0416667"},
+        {400, 10, 20, " font_share=0.0416667"},
+        {400, 10, 12, " font_share=0.01"},
+    };
+    for (const auto &c : cases) {
+        Overlay o;
+        Frame frame(320, c.rows, 0);
+        std::string error;
+        ASSERT_TRUE(o.Configure(std::string("held keys=A edge=0.025") + c.share, error, 0))
+            << error;
+        const Format f = Rgb32();
+        o.Resize(320, c.rows, &f);
+        o.Guest(320, c.rows);
+        o.Compose(frame.buf(), frame.pitch(), nullptr, 0, false, 0, 0);
+        const unsigned x = c.inset + 1;
+        unsigned first = c.rows, last = 0;
+        for (unsigned y = c.inset; y < c.rows - c.inset; y++)
+            if (frame.at(x, y) != 0) { first = std::min(first, y); last = std::max(last, y); }
+        EXPECT_EQ(last - first + 1, c.box) << c.rows << " rows of picture, share " << c.share;
+    }
+}
+
+TEST(PresenceLayers, KeycapsTakeTheEdgeTheBandLeavesFreeAndNeverTouchTheCaption) {
+    for (const char *place : {"top", "bottom"}) {
+        Band b(std::string("held keys=Esc caption=run serial=1 place=") + place);
+        b.Draw(0);
+        const bool top = std::string(place) == "top";
+        const unsigned key_y = top ? 200 - kInset - kKeyH : kKeyY;
+        const unsigned box_y = top ? 6 : kBoxY;
+        EXPECT_NE(b.frame.at(kInset + 2, key_y + 2), 0u) << place << ": the mark at the free edge";
+        EXPECT_NE(b.frame.at(kInset + 6, key_y), 0u) << place << ": its outline";
+        EXPECT_EQ(b.frame.at(kInset + 2, key_y - 1), 0u) << place << ": nothing above it";
+        EXPECT_EQ(b.frame.at(kInset + 2, key_y + kKeyH), 0u)
+            << place << ": one row of marks, nothing past it";
+        /* the band's box and the marks share no row: the caption is never covered */
+        EXPECT_TRUE(key_y + kKeyH <= box_y || box_y + kBoxH <= key_y)
+            << place << ": the marks at " << key_y << ", the band at " << box_y;
+    }
 }
 
 TEST(PresenceLayers, ThePauseMarkIsDrawnOnlyWhilePaused) {
@@ -432,47 +514,48 @@ TEST(PresenceLayers, ThePauseMarkIsDrawnOnlyWhilePaused) {
     EXPECT_EQ(b.frame.at(x0 + 2, kBoxY + 2), 0u) << "held is not paused";
 }
 
-/* The record mark's box: from the top right inset, 20 rows from row 7; its dot is 10 guest
-   pixels, from 2 inside the box and 5 rows down. */
-const unsigned kRecY = 7, kRecDot = 10;
+/* The record mark's box: from the top right inset, 12 rows from row 7; its dot is 5 guest
+   pixels, from 2 inside the box and 3 rows down. */
+const unsigned kRecY = 7, kRecH = 12, kRecDot = 5, kRecDotY = kRecY + (kRecH - kRecDot) / 2;
 const unsigned kRecVideoW = 2 + kRecDot + 2 + 3 * 8 + 2, kRecAudioW = 2 + kRecDot + 2 + 8 + 2;
 
 TEST(PresenceLayers, TheRecordMarkBlinksInTheTopRightCornerWhateverThePlace) {
     Band b("held rec=video place=bottom");
     b.Draw(0);
     unsigned x0 = 320 - kInset - kRecVideoW;
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the dot, record_rgb";
-    const uint32_t cap = b.frame.at(x0 + 2, kRecY + 5);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0x00FF3B30u)
+        << "the dot, record_rgb";
+    const uint32_t cap = b.frame.at(x0 + 2, kRecDotY);
     EXPECT_NE(cap, 0u) << "the dot's corner is the box";
     EXPECT_NE(cap, 0x00FF3B30u) << "and not the dot: a disc";
     EXPECT_EQ(b.frame.at(x0 - 1, kRecY), 0u);
     EXPECT_EQ(b.frame.at(x0, kRecY - 1), 0u);
     unsigned col = 0, row = 0;
-    FirstInk('R', col, row);
+    FirstInk('R', 8, col, row);
     EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC";
     EXPECT_FALSE(b.o.NeedsRepaint(499, false, 0, 0)) << "on for the first half of the second";
     EXPECT_TRUE(b.o.NeedsRepaint(500, false, 0, 0));
     b.Draw(500);
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "off for the second half";
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0u) << "off for the second half";
     b.Draw(1000);
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0x00FF3B30u);
 
     std::string error;
     ASSERT_TRUE(b.o.Configure("held rec=audio", error, 1200));
     b.Draw(1200);
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "the video mark gone";
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0u) << "the video mark gone";
     x0 = 320 - kInset - kRecAudioW;
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "a change shows at once";
-    FirstInk(0x0E, col, row);
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0x00FF3B30u) << "a change shows at once";
+    FirstInk(0x0E, 8, col, row);
     EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "the note";
 
     ASSERT_TRUE(b.o.Configure("held rec=both", error, 2000));
     b.Draw(2000);
     x0 = 320 - kInset - (kRecVideoW + 2 + kRecAudioW - 2 * 2);
-    FirstInk('R', col, row);
+    FirstInk('R', 8, col, row);
     EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "REC first";
     const unsigned audio_x0 = x0 + kRecVideoW - 2 + 2;
-    FirstInk(0x0E, col, row);
+    FirstInk(0x0E, 8, col, row);
     EXPECT_EQ(b.frame.at(audio_x0 + kRecDot + 2 + col, kRecY + 2 + row), 0x00FFFFFFu) << "then the note";
 
     ASSERT_TRUE(b.o.Configure("held rec=video record_blink_s=2", error, 3000));
@@ -481,26 +564,44 @@ TEST(PresenceLayers, TheRecordMarkBlinksInTheTopRightCornerWhateverThePlace) {
     EXPECT_TRUE(b.o.NeedsRepaint(4000, false, 0, 0));
 
     x0 = 320 - kInset - kRecVideoW;
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0x00FF3B30u) << "the video mark, on";
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0x00FF3B30u) << "the video mark, on";
     ASSERT_TRUE(b.o.Configure("held rec=none", error, 3500));
     b.Draw(3500);
-    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecY + 10), 0u) << "taken off mid blink";
+    EXPECT_EQ(b.frame.at(x0 + 2 + kRecDot / 2, kRecDotY + kRecDot / 2), 0u) << "taken off mid blink";
     EXPECT_FALSE(b.o.NeedsRepaint(9000, false, 0, 0)) << "nothing recorded, nothing blinks";
 }
 
 TEST(PresenceLayers, ABandAtTheTopLeavesTheRecordMarkItsCornerInBothHalvesOfTheBlink) {
     Band b("held keys=A rec=video place=top");
     b.Draw(0);
-    const unsigned a_x0 = 320 - kInset - kRecVideoW - 2 - 12;
-    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the keycap left of the mark";
-    EXPECT_EQ(b.frame.at(a_x0 + 12, 10), 0u) << "the gap after it";
+    /* the band is at the top here, so the keycap takes the bottom's inset row */
+    const unsigned key_y = 200 - kInset - kKeyH, a_x0 = kInset + 6;
+    EXPECT_NE(b.frame.at(a_x0, key_y + 6), 0u) << "the keycap at the free edge";
+    EXPECT_EQ(b.frame.at(a_x0, key_y - 1), 0u) << "nothing above it";
     b.Draw(500);
-    EXPECT_NE(b.frame.at(a_x0, 10), 0u) << "the mark off, the keycap stays";
+    EXPECT_NE(b.frame.at(a_x0, key_y + 6), 0u) << "the mark off, the keycap stays";
     std::string error;
     ASSERT_TRUE(b.o.Configure("held layers=edge,keys", error, 600));
     b.Draw(600);
-    EXPECT_EQ(b.frame.at(a_x0, 10), 0u) << "no record layer asked: the keycap at the inset";
-    EXPECT_NE(b.frame.at(320 - kInset - 12, 10), 0u);
+    EXPECT_NE(b.frame.at(a_x0, key_y + 6), 0u) << "the keycap stays at the free edge";
+    EXPECT_EQ(b.frame.at(320 - kInset - 12, key_y + 6), 0u) << "and is not pushed to the right";
+}
+
+TEST(PresenceLayers, AKeycapRowKeepsClearOfTheRecordMarkInTheCornerAboveIt) {
+    /* the band at the bottom puts the marks at the top, where the record mark sits in the
+       right corner; the row stops before it, never under the mark */
+    Band b("held keys=abcdefghijkl,mnopqrstuvwx,abcdefghijkl,mnopqrstuvwx,"
+           "abcdefghijkl,mnopqrstuvwx,abcdefghijkl,mnopqrstuvwx"
+           " keycap_rgb=FF00FF keycap_alpha=1 rec=video place=bottom");
+    b.Draw(0);
+    const unsigned rec_x0 = 320 - kInset - kRecVideoW;
+    EXPECT_EQ(b.frame.at(kInset + 6, kKeyY + kKeyH - 2), 0x00FF00FFu)
+        << "the newest key at the left";
+    EXPECT_EQ(b.frame.at(kInset + 100 + 2 + 6, kKeyY + kKeyH - 2), 0x00FF00FFu)
+        << "the second one beside it";
+    EXPECT_EQ(b.frame.at(kInset + 2 * (100 + 2), kKeyY + kKeyH - 2), 0u)
+        << "the next one would reach the mark";
+    EXPECT_EQ(b.frame.at(rec_x0 - 1, kKeyY + kKeyH - 2), 0u) << "a gap before the mark's box";
 }
 
 TEST(PresenceLayers, ACaptionThatFitsIsCentredInItsTint) {
@@ -510,14 +611,25 @@ TEST(PresenceLayers, ACaptionThatFitsIsCentredInItsTint) {
     const unsigned x0 = kInset + (320 - 2 * kInset - 68) / 2;
     const uint32_t box = b.frame.at(x0, kBoxY);
     EXPECT_GT(box & 0xFFu, (box >> 16) & 0xFFu) << "the read tint, more blue than red";
-    EXPECT_EQ(b.frame.at(x0 - 1, kBoxY), 0u) << "the box ends where the text does";
-    EXPECT_EQ(b.frame.at(x0 + 68, kBoxY), 0u);
     unsigned col = 0, row = 0;
-    FirstInk('h', col, row);
+    FirstInk('h', 8, col, row);
     EXPECT_EQ(b.frame.at(x0 + 2 + col, kBoxY + 2 + row), 0x00FFFFFFu) << "the text, %20 a space";
-    FirstInk('t', col, row);
+    FirstInk('t', 8, col, row);
     EXPECT_EQ(b.frame.at(x0 + 2 + 3 * 8 + col, kBoxY + 2 + row), 0x00FFFFFFu);
     EXPECT_FALSE(b.o.NeedsRepaint(5000, false, 0, 0)) << "a caption that fits stays still";
+}
+
+TEST(PresenceLayers, AShortCaptionStillTintsTheWholeBand) {
+    /* the clip's band is the width of the picture, not the text's: a word's worth of caption
+       still lights the strip from one inset to the other */
+    Band b("held caption=go tint=5AC8FA serial=1 place=bottom");
+    b.Draw(0);
+    const uint32_t tint = b.frame.at(kInset, kBoxY);
+    ASSERT_NE(tint, 0u) << "the band's left end";
+    EXPECT_GT(tint & 0xFFu, (tint >> 16) & 0xFFu) << "the read tint, more blue than red";
+    EXPECT_EQ(b.frame.at(320 - kInset - 1, kBoxY), tint) << "and its right end";
+    EXPECT_EQ(b.frame.at(kInset - 1, kBoxY), 0u) << "nothing past the inset";
+    EXPECT_EQ(b.frame.at(320 - kInset, kBoxY), 0u);
 }
 
 TEST(PresenceLayers, ACaptionTooWideForItsRoomScrollsAGuestPixelAtATime) {
@@ -563,11 +675,11 @@ TEST(PresenceLayers, ACaptionLeavesWithItsFadeAndTheSameSerialRestartsNothing) {
 TEST(PresenceLayers, TheLayersWordTurnsLayersOffAndPlaceMovesTheBand) {
     Band b("paused keys=A layers=edge,keys place=top");
     b.Draw(0);
-    EXPECT_EQ(b.frame.at(kInset + 2, kBoxY + 2), 0u) << "no pause layer asked";
-    const unsigned a_x0 = 320 - kInset - 12;
-    /* the top band's boxes: 25 rows, the box in their middle */
-    EXPECT_NE(b.frame.at(a_x0, 2), 0u) << "the keycap at the top";
-    EXPECT_EQ(b.frame.at(a_x0, kBoxY), 0u) << "and not at the bottom";
+    EXPECT_EQ(b.frame.at(kInset + 2, 12), 0u) << "no pause layer asked";
+    /* the band takes the top, so the keycap takes the bottom inset row */
+    const unsigned key_y = 200 - kInset - kKeyH;
+    EXPECT_NE(b.frame.at(kInset + 6, key_y + 6), 0u) << "the keycap at the free edge";
+    EXPECT_EQ(b.frame.at(kInset + 6, 12), 0u) << "and not in the band";
     EXPECT_NE(b.o.Describe().find(" layers=edge,keys place=top"), std::string::npos) << b.o.Describe();
 }
 
@@ -956,13 +1068,11 @@ TEST(PresenceCost, ACaptionIsDrawnOnceAndThenCostsNothing) {
         ASSERT_TRUE(s.o.Configure("held caption=start serial=1", error, 0));
         const presence::Cost c = s.Still(0);
         Print("caption", out, 1, c);
-        const Expected e(out);
-        /* "start" is 5 x 8 + 4 guest pixels, centred between insets of the edge's 5 plus 2 */
-        const uint64_t gx0 = 7 + (320 - 14 - 44) / 2;
-        const uint64_t w = OutSpan(gx0, gx0 + 44, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
-        const uint64_t on_edge = w * (OutSpan(0, 197, kGuestH, out.h) - (out.h - e.band));
+        /* the caption's band runs the width between the insets of the edge's 5 plus 2, 12 rows
+           from row 181: it ends 2 rows above the edge's own 5, so none of it was saved already */
+        const uint64_t w = OutSpan(7, 320 - 7, kGuestW, out.w), h = OutSpan(181, 193, kGuestH, out.h);
         EXPECT_EQ(c.written, w * h);
-        EXPECT_EQ(c.read, w * h - on_edge) << "the box's pixels the edge had not saved already";
+        EXPECT_EQ(c.read, w * h);
         EXPECT_EQ(c.presented, 4 * w * h);
         const presence::Cost later = s.Still(5000);
         EXPECT_EQ(later.read + later.written + later.presented, 0u) << "a still caption costs nothing";
@@ -972,7 +1082,7 @@ TEST(PresenceCost, ACaptionIsDrawnOnceAndThenCostsNothing) {
 /* The video mark's box in output pixels, as kRecY and kRecVideoW lay it in the guest. */
 void RecBox(const Output &out, uint64_t &w, uint64_t &h) {
     w = OutSpan(320 - 7 - kRecVideoW, 320 - 7, kGuestW, out.w);
-    h = OutSpan(kRecY, kRecY + 20, kGuestH, out.h);
+    h = OutSpan(kRecY, kRecY + kRecH, kGuestH, out.h);
 }
 
 TEST(PresenceCost, ABlinkRepaintsAndPresentsTheRecordMarksBoxAlone) {
@@ -1021,7 +1131,7 @@ TEST(PresenceCost, AScrollingCaptionRepaintsItsBoxOncePerGuestPixel) {
         EXPECT_FALSE(s.o.NeedsRepaint(10, true, 0.5f, 0.5f));
         const presence::Cost c = s.Still(11);
         Print("scroll", out, 1, c);
-        const uint64_t w = OutSpan(7, 313, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        const uint64_t w = OutSpan(7, 313, kGuestW, out.w), h = OutSpan(181, 193, kGuestH, out.h);
         EXPECT_EQ(c.read, 0u);
         EXPECT_EQ(c.written, w * h) << "the box, as wide as the room";
         EXPECT_EQ(c.presented, 4 * w * h);
@@ -1225,10 +1335,9 @@ TEST(PresenceTexture, ACaptionIsUploadedOnceAndThenCostsNothing) {
         s.o.Upload();
         const presence::Cost c = Delta(s.o.cost(), before);
         Print("tcaption", out, 1, c);
-        const uint64_t gx0 = 7 + (320 - 14 - 44) / 2;
-        const uint64_t w = OutSpan(gx0, gx0 + 44, kGuestW, out.w), h = OutSpan(177, 197, kGuestH, out.h);
+        const uint64_t w = OutSpan(7, 320 - 7, kGuestW, out.w), h = OutSpan(181, 193, kGuestH, out.h);
         EXPECT_EQ(c.read + c.written + c.presented, 0u);
-        EXPECT_EQ(c.upload_bytes, 4 * w * h) << "the caption's box";
+        EXPECT_EQ(c.upload_bytes, 4 * w * h) << "the caption's band";
         const presence::Cost mid = s.o.cost();
         s.Still(5000);
         s.o.Upload();

@@ -56,6 +56,8 @@ constexpr size_t MAX_CAPTION = 160, MAX_KEYS = 8, MAX_KEY = 12;
    comes round again. */
 constexpr unsigned GLYPH_W = 8, PAD = 2, GAP = 2, BAR_W = 3, PAUSE_W = 2 * PAD + 3 * BAR_W;
 constexpr unsigned SCROLL_GAP = 4 * GLYPH_W;
+/* A mark's rounded corner, in guest pixels, and the alpha of its outline, half the text's. */
+constexpr unsigned KEY_RADIUS = 4, KEY_OUTLINE_ALPHA = 128;
 /* The record mark: its dot is this many eighths of the font's height, and audio is the VGA
    font's double note. */
 constexpr unsigned REC_DOT_EIGHTHS = 5;
@@ -256,6 +258,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "keycap_rgb") ok = ParseHex(value, look.keycap_rgb);
         else if (key == "keycap_text_rgb") ok = ParseHex(value, look.keycap_text_rgb);
         else if (key == "keycap_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.keycap_alpha);
+        else if (key == "font_share") ok = ParseFloat(value, 0.005, 0.25, look.font_share);
         else if (key == "record_rgb") ok = ParseHex(value, look.record_rgb);
         else if (key == "record_blink_s") ok = ParseFloat(value, 0.1, 10.0, look.record_blink_s);
         else if (key == "tint") ok = ParseHex(value, tint);
@@ -455,7 +458,9 @@ Rect Overlay::OutRect(unsigned gx0, unsigned gy0, unsigned gx1, unsigned gy1) co
 void Overlay::Band(Scene &s, uint32_t now_ms) const {
     const unsigned gw = guest_width_ ? guest_width_ : width_, gh = guest_height_ ? guest_height_ : height_;
     const unsigned bh = std::max(1u, gh / placement::BAND_DIVISOR);
-    s.font_h = bh >= 16 + 2 * PAD ? 16 : 8;
+    // One size for both layers: the client's share of the picture, taken as the BIOS font
+    // nearest it, so 8 on a 320x200 game and 16 on a 640x400 one.
+    s.font_h = (look_.font_share * gh) >= 12 ? 16 : 8;
     s.box_h = s.font_h + 2 * PAD;
     s.top = place_ == Place::Top || (place_ == Place::Auto && band_ == Place::Top);
     if (s.top) s.box_y = bh > s.box_h ? (bh - s.box_h) / 2 : 0;
@@ -464,9 +469,9 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
     const unsigned margin = edge + 2;
     unsigned left = margin, right = gw > margin ? gw - margin : 0;
     const unsigned y0 = s.box_y, y1 = s.box_y + s.box_h;
-    auto set = [&](Layer l, unsigned gx0, unsigned gx1, uint64_t stamp) {
+    auto set = [&](Layer l, unsigned gx0, unsigned gx1, unsigned gy0, unsigned gy1, uint64_t stamp) {
         LayerKey &k = s.key[l];
-        k.r[0] = OutRect(gx0, y0, gx1, y1);
+        k.r[0] = OutRect(gx0, gy0, gx1, gy1);
         k.n = 1;
         k.on = !k.r[0].empty();
         k.stamp = stamp;
@@ -499,27 +504,35 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
 
     if (layers_[PAUSE] && s.state == State::Paused && left + PAUSE_W <= right) {
         s.pause_x0 = left;
-        set(PAUSE, left, left + PAUSE_W, look_generation_);
+        set(PAUSE, left, left + PAUSE_W, y0, y1, look_generation_);
         left += PAUSE_W + GAP;
     }
 
-    if (layers_[KEYS] && !keys_.empty()) {
-        /* the last keys down are the ones kept when the band has no room for all */
-        unsigned x = right;
-        size_t shown = 0;
+    /* The held keys' marks take the edge the band leaves free, one row, never inside the band
+       and never over the record mark: the newest key at the left, the oldest making room where
+       the row fills, so the key being pressed is always the one shown. */
+    s.key_font_h = s.font_h;
+    s.key_box_h = s.key_font_h + 2 * PAD;
+    const unsigned key_y0 = s.top ? (gh > margin + s.key_box_h && gh - margin - s.key_box_h >= y1
+                                     ? gh - margin - s.key_box_h : 0)
+                                  : (margin + s.key_box_h <= y0 ? margin : 0);
+    if (layers_[KEYS] && !keys_.empty() && key_y0 != 0) {
+        unsigned key_right = gw > margin ? gw - margin : 0;
+        if (!s.top && recording_ != Recording::None && s.rec_x0 != 0 &&
+            key_y0 < s.rec_y0 + s.box_h && key_y0 + s.key_box_h > s.rec_y0)
+            key_right = s.rec_x0 > left + GAP ? s.rec_x0 - GAP : left;
+        unsigned x = left, x1 = left;
         for (size_t i = keys_.size(); i-- > 0;) {
-            const unsigned need = (unsigned)keys_[i].size() * GLYPH_W + 2 * PAD + (shown ? GAP : 0);
-            if (x < left + need) break;
-            x -= need;
-            shown++;
+            const unsigned need = (unsigned)keys_[i].size() * GLYPH_W + 2 * PAD;
+            if (x + need > key_right) break;
+            s.key_x0.push_back(x);
+            x1 = x + need;
+            x += need + GAP;
         }
-        if (shown) {
-            for (size_t i = keys_.size() - shown; i < keys_.size(); i++) {
-                s.key_x0.push_back(x);
-                x += (unsigned)keys_[i].size() * GLYPH_W + 2 * PAD + GAP;
-            }
-            set(KEYS, s.key_x0.front(), right, ((uint64_t)keys_generation_ << 32) | (look_generation_ & 0xFFFFu));
-            right = s.key_x0.front() > left + GAP ? s.key_x0.front() - GAP : left;
+        if (!s.key_x0.empty()) {
+            s.key_y0 = key_y0;
+            set(KEYS, s.key_x0.front(), x1, s.key_y0, s.key_y0 + s.key_box_h,
+                ((uint64_t)keys_generation_ << 32) | (look_generation_ & 0xFFFFu));
         }
     }
 
@@ -547,7 +560,9 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
                 s.cap_x0 = left + (room - text - 2 * PAD) / 2;
                 s.cap_x1 = s.cap_x0 + text + 2 * PAD;
             }
-            set(CALLS, s.cap_x0, s.cap_x1,
+            /* the band the clip shows: the caption's tint spans the room between the insets,
+               and the text is centred in whatever the pause mark leaves of it */
+            set(CALLS, margin, right, y0, y1,
                 ((uint64_t)caption_generation_ << 40) | ((uint64_t)(s.cap_offset & 0xFFFFu) << 24) |
                 ((uint64_t)s.cap_level << 16) | (look_generation_ & 0xFFFFu));
         }
@@ -676,13 +691,14 @@ void Overlay::Prepare(const Scene &s) {
     }
 }
 
-void Overlay::PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, uint32_t *row,
-                        unsigned gx0, unsigned gx1, unsigned gy0, const std::string &text,
-                        unsigned offset, unsigned period, uint32_t ink) const {
+void Overlay::PaintText(unsigned y, unsigned x0, unsigned x1, uint32_t *row,
+                        unsigned gx0, unsigned gx1, unsigned gy0, unsigned font_h,
+                        const std::string &text, unsigned offset, unsigned period,
+                        uint32_t ink) const {
     const unsigned gy = gy_of_y_[y];
-    if (gy < gy0 || gy >= gy0 + s.font_h) return;
+    if (gy < gy0 || gy >= gy0 + font_h) return;
     const unsigned glyph_row = gy - gy0;
-    const uint8_t *font = s.font_h == 16 ? int10_font_16 : int10_font_08;
+    const uint8_t *font = font_h == 16 ? int10_font_16 : int10_font_08;
     const unsigned text_px = (unsigned)text.size() * GLYPH_W;
     for (unsigned x = x0; x < x1; x++) {
         const unsigned gx = gx_of_x_[x];
@@ -690,7 +706,7 @@ void Overlay::PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, ui
         unsigned u = gx - gx0 + offset;
         if (period) u %= period;
         if (u >= text_px) continue;
-        const uint8_t bits = font[(unsigned char)text[u / GLYPH_W] * s.font_h + glyph_row];
+        const uint8_t bits = font[(unsigned char)text[u / GLYPH_W] * font_h + glyph_row];
         if (bits & (0x80u >> (u % GLYPH_W))) row[x] = Over(row[x], ink);
     }
 }
@@ -728,13 +744,33 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
             case KEYS: {
                 const uint32_t cap = Premul(look_.keycap_rgb, Alpha255(look_.keycap_alpha));
                 const uint32_t ink = Premul(look_.keycap_text_rgb, 255);
-                const size_t first = keys_.size() - s.key_x0.size();
+                const uint32_t line = Premul(look_.keycap_text_rgb, KEY_OUTLINE_ALPHA);
+                const int radius = CellEdge(scale_x_, KEY_RADIUS);
                 for (size_t n = 0; n < s.key_x0.size(); n++) {
-                    const std::string &name = keys_[first + n];
+                    const std::string &name = keys_[keys_.size() - 1 - n];
                     const unsigned gx0 = s.key_x0[n], gx1 = gx0 + (unsigned)name.size() * GLYPH_W + 2 * PAD;
-                    for (unsigned x = a; x < b; x++)
-                        if (gx_of_x_[x] >= gx0 && gx_of_x_[x] < gx1) row[x] = Over(row[x], cap);
-                    PaintText(s, y, a, b, row, gx0 + PAD, gx1 - PAD, s.box_y + PAD, name, 0, 0, ink);
+                    /* The mark as the clip draws it: a rounded box, its outline half the text's
+                       brightness, drawn over the fill. */
+                    const Rect box = OutRect(gx0, s.key_y0, gx1, s.key_y0 + s.key_box_h);
+                    const int w = (int)(box.x1 - box.x0), h = (int)(box.y1 - box.y0);
+                    auto inside = [&](int dx, int dy, int inset) {
+                        const int r = std::max(0, radius - inset), ww = w - 2 * inset,
+                                  hh = h - 2 * inset;
+                        if (dx < 0 || dy < 0 || dx >= ww || dy >= hh) return false;
+                        if (r == 0 || (dx >= r && dx < ww - r) || (dy >= r && dy < hh - r))
+                            return true;
+                        const int cx = dx < r ? r - dx - 1 : dx - (ww - r);
+                        const int cy = dy < r ? r - dy - 1 : dy - (hh - r);
+                        return cx * cx + cy * cy <= r * r;
+                    };
+                    for (unsigned x = a; x < b; x++) {
+                        const int dx = (int)x - (int)box.x0, dy = (int)y - (int)box.y0;
+                        if (!inside(dx, dy, 0)) continue;
+                        row[x] = Over(row[x], cap);
+                        if (!inside(dx - 1, dy - 1, 1)) row[x] = Over(row[x], line);
+                    }
+                    PaintText(y, a, b, row, gx0 + PAD, gx1 - PAD, s.key_y0 + PAD, s.key_font_h,
+                              name, 0, 0, ink);
                 }
                 break;
             }
@@ -744,8 +780,8 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                 const uint32_t ink = Premul(look_.caption_text_rgb, 255 * level / CAPTION_LEVELS);
                 for (unsigned x = a; x < b; x++) row[x] = Over(row[x], box);
                 const unsigned period = s.cap_scrolls ? (unsigned)caption_.size() * GLYPH_W + SCROLL_GAP : 0;
-                PaintText(s, y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, s.box_y + PAD, caption_,
-                          s.cap_offset, period, ink);
+                PaintText(y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, s.box_y + PAD, s.font_h,
+                          caption_, s.cap_offset, period, ink);
                 break;
             }
             case PAUSE: {
@@ -781,7 +817,8 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                         }
                     }
                     const unsigned tx = gx0 + dot + PAD, tw = (unsigned)label.size() * GLYPH_W;
-                    PaintText(s, y, a, b, row, tx, tx + tw, s.rec_y0 + PAD, label, 0, 0, ink);
+                    PaintText(y, a, b, row, tx, tx + tw, s.rec_y0 + PAD, s.font_h, label, 0, 0,
+                              ink);
                     gx0 = tx + tw + GAP;
                 };
                 if (recording_ != Recording::Audio) mark("REC");
@@ -1228,10 +1265,14 @@ void PRESENCE_Repaint() {
 }
 
 void PRESENCE_ParkedTick() {
-    /* a breakpoint can stop the guest in the middle of a frame the scaler was writing; the
-       update that frame left open would keep every repaint out until the guest runs again */
-    RENDER_AbandonUpdate();
-    if (PRESENCE_WantsRepaint()) PRESENCE_Repaint();
+    /* A breakpoint can stop the guest in the middle of a frame the scaler was writing; the
+       update it left open would keep a CPU-path repaint out until the guest runs again, so it
+       is dropped unshown. An output that draws the overlay as its own texture presents it
+       without a new frame, and dropping the interrupted frame there would throw the picture
+       away: a session polled every frame would never upload one. */
+    const bool wants = PRESENCE_WantsRepaint();
+    if (wants && presence::Instance().texture() == nullptr) RENDER_AbandonUpdate();
+    if (wants) PRESENCE_Repaint();
 }
 
 bool PRESENCE_TextureDraw(const presence::Texture *texture) {

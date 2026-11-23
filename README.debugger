@@ -331,8 +331,9 @@ value:
   pointer   1 to draw the arrow (with a sprite given), 0 not to
   layers    the layers to draw, comma separated, from `edge`, `pointer`,
             `keys`, `calls`, `pause`, `record`; all of them unless told
-  place     where the caption, the keycaps and the pause mark go: `top` or
-            `bottom` band of the picture, or `auto`, the band showing less
+  place     where the caption and the pause mark go: `top` or `bottom` band of
+            the picture, or `auto`, the band showing less; the keycaps take the
+            other edge
   caption   the call's caption, at most 160 bytes, one word: `%XX` for a
             space, a percent sign or any byte outside printable ASCII; empty
             to take it away (it leaves with its fade)
@@ -351,6 +352,9 @@ value:
             the seconds a caption takes to fade in and out
   scroll_cps
             characters a second a caption too wide for its room scrolls at
+  font_share
+            the caption's and the keycaps' text height as a share of the
+            picture's; the BIOS font nearest it is drawn
   record_rgb
             the record mark's dot, six hex digits
   record_blink_s
@@ -365,11 +369,16 @@ each new place from where it was drawn rather than jumping; with no driver
 installed there is no arrow. The glide is drawing only: the guest's pointer is
 where the driver says at once.
 
-The caption, the keycaps and the pause mark share a band, the top or bottom
-eighth of the picture, inset from the edge: the pause mark at the left, the
-keycaps at the right, the caption between them, centred when it fits and
-scrolling when it does not. Text is drawn in the VGA ROM font, 8x16, or 8x8 in a
-band too short for it. With `place=auto` the overlay samples the guest's own
+The caption and the pause mark share a band, the top or bottom eighth of the
+picture, inset from the edge: the pause mark at the left, the caption centred in
+what is left when it fits and scrolling when it does not. The keycaps take the
+edge the band leaves free, one row inset from the picture, the newest key at the
+left and the oldest making room when the row fills; they never lie over the band
+or the record mark. A keycap is drawn as the clip draws it: a rounded box, its
+outline at half the text's brightness. The caption and a keycap are drawn in the
+same VGA ROM font, the BIOS size nearest the share of the picture the client
+asks for, so the two never disagree in size.
+With `place=auto` the overlay samples the guest's own
 picture once a second on a grid in each band (16 columns by 2 rows, the band an
 eighth of the picture), scores each band by how many samples differ from its most
 common colour, and moves to the other band once that one scored 4 lower on 2

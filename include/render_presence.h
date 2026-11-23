@@ -56,6 +56,7 @@ struct Look {
     uint32_t keycap_rgb = 0x202020;
     uint32_t keycap_text_rgb = 0xFFFFFF;
     float keycap_alpha = 0.8f;
+    float font_share = 1.0f / 24.0f; /* the text's height, a share of the picture's */
     uint32_t record_rgb = 0xFF3B30;   /* the record mark's dot */
     float record_blink_s = 1.0f;      /* the record mark's blink, on for its first half */
     bool operator==(const Look &o) const {
@@ -65,8 +66,8 @@ struct Look {
                caption_alpha == o.caption_alpha && scroll_cps == o.scroll_cps &&
                caption_in == o.caption_in && caption_out == o.caption_out &&
                keycap_rgb == o.keycap_rgb && keycap_text_rgb == o.keycap_text_rgb &&
-               keycap_alpha == o.keycap_alpha && record_rgb == o.record_rgb &&
-               record_blink_s == o.record_blink_s;
+               keycap_alpha == o.keycap_alpha && font_share == o.font_share &&
+               record_rgb == o.record_rgb && record_blink_s == o.record_blink_s;
     }
 };
 
@@ -224,6 +225,9 @@ private:
         bool top = false;                     /* the band's place */
         unsigned box_y = 0, box_h = 0, font_h = 16;   /* guest pixels */
         unsigned pause_x0 = 0;
+        unsigned key_y0 = 0;                  /* the held keys' row, guest pixels, on the edge
+                                                 the band leaves free */
+        unsigned key_font_h = 8, key_box_h = 12;   /* the marks' glyphs and box, guest pixels */
         unsigned rec_x0 = 0, rec_y0 = 0;      /* the record mark's box, guest pixels */
         unsigned cap_x0 = 0, cap_x1 = 0, cap_offset = 0;
         bool cap_scrolls = false;
@@ -252,10 +256,11 @@ private:
     void Coalesce(const std::vector<Rect> &in, std::vector<Rect> &out, std::vector<uint8_t> *marks);
     void Prepare(const Scene &s);
     void PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1);
-    /* `text` in the font `s` uses, its glyphs' top row at guest row `gy0`. */
-    void PaintText(const Scene &s, unsigned y, unsigned x0, unsigned x1, uint32_t *row,
-                   unsigned gx0, unsigned gx1, unsigned gy0, const std::string &text,
-                   unsigned offset, unsigned period, uint32_t ink) const;
+    /* `text` in the 8- or 16-row font `font_h`, its glyphs' top row at guest row `gy0`. */
+    void PaintText(unsigned y, unsigned x0, unsigned x1, uint32_t *row,
+                   unsigned gx0, unsigned gx1, unsigned gy0, unsigned font_h,
+                   const std::string &text, unsigned offset, unsigned period,
+                   uint32_t ink) const;
     uint32_t Blend(uint32_t under, uint32_t over) const;
     uint32_t Read(const uint8_t *p) const;
     void Write(uint8_t *p, uint32_t v) const;
