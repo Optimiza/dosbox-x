@@ -354,7 +354,8 @@ value:
   caption_in, caption_out
             the seconds a caption takes to fade in and out
   scroll_cps
-            characters a second a caption too wide for its room scrolls at
+            taken and ignored: the servers of protocol 4 still send it, and the
+            caption never scrolls, so an older one keeps its overlay
   font_share
             the caption's and the keycaps' text height as a share of the
             picture's; the BIOS font nearest it is drawn
@@ -374,7 +375,7 @@ where the driver says at once.
 
 The caption and the pause mark share a band, the top or bottom eighth of the
 picture, inset from the edge: the pause mark at the left, the caption centred in
-what is left when it fits and scrolling when it does not. The keycaps take the
+what is left, cut and marked with `..` when it does not fit. The keycaps take the
 edge the band leaves free, one row inset from the picture, the newest key at the
 left and the oldest making room when the row fills; they never lie over the band
 or the record mark. A keycap is drawn as the clip draws it: a rounded box, its
@@ -447,7 +448,7 @@ to. The scaler writes the output in place, rewriting only the blocks of a line
 that changed, so before it writes a line the overlay puts the picture back on
 that line's rows, and after the frame it draws itself again on those rows; every
 other row keeps the overlay as it was, and only a layer that changed (a fade, the
-arrow moving, a new caption, a scroll step) is redrawn and presented, and on an
+arrow moving, a new caption) is redrawn and presented, and on an
 output that presents rectangles (the surface output) only its rectangles are. The complex scalers (hq2x, the SaI
 family, advmame) and a frame that rewrites everything take the overlay off every
 row first. A still overlay over a still picture costs nothing but a check per

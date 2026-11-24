@@ -678,6 +678,25 @@ TEST(PresenceLayers, ACaptionThatFitsIsCentredInItsTint) {
     EXPECT_FALSE(b.o.NeedsRepaint(5000, false, 0, 0)) << "a caption that fits stays still";
 }
 
+TEST(PresenceLayers, TheBandIsLaidAtTheLookSAlphaSoThePictureShowsThrough) {
+    /* A band painted whole hides the picture under it; at the look's alpha the picture reaches
+       it, which is what every tint has to do. */
+    Band dark("held caption=go tint=5AC8FA serial=1 place=bottom", 0x00000000u);
+    Band light("held caption=go tint=5AC8FA serial=1 place=bottom", 0xFFFFFFFFu);
+    dark.Draw(0);
+    light.Draw(0);
+    const uint32_t a = dark.frame.at(kInset, kBoxY), b = light.frame.at(kInset, kBoxY);
+    EXPECT_NE(a, b) << "the picture under the band reaches it";
+    for (const unsigned shift : {16u, 8u, 0u}) {
+        const uint32_t tint = (0x5AC8FAu >> shift) & 0xFFu, over_dark = (a >> shift) & 0xFFu,
+                       over_light = (b >> shift) & 0xFFu;
+        EXPECT_LT(over_dark, tint) << "darkened by what the picture takes, channel " << shift;
+        EXPECT_GE(over_light, tint) << "and lifted by a white one, channel " << shift;
+    }
+    /* a channel already near white cannot rise, but the tint's own red can */
+    EXPECT_GT((b >> 16) & 0xFFu, (0x5AC8FAu >> 16) & 0xFFu) << "the white picture shows";
+}
+
 TEST(PresenceLayers, AShortCaptionStillTintsTheWholeBand) {
     /* the clip's band is the width of the picture, not the text's: a word's worth of caption
        still lights the strip from one inset to the other */
@@ -691,18 +710,43 @@ TEST(PresenceLayers, AShortCaptionStillTintsTheWholeBand) {
     EXPECT_NE(b.frame.at(320 - kInset, kBoxY), tint);
 }
 
-TEST(PresenceLayers, ACaptionTooWideForItsRoomScrollsAGuestPixelAtATime) {
+TEST(PresenceLayers, ACaptionTooWideForItsRoomIsCutAndStaysStill) {
+    /* A line that moves cannot be read while the machine runs: the caption is cut to the 38
+       glyphs its room holds, its head kept and its cut marked with a dot pair. */
     const std::string text(60, 'W');
-    Band b("held scroll_cps=12 serial=1 place=bottom caption=" + text);
+    Band b("held serial=1 place=bottom caption=" + text);
     b.Draw(0);
-    std::vector<uint32_t> before(b.frame.px.begin() + (kBoxY + 8) * 320,
-                                 b.frame.px.begin() + (kBoxY + 9) * 320);
-    /* 12 characters a second is 96 guest pixels: one every 10.4 ms */
-    EXPECT_FALSE(b.o.NeedsRepaint(10, false, 0, 0)) << "less than a pixel is not a step";
-    EXPECT_TRUE(b.o.NeedsRepaint(11, false, 0, 0));
-    b.Draw(11);
-    for (unsigned x = kInset + 2; x + 1 < 320 - kInset - 2; x++)
-        ASSERT_EQ(b.frame.at(x, kBoxY + 8), before[x + 1]) << "moved one pixel left at " << x;
+    /* a glyph row: the box's top row carries the tint alone, so a scroll would not show there */
+    std::vector<uint32_t> before(b.frame.px.begin() + (kBoxY + 2) * 320,
+                                 b.frame.px.begin() + (kBoxY + 3) * 320);
+    /* the band spans the room between the insets, whatever the text's width */
+    EXPECT_NE(b.frame.at(kInset, kBoxY), 0u) << "the tint at the left inset";
+    EXPECT_NE(b.frame.at(320 - kInset - 1, kBoxY), 0u) << "and at the right one";
+    /* the text is 38 glyphs from x 8, its 36th and 37th the dots the cut is marked with */
+    unsigned col = 0, row = 0;
+    FirstInk('.', 8, col, row);
+    EXPECT_EQ(b.frame.at(kInset + 3 + 36 * 8 + col, kBoxY + 2 + row), 0x00FFFFFFu) << "the dot pair";
+    EXPECT_FALSE(b.o.NeedsRepaint(11, false, 0, 0)) << "a caption cut to its band does not move";
+    b.Draw(5000);
+    for (unsigned x = 0; x < 320; x++)
+        ASSERT_EQ(b.frame.at(x, kBoxY + 2), before[x]) << "the text held still at " << x;
+}
+
+TEST(PresenceLayers, ACaptionIsLaidAgainWhenThePauseMarkTakesItsRoom) {
+    /* The pause mark narrows the band, so the cut follows it: a caption laid while the mark
+       was off must be laid again when it comes, or the tail of the old line stays. */
+    const std::string word = " caption=" + std::string(60, 'W') + " serial=1 place=bottom";
+    Band laid("held" + word);
+    laid.Draw(0);
+    std::string error;
+    ASSERT_TRUE(laid.o.Configure("paused" + word, error, 1)) << error;
+    laid.Draw(1);
+    Band fresh("paused" + word);
+    fresh.Draw(0);
+    for (unsigned y = kBoxY; y < kBoxY + kBoxH; y++)
+        for (unsigned x = 0; x < 320; x++)
+            ASSERT_EQ(laid.frame.at(x, y), fresh.frame.at(x, y))
+                << "the caption laid again at " << x << "," << y;
 }
 
 TEST(PresenceLayers, ACaptionLeavesWithItsFadeAndTheSameSerialRestartsNothing) {
@@ -1181,23 +1225,6 @@ TEST(PresenceCost, ABlinkRepaintsAndPresentsTheRecordMarksBoxAlone) {
         s.Still(3000);
         const presence::Cost later = s.Still(10000);
         EXPECT_EQ(later.read + later.written + later.presented, 0u) << "no recording costs nothing";
-    }
-}
-
-TEST(PresenceCost, AScrollingCaptionRepaintsItsBoxOncePerGuestPixel) {
-    for (const Output &out : kOutputs) {
-        Session s(out);
-        std::string error;
-        ASSERT_TRUE(s.o.Configure("held scroll_cps=12 serial=1 caption=" + std::string(60, 'x'), error, 0));
-        s.Still(0);
-        EXPECT_FALSE(s.o.NeedsRepaint(10, true, 0.5f, 0.5f));
-        const presence::Cost c = s.Still(11);
-        Print("scroll", out, 1, c);
-        const uint64_t w = OutSpan(kInset, 320 - kInset, kGuestW, out.w),
-                       h = OutSpan(kBoxY, kBoxY + kBoxH, kGuestH, out.h);
-        EXPECT_EQ(c.read, 0u);
-        EXPECT_EQ(c.written, w * h) << "the box, as wide as the room";
-        EXPECT_EQ(c.presented, 4 * w * h);
     }
 }
 

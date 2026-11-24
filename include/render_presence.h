@@ -49,8 +49,7 @@ struct Look {
     /* the arrow, top row first: 'X' outline, 'o' fill, '.' untouched */
     std::vector<std::string> sprite;
     uint32_t caption_text_rgb = 0xFFFFFF;
-    float caption_alpha = 0.7f;
-    float scroll_cps = 12.0f; /* characters a second, for a caption wider than its room */
+    float caption_alpha = 0.75f;
     float caption_in = 0.15f;
     float caption_out = 0.15f;
     uint32_t keycap_rgb = 0x202020;
@@ -63,7 +62,7 @@ struct Look {
         return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
                acting == o.acting && held == o.held && fade == o.fade && glide == o.glide &&
                sprite == o.sprite && caption_text_rgb == o.caption_text_rgb &&
-               caption_alpha == o.caption_alpha && scroll_cps == o.scroll_cps &&
+               caption_alpha == o.caption_alpha &&
                caption_in == o.caption_in && caption_out == o.caption_out &&
                keycap_rgb == o.keycap_rgb && keycap_text_rgb == o.keycap_text_rgb &&
                keycap_alpha == o.keycap_alpha && font_share == o.font_share &&
@@ -229,8 +228,8 @@ private:
                                                  the band leaves free */
         unsigned key_font_h = 8, key_box_h = 12;   /* the marks' glyphs and box, guest pixels */
         unsigned rec_x0 = 0, rec_y0 = 0;      /* the record mark's box, guest pixels */
-        unsigned cap_x0 = 0, cap_x1 = 0, cap_offset = 0;
-        bool cap_scrolls = false;
+        unsigned cap_x0 = 0, cap_x1 = 0;
+        std::string cap_text;                 /* the caption as drawn: cut to its band */
         int cap_level = 0;                    /* the caption's fade, of CAPTION_LEVELS */
         std::vector<unsigned> key_x0;         /* each shown keycap's left, guest pixels */
         LayerKey key[LAYER_COUNT];
@@ -259,8 +258,7 @@ private:
     /* `text` in the 8- or 16-row font `font_h`, its glyphs' top row at guest row `gy0`. */
     void PaintText(unsigned y, unsigned x0, unsigned x1, uint32_t *row,
                    unsigned gx0, unsigned gx1, unsigned gy0, unsigned font_h,
-                   const std::string &text, unsigned offset, unsigned period,
-                   uint32_t ink) const;
+                   const std::string &text, uint32_t ink) const;
     uint32_t Blend(uint32_t under, uint32_t over) const;
     uint32_t Read(const uint8_t *p) const;
     void Write(uint8_t *p, uint32_t v) const;

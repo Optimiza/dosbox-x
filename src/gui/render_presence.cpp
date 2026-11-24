@@ -52,10 +52,8 @@ constexpr int CAPTION_LEVELS = 16;
 constexpr int MAX_SPRITE_SIDE = 64;
 constexpr size_t MAX_CAPTION = 160, MAX_KEYS = 8, MAX_KEY = 12;
 /* The band's layout, in guest pixels: a glyph's width, the padding inside a box, the gap
-   between boxes, the pause mark's bars, and the blank a scrolling caption leaves before it
-   comes round again. */
+   between boxes, and the pause mark's bars. */
 constexpr unsigned GLYPH_W = 8, PAD = 2, GAP = 2, BAR_W = 3, PAUSE_W = 2 * PAD + 3 * BAR_W;
-constexpr unsigned SCROLL_GAP = 4 * GLYPH_W;
 /* A mark's rounded corner, in guest pixels, and the alpha of its outline, half the text's. */
 constexpr unsigned KEY_RADIUS = 4, KEY_OUTLINE_ALPHA = 128;
 /* The record mark: its dot is this many eighths of the font's height, and audio is the VGA
@@ -119,6 +117,15 @@ std::vector<std::string> Split(const std::string &s) {
     while (std::getline(in, part, ',')) parts.push_back(part);
     if (s.back() == ',') parts.push_back("");
     return parts;
+}
+
+/* A caption wider than its band is cut to what fits and marked with a dot pair: a line that
+   moves cannot be read while the machine runs, and the call is whole in the client's own
+   transcript. A band that cannot hold the marker holds no text. */
+std::string FitText(const std::string &text, unsigned glyphs) {
+    if (text.size() <= glyphs) return text;
+    if (glyphs < 2) return "";
+    return text.substr(0, glyphs - 2) + "..";
 }
 
 const char *StateName(State s) {
@@ -253,9 +260,15 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "glide") ok = ParseFloat(value, 0.0f, 5.0f, look.glide);
         else if (key == "caption_text_rgb") ok = ParseHex(value, look.caption_text_rgb);
         else if (key == "caption_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.caption_alpha);
-        else if (key == "scroll_cps") ok = ParseFloat(value, 0.0f, 100.0f, look.scroll_cps);
         else if (key == "caption_in") ok = ParseFloat(value, 0.0f, 5.0f, look.caption_in);
         else if (key == "caption_out") ok = ParseFloat(value, 0.0f, 5.0f, look.caption_out);
+        /* A word the servers of protocol 4 still send: taken and ignored, so an older server
+           keeps the whole overlay instead of losing the command over one it no longer needs. */
+        else if (key == "scroll_cps") {
+            float legacy = 0.0f;
+            ok = ParseFloat(value, 0.0f, 100.0f, legacy);
+            (void)legacy;
+        }
         else if (key == "keycap_rgb") ok = ParseHex(value, look.keycap_rgb);
         else if (key == "keycap_text_rgb") ok = ParseHex(value, look.keycap_text_rgb);
         else if (key == "keycap_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.keycap_alpha);
@@ -569,24 +582,18 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
                 : 0.0f;
         s.cap_level = (int)std::lround(f_in * f_out * CAPTION_LEVELS);
         if (s.cap_level > 0) {
-            const unsigned room = right - left, text = (unsigned)caption_.size() * GLYPH_W;
-            s.cap_scrolls = text + 2 * PAD > room;
-            if (s.cap_scrolls) {
-                s.cap_x0 = left;
-                s.cap_x1 = right;
-                const double moved = (double)(uint32_t)(now_ms - caption_since_ms_) / 1000.0 *
-                                     (double)look_.scroll_cps * GLYPH_W;
-                /* floored first: 32-bit MSVC's double to uint64_t conversion rounds to nearest,
-                   so a step would land half a pixel early */
-                s.cap_offset = (unsigned)((uint64_t)std::floor(moved) % (text + SCROLL_GAP));
-            } else {
-                s.cap_x0 = left + (room - text - 2 * PAD) / 2;
-                s.cap_x1 = s.cap_x0 + text + 2 * PAD;
-            }
+            const unsigned room = right - left;
+            s.cap_text = FitText(caption_, room > 2 * PAD ? (room - 2 * PAD) / GLYPH_W : 0);
+            const unsigned text = (unsigned)s.cap_text.size() * GLYPH_W;
+            s.cap_x0 = left + (room - text - 2 * PAD) / 2;
+            s.cap_x1 = s.cap_x0 + text + 2 * PAD;
             /* the band the clip shows: the caption's tint spans the room between the insets,
-               and the text is centred in whatever the pause mark leaves of it */
+               and the text is centred in whatever the pause mark leaves of it, so the cut
+               follows that room: its left edge is part of the stamp, or a caption laid while
+               the mark was on would never be laid again when it leaves */
             set(CALLS, margin, right, y0, y1,
-                ((uint64_t)caption_generation_ << 40) | ((uint64_t)(s.cap_offset & 0xFFFFu) << 24) |
+                ((uint64_t)caption_generation_ << 40) |
+                ((uint64_t)(s.cap_x0 & 0xFFFFu) << 24) |
                 ((uint64_t)s.cap_level << 16) | (look_generation_ & 0xFFFFu));
         }
     }
@@ -716,8 +723,7 @@ void Overlay::Prepare(const Scene &s) {
 
 void Overlay::PaintText(unsigned y, unsigned x0, unsigned x1, uint32_t *row,
                         unsigned gx0, unsigned gx1, unsigned gy0, unsigned font_h,
-                        const std::string &text, unsigned offset, unsigned period,
-                        uint32_t ink) const {
+                        const std::string &text, uint32_t ink) const {
     const unsigned gy = gy_of_y_[y];
     if (gy < gy0 || gy >= gy0 + font_h) return;
     const unsigned glyph_row = gy - gy0;
@@ -726,8 +732,7 @@ void Overlay::PaintText(unsigned y, unsigned x0, unsigned x1, uint32_t *row,
     for (unsigned x = x0; x < x1; x++) {
         const unsigned gx = gx_of_x_[x];
         if (gx < gx0 || gx >= gx1) continue;
-        unsigned u = gx - gx0 + offset;
-        if (period) u %= period;
+        const unsigned u = gx - gx0;
         if (u >= text_px) continue;
         const uint8_t bits = font[(unsigned char)text[u / GLYPH_W] * font_h + glyph_row];
         if (bits & (0x80u >> (u % GLYPH_W))) row[x] = Over(row[x], ink);
@@ -798,20 +803,20 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                         if (!inside(dx - 1, dy - 1, 1)) row[x] = Over(row[x], line);
                     }
                     PaintText(y, a, b, row, gx0 + PAD, gx1 - PAD, s.key_y0 + PAD, s.key_font_h,
-                              name, 0, 0, ink);
+                              name, ink);
                 }
                 break;
             }
             case CALLS: {
                 const unsigned level = (unsigned)s.cap_level;
-                /* The tint arrives darkened for the band and is laid down opaque once faded in:
-                   a translucent band over a bright picture left the caption under WCAG AA. */
-                const uint32_t box = Premul(tint_, 255 * level / CAPTION_LEVELS);
+                /* The tint arrives darkened for the band and is laid at the look's alpha, so
+                   the picture shows through it: the text keeps its AA over the dark pictures
+                   these sessions draw, and a bright one is what the translucency costs. */
+                const uint32_t box = Premul(tint_, Alpha255(look_.caption_alpha) * level / CAPTION_LEVELS);
                 const uint32_t ink = Premul(look_.caption_text_rgb, 255 * level / CAPTION_LEVELS);
                 for (unsigned x = a; x < b; x++) row[x] = Over(row[x], box);
-                const unsigned period = s.cap_scrolls ? (unsigned)caption_.size() * GLYPH_W + SCROLL_GAP : 0;
                 PaintText(y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, s.box_y + PAD, s.font_h,
-                          caption_, s.cap_offset, period, ink);
+                          s.cap_text, ink);
                 break;
             }
             case PAUSE: {
@@ -847,8 +852,7 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                         }
                     }
                     const unsigned tx = gx0 + dot + PAD, tw = (unsigned)label.size() * GLYPH_W;
-                    PaintText(y, a, b, row, tx, tx + tw, s.rec_y0 + PAD, s.font_h, label, 0, 0,
-                              ink);
+                    PaintText(y, a, b, row, tx, tx + tw, s.rec_y0 + PAD, s.font_h, label, ink);
                     gx0 = tx + tw + GAP;
                 };
                 if (recording_ != Recording::Audio) mark("REC");
