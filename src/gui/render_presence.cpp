@@ -457,16 +457,22 @@ Rect Overlay::OutRect(unsigned gx0, unsigned gy0, unsigned gx1, unsigned gy1) co
 
 void Overlay::Band(Scene &s, uint32_t now_ms) const {
     const unsigned gw = guest_width_ ? guest_width_ : width_, gh = guest_height_ ? guest_height_ : height_;
-    const unsigned bh = std::max(1u, gh / placement::BAND_DIVISOR);
     // One size for both layers: the client's share of the picture, taken as the BIOS font
     // nearest it, so 8 on a 320x200 game and 16 on a 640x400 one.
     s.font_h = (look_.font_share * gh) >= 12 ? 16 : 8;
     s.box_h = s.font_h + 2 * PAD;
     s.top = place_ == Place::Top || (place_ == Place::Auto && band_ == Place::Top);
-    if (s.top) s.box_y = bh > s.box_h ? (bh - s.box_h) / 2 : 0;
-    else s.box_y = bh > s.box_h ? gh - bh + (bh - s.box_h) / 2 : gh > s.box_h ? gh - s.box_h : 0;
+    /* The box sits at the edge's own depth, as the clip draws it: never centred in the eighth,
+       whose height only tells where the tint stops. The depth is a vertical distance, so it is
+       the height's scale that converts it: on an aspect-corrected output the two differ. */
     const unsigned edge = (unsigned)(((uint64_t)EdgeBand() * gw + width_ - 1) / std::max(1u, width_));
-    const unsigned margin = edge + 2;
+    const unsigned edge_y = (unsigned)(((uint64_t)EdgeBand() * gh + height_ - 1)
+                                       / std::max(1u, height_));
+    const unsigned margin = std::max((unsigned)PAD, edge);
+    const unsigned margin_y = std::max((unsigned)PAD, edge_y);
+    if (s.top) s.box_y = margin_y;
+    else s.box_y = gh > margin_y + s.box_h ? gh - margin_y - s.box_h
+                                           : gh > s.box_h ? gh - s.box_h : 0;
     unsigned left = margin, right = gw > margin ? gw - margin : 0;
     const unsigned y0 = s.box_y, y1 = s.box_y + s.box_h;
     auto set = [&](Layer l, unsigned gx0, unsigned gx1, unsigned gy0, unsigned gy1, uint64_t stamp) {
@@ -484,8 +490,7 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
         const bool video = recording_ != Recording::Audio, audio = recording_ != Recording::Video;
         const unsigned w = 2 * PAD + (video ? dot + PAD + 3 * GLYPH_W : 0) +
                            (audio ? dot + PAD + GLYPH_W : 0) + (video && audio ? GAP : 0);
-        const unsigned edge_y = (unsigned)(((uint64_t)EdgeBand() * gh + height_ - 1) / std::max(1u, height_));
-        const unsigned top = edge_y + 2;
+        const unsigned top = margin_y;
         if (right >= left + w && top + s.box_h <= gh) {
             s.rec_x0 = right - w;
             s.rec_y0 = top;
@@ -513,9 +518,10 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
        the row fills, so the key being pressed is always the one shown. */
     s.key_font_h = s.font_h;
     s.key_box_h = s.key_font_h + 2 * PAD;
-    const unsigned key_y0 = s.top ? (gh > margin + s.key_box_h && gh - margin - s.key_box_h >= y1
-                                     ? gh - margin - s.key_box_h : 0)
-                                  : (margin + s.key_box_h <= y0 ? margin : 0);
+    const unsigned key_y0 = s.top ? (gh > margin_y + s.key_box_h
+                                     && gh - margin_y - s.key_box_h >= y1
+                                     ? gh - margin_y - s.key_box_h : 0)
+                                  : (margin_y + s.key_box_h <= y0 ? margin_y : 0);
     if (layers_[KEYS] && !keys_.empty() && key_y0 != 0) {
         unsigned key_right = gw > margin ? gw - margin : 0;
         if (!s.top && recording_ != Recording::None && s.rec_x0 != 0 &&

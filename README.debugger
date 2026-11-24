@@ -376,8 +376,10 @@ edge the band leaves free, one row inset from the picture, the newest key at the
 left and the oldest making room when the row fills; they never lie over the band
 or the record mark. A keycap is drawn as the clip draws it: a rounded box, its
 outline at half the text's brightness. The caption and a keycap are drawn in the
-same VGA ROM font, the BIOS size nearest the share of the picture the client
-asks for, so the two never disagree in size.
+same VGA ROM font, at the BIOS size nearest the share of the picture the client
+asks for. The clip draws its text with its own bitmap cell from the same share,
+so the two agree on the share and each rounds it to its own font: on a tall
+picture, where no BIOS font is near the share, the live text is the smaller.
 With `place=auto` the overlay samples the guest's own
 picture once a second on a grid in each band (16 columns by 2 rows, the band an
 eighth of the picture), scores each band by how many samples differ from its most

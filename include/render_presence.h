@@ -23,7 +23,7 @@
 namespace presence {
 
 /* What the bare PRESENCE command announces, so a client can refuse a build older than it
-   expects: 1 was the build that announced nothing, 2 drew the edge and the pointer only. */
+   expects: below this a build draws fewer of the layers the client asks for. */
 constexpr int PROTOCOL_VERSION = 3;
 
 enum class State { Off, Held, Acting, Paused };
@@ -120,7 +120,7 @@ public:
     virtual void Present() = 0;
 };
 
-/* Decision 13's sampling, the rules scry_core.placement states and its test vectors replay. */
+/* The rules `scry_core.placement` states and its test vectors replay. */
 namespace placement {
 constexpr unsigned BAND_DIVISOR = 8, COLUMNS = 16, ROWS = 2, MARGIN = 4, CONSECUTIVE = 2;
 constexpr uint32_t SAMPLE_MS = 1000;
