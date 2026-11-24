@@ -782,7 +782,9 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
             }
             case CALLS: {
                 const unsigned level = (unsigned)s.cap_level;
-                const uint32_t box = Premul(tint_, Alpha255(look_.caption_alpha) * level / CAPTION_LEVELS);
+                /* The tint arrives darkened for the band and is laid down opaque once faded in:
+                   a translucent band over a bright picture left the caption under WCAG AA. */
+                const uint32_t box = Premul(tint_, 255 * level / CAPTION_LEVELS);
                 const uint32_t ink = Premul(look_.caption_text_rgb, 255 * level / CAPTION_LEVELS);
                 for (unsigned x = a; x < b; x++) row[x] = Over(row[x], box);
                 const unsigned period = s.cap_scrolls ? (unsigned)caption_.size() * GLYPH_W + SCROLL_GAP : 0;
