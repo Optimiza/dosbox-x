@@ -86,9 +86,9 @@ TEST(Presence, TheBareCommandAnnouncesItsVersion) {
     std::vector<std::string> lines;
     EXPECT_TRUE(PRESENCE_Command("", lines));
     ASSERT_EQ(lines.size(), 1u);
-    EXPECT_NE(lines[0].find(" version=3"), std::string::npos) << lines[0];
+    EXPECT_NE(lines[0].find(" version=4"), std::string::npos) << lines[0];
     EXPECT_TRUE(PRESENCE_Command("  ", lines));
-    EXPECT_NE(lines[0].find(" version=3"), std::string::npos) << lines[0];
+    EXPECT_NE(lines[0].find(" version=4"), std::string::npos) << lines[0];
     EXPECT_EQ(presence::Overlay().Describe().find("version="), std::string::npos)
         << "only the bare command announces it";
 }
@@ -453,6 +453,18 @@ TEST(PresenceLayers, AKeycapIsABoxPerKeyWithTheKeysGlyphs) {
     EXPECT_EQ(b.frame.at(a_x0 + 2 + col, kKeyY + 2 + row), 0u) << "no key down, no keycap";
 }
 
+TEST(PresenceLayers, AKeycapIsDrawnAtTheAlphaTheServerSends) {
+    /* the server sends each mark's alpha, so a keycap that was let go fades out */
+    Band whole("held keys=A key_alpha=100 place=bottom");
+    whole.Draw(0);
+    Band faint("held keys=A key_alpha=40 place=bottom");
+    faint.Draw(0);
+    const uint32_t solid = whole.frame.at(kInset + 6, kKeyY + kKeyH - 2);
+    const uint32_t faded = faint.frame.at(kInset + 6, kKeyY + kKeyH - 2);
+    EXPECT_NE(solid, 0u) << "the whole mark";
+    EXPECT_LT(faded & 0xFFu, solid & 0xFFu) << "the mark at 40% is drawn fainter";
+}
+
 TEST(PresenceLayers, AKeycapsBoxStaysUnderASeventhOfThePicture) {
     /* one rule for the band and the keys: the 8-row font on a 200-row picture and the 16-row
        one on a 300-row picture, so a 12- and a 20-row box, both under a seventh. */
@@ -751,6 +763,8 @@ TEST(PresenceLayers, TheProtocolRefusesWhatItCannotDrawAndChangesNothing) {
     EXPECT_FALSE(o.Configure("held keys=a,b,c,d,e,f,g,h,i", error, 0)) << "over 8 keys";
     EXPECT_FALSE(o.Configure("held keys=ThirteenBytes", error, 0)) << "a key over 12 bytes";
     EXPECT_FALSE(o.Configure("held keys=a,,b", error, 0)) << "an empty key";
+    EXPECT_FALSE(o.Configure("held keys=a key_alpha=101", error, 0)) << "over 100%";
+    EXPECT_FALSE(o.Configure("held keys=a key_alpha=x", error, 0)) << "not a percentage";
     EXPECT_FALSE(o.Configure("held place=left", error, 0));
     EXPECT_FALSE(o.Configure("held tint=red", error, 0));
     EXPECT_FALSE(o.Configure("held serial=-1", error, 0));

@@ -24,7 +24,7 @@ namespace presence {
 
 /* What the bare PRESENCE command announces, so a client can refuse a build older than it
    expects: below this a build draws fewer of the layers the client asks for. */
-constexpr int PROTOCOL_VERSION = 3;
+constexpr int PROTOCOL_VERSION = 4;
 
 enum class State { Off, Held, Acting, Paused };
 /* The band of the picture the captions, keycaps and pause mark go in. */
@@ -287,6 +287,8 @@ private:
     uint32_t caption_since_ms_ = 0, caption_left_ms_ = 0;
     unsigned caption_generation_ = 0;
     std::vector<std::string> keys_;
+    /* Each drawn keycap's alpha, 0 to 1; a mark the server let go fades out. Empty means 1. */
+    std::vector<float> keys_alpha_;
     unsigned keys_generation_ = 0;
     Recording recording_ = Recording::None;
     uint32_t recording_since_ms_ = 0;       /* the blink's phase starts at the last change */

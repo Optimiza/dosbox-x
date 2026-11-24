@@ -343,6 +343,9 @@ value:
   tint      the caption box's colour, six hex digits
   keys      the names of the keys down now, comma separated, at most 8 of at
             most 12 bytes each, encoded as `caption`; empty for none
+  key_alpha each keycap's alpha as a percentage, comma separated, in the order
+            `keys` names them: a mark the client let go fades out instead of
+            vanishing
   rec       what the client records: `none`, `video`, `audio` or `both`
   caption_text_rgb, keycap_rgb, keycap_text_rgb
             the caption's text, the keycaps' box and text, six hex digits
@@ -424,8 +427,9 @@ nothing; the response ends with that reason alone. The arguments keep their
 case.
 
 The bare command, `PRESENCE` with no state, changes nothing and answers the same line
-with `version=3` appended, so a client can refuse a build older than it expects
-(version 1 was implicit, version 2 drew the edge and the arrow only).
+with `version=4` appended, so a client can refuse a build older than it expects
+(version 1 was implicit, version 2 drew the edge and the arrow only, version 3
+the caption, the keycaps and the pause and record marks).
 
 The overlay is drawn after the frame was handed to capture: screenshots, video
 capture and the VGA memory never contain it. Its layers are composited once per

@@ -238,6 +238,7 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     std::string caption;
     uint64_t serial = 0;
     std::vector<std::string> keys;
+    std::vector<float> keys_alpha;
     while (in >> word) {
         const size_t eq = word.find('=');
         if (eq == std::string::npos) { error = "PRESENCE argument without a value: " + word; return false; }
@@ -321,6 +322,21 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
                 keys.push_back(decoded);
             }
         }
+        else if (key == "key_alpha") {
+            /* each keycap's alpha as a percentage, in the order `keys` names them */
+            const std::vector<std::string> parts = Split(value);
+            ok = parts.size() <= MAX_KEYS;
+            for (const std::string &part : parts) {
+                long level = 0;
+                ok = ok && !part.empty() && part.size() <= 3 &&
+                     part.find_first_not_of("0123456789") == std::string::npos;
+                if (!ok) break;
+                level = std::strtol(part.c_str(), nullptr, 10);
+                ok = level <= 100;
+                if (!ok) break;
+                keys_alpha.push_back((float)level / 100.0f);
+            }
+        }
         else { error = "PRESENCE does not know the argument " + key; return false; }
         if (!ok) { error = "PRESENCE " + key + "=" + value + " is not a value it takes"; return false; }
     }
@@ -366,8 +382,9 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         recording_ = recording;
         recording_since_ms_ = now_ms;
     }
-    if (have_keys && keys != keys_) {
+    if (have_keys && (keys != keys_ || keys_alpha != keys_alpha_)) {
         keys_ = keys;
+        keys_alpha_ = keys_alpha;
         keys_generation_++;
     }
     return true;
@@ -748,12 +765,17 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                 break;
             }
             case KEYS: {
-                const uint32_t cap = Premul(look_.keycap_rgb, Alpha255(look_.keycap_alpha));
-                const uint32_t ink = Premul(look_.keycap_text_rgb, 255);
-                const uint32_t line = Premul(look_.keycap_text_rgb, KEY_OUTLINE_ALPHA);
                 const int radius = CellEdge(scale_x_, KEY_RADIUS);
                 for (size_t n = 0; n < s.key_x0.size(); n++) {
-                    const std::string &name = keys_[keys_.size() - 1 - n];
+                    const size_t which = keys_.size() - 1 - n;
+                    const std::string &name = keys_[which];
+                    /* A mark the server let go fades: it sends each keycap's own alpha. */
+                    const float key_alpha = which < keys_alpha_.size() ? keys_alpha_[which] : 1.0f;
+                    const uint32_t cap = Premul(look_.keycap_rgb,
+                                                Alpha255(look_.keycap_alpha * key_alpha));
+                    const uint32_t ink = Premul(look_.keycap_text_rgb, Alpha255(key_alpha));
+                    const uint32_t line = Premul(look_.keycap_text_rgb,
+                                                 (unsigned)std::lround(KEY_OUTLINE_ALPHA * key_alpha));
                     const unsigned gx0 = s.key_x0[n], gx1 = gx0 + (unsigned)name.size() * GLYPH_W + 2 * PAD;
                     /* The mark as the clip draws it: a rounded box, its outline half the text's
                        brightness, drawn over the fill. */
