@@ -380,8 +380,7 @@ case.
 
 The bare command, `PRESENCE` with no state, changes nothing and answers the same line
 with `version=4` appended, so a client can refuse a build older than it expects
-(version 1 was implicit, version 2 drew the edge and the arrow only, version 3
-the record mark, version 4 the layers as they stand: the edge, the pointer and
+(version 1 was implicit; this server needs version 4, the edge, the pointer and
 the record mark).
 
 The overlay is drawn after the frame was handed to capture: screenshots, video
