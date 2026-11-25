@@ -1,9 +1,8 @@
 /*
  *  Presence indicator: a client driving the emulator through the mcp_server
  *  debugger channel marks the window it drives: a soft edge on the output's
- *  inner sides and, as asked, the guest's mouse pointer, the keys held down, a
- *  caption naming the call, a mark while the session holds the machine and a
- *  blinking mark while it records.
+ *  inner sides and, as asked, the guest's mouse pointer and a blinking mark
+ *  while it records.
  *
  *  It is drawn into the scaled output buffer just before it is presented, or
  *  on OpenGL and Direct3D 9 as a texture of its own over the frame, after the frame has been
@@ -26,11 +25,9 @@ namespace presence {
    expects: below this a build draws fewer of the layers the client asks for. */
 constexpr int PROTOCOL_VERSION = 4;
 
-enum class State { Off, Held, Acting, Paused };
-/* The band of the picture the captions, keycaps and pause mark go in. */
-enum class Place { Top, Bottom, Auto };
+enum class State { Off, Held, Acting };
 /* Drawing order, bottom first; the words are the client's layer names. */
-enum Layer { EDGE, POINTER, KEYS, CALLS, PAUSE, RECORD, LAYER_COUNT };
+enum Layer { EDGE, POINTER, RECORD, LAYER_COUNT };
 /* What the session records, which the record mark shows. */
 enum class Recording { None, Video, Audio, Both };
 
@@ -48,24 +45,12 @@ struct Look {
     float glide = 0.1f;       /* the arrow easing out to a new place */
     /* the arrow, top row first: 'X' outline, 'o' fill, '.' untouched */
     std::vector<std::string> sprite;
-    uint32_t caption_text_rgb = 0xFFFFFF;
-    float caption_alpha = 0.75f;
-    float caption_in = 0.15f;
-    float caption_out = 0.15f;
-    uint32_t keycap_rgb = 0x202020;
-    uint32_t keycap_text_rgb = 0xFFFFFF;
-    float keycap_alpha = 0.8f;
-    float font_share = 1.0f / 24.0f; /* the text's height, a share of the picture's */
     uint32_t record_rgb = 0xFF3B30;   /* the record mark's dot */
     float record_blink_s = 1.0f;      /* the record mark's blink, on for its first half */
     bool operator==(const Look &o) const {
         return rgb == o.rgb && outline == o.outline && edge == o.edge && steps == o.steps &&
                acting == o.acting && held == o.held && fade == o.fade && glide == o.glide &&
-               sprite == o.sprite && caption_text_rgb == o.caption_text_rgb &&
-               caption_alpha == o.caption_alpha &&
-               caption_in == o.caption_in && caption_out == o.caption_out &&
-               keycap_rgb == o.keycap_rgb && keycap_text_rgb == o.keycap_text_rgb &&
-               keycap_alpha == o.keycap_alpha && font_share == o.font_share &&
+               sprite == o.sprite &&
                record_rgb == o.record_rgb && record_blink_s == o.record_blink_s;
     }
 };
@@ -119,30 +104,9 @@ public:
     virtual void Present() = 0;
 };
 
-/* The rules `scry_core.placement` states and its test vectors replay. */
-namespace placement {
-constexpr unsigned BAND_DIVISOR = 8, COLUMNS = 16, ROWS = 2, MARGIN = 4, CONSECUTIVE = 2;
-constexpr uint32_t SAMPLE_MS = 1000;
-constexpr unsigned SAMPLES = COLUMNS * ROWS;
-struct Point { unsigned x, y; };
-/* The top band's and the bottom band's samples, row by row, at their cells' centres. */
-void Points(unsigned width, unsigned height, Point top[SAMPLES], Point bottom[SAMPLES]);
-/* How many of the samples differ from their most common colour. */
-unsigned Score(const uint32_t colours[SAMPLES]);
-/* The band after one sample of the two bands' scores; `streak` carries across samples. */
-Place Step(Place band, unsigned &streak, unsigned top, unsigned bottom);
-} /* namespace placement */
-
-/* The guest's picture, for placement: its size and the colour at (x, y) as 0xRRGGBB. */
-struct Picture {
-    unsigned width = 0, height = 0;
-    uint32_t (*pixel)(const void *context, unsigned x, unsigned y) = nullptr;
-    const void *context = nullptr;
-};
-
 class Overlay {
 public:
-    /* "<off|held|acting|paused> [key=value ...]": the state, the look, the layers and what
+    /* "<off|held|acting> [key=value ...]": the state, the look, the layers and what
        they show. Keys left out keep their value; a refused command changes nothing. `now_ms`
        is the host clock the fades are timed on. */
     bool Configure(const std::string &args, std::string &error, uint32_t now_ms);
@@ -193,11 +157,7 @@ public:
     /* Whether a change waits to be uploaded to the texture. */
     bool upload_pending() const { return !uploads_.empty(); }
 
-    /* Placement `auto`: score the guest's two bands once every SAMPLE_MS. */
-    void Sample(uint32_t now_ms, const Picture &picture);
-
     State state() const { return state_; }
-    Place place() const { return band_; }
     bool drawn() const;
     /* Whether the output buffer holds the overlay, so the scaler must take it off a line. */
     bool in_buffer() const { return texture_ == nullptr && drawn(); }
@@ -221,23 +181,14 @@ private:
         State state = State::Off;
         int alpha = 0;                        /* the edge's, of ALPHA_LEVELS */
         int ax = 0, ay = 0;                   /* the arrow's top left, output pixels */
-        bool top = false;                     /* the band's place */
-        unsigned box_y = 0, box_h = 0, font_h = 16;   /* guest pixels */
-        unsigned pause_x0 = 0;
-        unsigned key_y0 = 0;                  /* the held keys' row, guest pixels, on the edge
-                                                 the band leaves free */
-        unsigned key_font_h = 8, key_box_h = 12;   /* the marks' glyphs and box, guest pixels */
+        unsigned box_h = 0, font_h = 16;      /* the record mark's box and glyphs, guest pixels */
         unsigned rec_x0 = 0, rec_y0 = 0;      /* the record mark's box, guest pixels */
-        unsigned cap_x0 = 0, cap_x1 = 0;
-        std::string cap_text;                 /* the caption as drawn: cut to its band */
-        int cap_level = 0;                    /* the caption's fade, of CAPTION_LEVELS */
-        std::vector<unsigned> key_x0;         /* each shown keycap's left, guest pixels */
         LayerKey key[LAYER_COUNT];
     };
     struct Interval { unsigned x0, x1; };
 
     Scene SceneAt(uint32_t now_ms, bool have_pointer, float fx, float fy) const;
-    void Band(Scene &s, uint32_t now_ms) const;
+    void Marks(Scene &s, uint32_t now_ms) const;
     /* Where the arrow is drawn at `now_ms`, as a fraction of the output: gliding
        from where it was drawn to the pointer at (fx, fy), the first time there. */
     void ArrowAt(uint32_t now_ms, float fx, float fy, float &x, float &y) const;
@@ -268,26 +219,9 @@ private:
     unsigned look_generation_ = 0;
     State state_ = State::Off;
     bool pointer_ = false;
-    bool layers_[LAYER_COUNT] = {true, true, true, true, true, true};
-    Place place_ = Place::Auto;
-    Place band_ = Place::Bottom;            /* where `auto` put the band */
-    unsigned streak_ = 0;
-    bool sampled_ = false;
-    uint32_t sampled_ms_ = 0;
+    bool layers_[LAYER_COUNT] = {true, true, true};
     uint32_t since_ms_ = 0;                 /* when the state last changed */
     State faded_from_ = State::Off;
-    /* the caption: its text, its tint, and when it came or began to leave */
-    std::string caption_;
-    uint32_t tint_ = 0xFF8C00;
-    bool caption_on_ = false, caption_leaving_ = false;
-    bool serial_known_ = false;
-    uint64_t serial_ = 0;
-    uint32_t caption_since_ms_ = 0, caption_left_ms_ = 0;
-    unsigned caption_generation_ = 0;
-    std::vector<std::string> keys_;
-    /* Each drawn keycap's alpha, 0 to 1; a mark the server let go fades out. Empty means 1. */
-    std::vector<float> keys_alpha_;
-    unsigned keys_generation_ = 0;
     Recording recording_ = Recording::None;
     uint32_t recording_since_ms_ = 0;       /* the blink's phase starts at the last change */
 

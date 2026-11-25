@@ -304,8 +304,7 @@ marks with it the window it drives, so whoever sits at the host can tell that
 somebody is driving it and keep their hands off:
 
   REQ 12 EXEC PRESENCE acting rgb=FF8C00 edge=0.025 steps=6 acting=0.850 held=0.283
-         fade=2.5 outline=2A1400 sprite=X.../XX../XoX./XXXX pointer=1
-         caption=send_keys%20Esc serial=3 tint=FF8C00 keys=Esc place=auto
+         fade=2.5 outline=2A1400 sprite=X.../XX../XoX./XXXX pointer=1 rec=video
 
 (one line). The first word is the state:
 
@@ -313,7 +312,6 @@ somebody is driving it and keep their hands off:
   held     a dim edge on the inner sides of the picture
   acting   the same edge, brighter; going back to held, it fades over `fade`
            seconds
-  paused   held's edge and a pause mark: the client holds the machine stopped
 
 The `key=value` words set what is drawn and how, and a key left out keeps its
 value:
@@ -322,43 +320,16 @@ value:
   edge      the edge's width, a fraction of the picture's shorter side
   steps     the bands its gradient is drawn in, strongest at the rim
   acting    the alpha while acting, 0 to 1
-  held      the alpha while held or paused, 0 to 1
+  held      the alpha while held, 0 to 1
   fade      the seconds from acting back to held
   sprite    an arrow drawn at the guest's mouse position, its rows top first
             and separated by `/`: `X` the outline, `o` the fill, `.` untouched
   outline   the arrow's outline colour, six hex digits (the fill is `rgb`)
   glide     the seconds the arrow takes to ease out to a new place, 0 to jump
   pointer   1 to draw the arrow (with a sprite given), 0 not to
-  layers    the layers to draw, comma separated, from `edge`, `pointer`,
-            `keys`, `calls`, `pause`, `record`; all of them unless told
-  place     where the caption and the pause mark go: `top` or `bottom` band of
-            the picture, or `auto`, the band showing less; the keycaps take the
-            other edge
-  caption   the call's caption, at most 160 bytes, one word: `%XX` for a
-            space, a percent sign or any byte outside printable ASCII; empty
-            to take it away (it leaves with its fade)
-  serial    the caption's number: a caption is new when its serial changes, so
-            the same caption sent again restarts nothing; with no serial ever
-            sent, every `caption` is a new one
-  tint      the caption box's colour, six hex digits
-  keys      the names of the keys down now, comma separated, at most 8 of at
-            most 12 bytes each, encoded as `caption`; empty for none
-  key_alpha each keycap's alpha as a percentage, comma separated, in the order
-            `keys` names them: a mark the client let go fades out instead of
-            vanishing
+  layers    the layers to draw, comma separated, from `edge`, `pointer` and
+            `record`; all of them unless told
   rec       what the client records: `none`, `video`, `audio` or `both`
-  caption_text_rgb, keycap_rgb, keycap_text_rgb
-            the caption's text, the keycaps' box and text, six hex digits
-  caption_alpha, keycap_alpha
-            the boxes' alphas, 0 to 1
-  caption_in, caption_out
-            the seconds a caption takes to fade in and out
-  scroll_cps
-            taken and ignored: the servers of protocol 4 still send it, and the
-            caption never scrolls, so an older one keeps its overlay
-  font_share
-            the caption's and the keycaps' text height as a share of the
-            picture's; the BIOS font nearest it is drawn
   record_rgb
             the record mark's dot, six hex digits
   record_blink_s
@@ -373,39 +344,20 @@ each new place from where it was drawn rather than jumping; with no driver
 installed there is no arrow. The glide is drawing only: the guest's pointer is
 where the driver says at once.
 
-The caption and the pause mark share a band, the top or bottom eighth of the
-picture, inset from the edge: the pause mark at the left, the caption centred in
-what is left, cut and marked with `..` when it does not fit. The keycaps take the
-edge the band leaves free, one row inset from the picture, the newest key at the
-left and the oldest making room when the row fills; they never lie over the band
-or the record mark. A keycap is drawn as the clip draws it: a rounded box, its
-outline at half the text's brightness. The caption and a keycap are drawn in the
-same VGA ROM font, at the BIOS size nearest the share of the picture the client
-asks for. The clip draws its text with its own bitmap cell from the same share,
-so the two agree on the share and each rounds it to its own font: on a tall
-picture, where no BIOS font is near the share, the live text is the smaller.
-With `place=auto` the overlay samples the guest's own
-picture once a second on a grid in each band (16 columns by 2 rows, the band an
-eighth of the picture), scores each band by how many samples differ from its most
-common colour, and moves to the other band once that one scored 4 lower on 2
-samples running.
-
 While `rec` is not `none`, the record mark sits in the top right corner of the
-picture, inset from the edge, whatever `place` says: a box of the keycaps'
-colours holding a dot in `record_rgb` and `REC` for video, a dot and the VGA
-font's double note for audio, both side by side for `both`. It blinks with the
-period `record_blink_s` gives, counted from the last change of `rec`, so a new
-recording shows at once. A band at the top keeps the room for it in both halves
-of the blink, so the keycaps and the caption never move with it. A blink
-repaints the mark's box alone: on the OpenGL and Direct3D 9 outputs it uploads
-that box and sends none of the frame.
+picture, inset from the edge: a dark box holding a dot in `record_rgb` and `REC`
+for video, a dot and the VGA font's double note for audio, both side by side for
+`both`. It blinks with the period `record_blink_s` gives, counted from the last
+change of `rec`, so a new recording shows at once. A blink repaints the mark's
+box alone: on the OpenGL and Direct3D 9 outputs it uploads that box and sends
+none of the frame.
 
 PRESENCE is answered at once, whether the guest runs or the debugger holds it
 (it marks the window, never the guest), with one line:
 
   PRESENCE held frames=1234 pointer=1 output=640x400x32 px_read=51245 px_written=51744
            bytes_presented=1026560 uploads=0 upload_bytes=0
-           layers=edge,pointer,keys,calls,pause,record place=bottom
+           layers=edge,pointer,record
 
 (one line). `frames` counts the frames the overlay was drawn on, and `output` is
 the output it is drawn on: `none` while there is no output yet, `undrawable`
@@ -414,15 +366,14 @@ shows text; its graphics modes are drawn on like any other). On an output it
 draws on, counters say what drawing it has cost since that output was made
 (they start again at 0 each time the render makes the output again, a new size,
 format, scaler or window mode, and `frames` does not), the same on any host: `px_read` the output pixels it read (the ones
-it saves before drawing, and the guest pixels `auto` samples), `px_written` the
+it saves before drawing), `px_written` the
 output pixels it wrote (put back or blended), `bytes_presented` the bytes it
 handed on to be presented, the scaler's own rows included, and `uploads` and
 `upload_bytes` the rectangles uploaded to the overlay's own texture and their
 bytes, 0 where it is drawn into the frame. On the OpenGL and Direct3D 9 outputs
-the overlay is that texture, so `px_read` counts only `auto`'s samples and `px_written` and
-`bytes_presented` stay 0. `layers` names the layers asked for and `place` the band in use; on an
-output it cannot draw on, `layers` is empty and `lacks` names the layers asked
-for. Two replies with no output made between them give the cost between them. An unknown
+the overlay is that texture, so `px_read` stays 0 and `px_written` and
+`bytes_presented` stay 0. `layers` names the layers asked for; on an output it
+cannot draw on, `layers` is empty and `lacks` names the layers asked for. Two replies with no output made between them give the cost between them. An unknown
 state or key, or a value out of its range, answers ERR naming it and changes
 nothing; the response ends with that reason alone. The arguments keep their
 case.
@@ -430,7 +381,8 @@ case.
 The bare command, `PRESENCE` with no state, changes nothing and answers the same line
 with `version=4` appended, so a client can refuse a build older than it expects
 (version 1 was implicit, version 2 drew the edge and the arrow only, version 3
-the caption, the keycaps and the pause and record marks).
+the record mark, version 4 the layers as they stand: the edge, the pointer and
+the record mark).
 
 The overlay is drawn after the frame was handed to capture: screenshots, video
 capture and the VGA memory never contain it. Its layers are composited once per
@@ -448,7 +400,7 @@ to. The scaler writes the output in place, rewriting only the blocks of a line
 that changed, so before it writes a line the overlay puts the picture back on
 that line's rows, and after the frame it draws itself again on those rows; every
 other row keeps the overlay as it was, and only a layer that changed (a fade, the
-arrow moving, a new caption) is redrawn and presented, and on an
+arrow moving, the blink) is redrawn and presented, and on an
 output that presents rectangles (the surface output) only its rectangles are. The complex scalers (hq2x, the SaI
 family, advmame) and a frame that rewrites everything take the overlay off every
 row first. A still overlay over a still picture costs nothing but a check per

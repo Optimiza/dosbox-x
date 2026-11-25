@@ -39,8 +39,6 @@
 /* the VGA ROM fonts (src/ints/int10.h, which needs the memory headers) */
 extern uint8_t int10_font_08[256 * 8];
 extern uint8_t int10_font_16[256 * 16];
-extern unsigned char *scalerSourceCacheBuffer;
-extern bool useTraditionalRenderCache;
 
 namespace presence {
 
@@ -48,19 +46,20 @@ namespace {
 
 /* Alphas are quantized to this many levels, so a fade repaints a bounded number of times. */
 constexpr int ALPHA_LEVELS = 64;
-constexpr int CAPTION_LEVELS = 16;
 constexpr int MAX_SPRITE_SIDE = 64;
-constexpr size_t MAX_CAPTION = 160, MAX_KEYS = 8, MAX_KEY = 12;
-/* The band's layout, in guest pixels: a glyph's width, the padding inside a box, the gap
-   between boxes, and the pause mark's bars. */
-constexpr unsigned GLYPH_W = 8, PAD = 2, GAP = 2, BAR_W = 3, PAUSE_W = 2 * PAD + 3 * BAR_W;
-/* A mark's rounded corner, in guest pixels, and the alpha of its outline, half the text's. */
-constexpr unsigned KEY_RADIUS = 4, KEY_OUTLINE_ALPHA = 128;
+/* The mark's layout, in guest pixels: a glyph's width, the padding inside its box and the gap
+   between its parts; the text's height, a share of the picture's, as the clip draws it. */
+constexpr unsigned GLYPH_W = 8, PAD = 2, GAP = 2;
+constexpr float MARK_FONT_SHARE = 1.0f / 24.0f;
+/* The mark's box and text, which come from the emulator and not from the client. */
+constexpr uint32_t MARK_RGB = 0x202020;
+constexpr float MARK_ALPHA = 0.8f;
+constexpr uint32_t MARK_TEXT_RGB = 0xFFFFFF;
 /* The record mark: its dot is this many eighths of the font's height, and audio is the VGA
    font's double note. */
 constexpr unsigned REC_DOT_EIGHTHS = 5;
 constexpr char NOTE_GLYPH = '\x0E';
-const char *const LAYER_NAMES[LAYER_COUNT] = {"edge", "pointer", "keys", "calls", "pause", "record"};
+const char *const LAYER_NAMES[LAYER_COUNT] = {"edge", "pointer", "record"};
 const char *const RECORDING_NAMES[] = {"none", "video", "audio", "both"};
 
 unsigned LowestBit(uint32_t v) {
@@ -88,27 +87,6 @@ bool ParseFloat(const std::string &s, double lo, double hi, float &out) {
     return true;
 }
 
-/* `%XX` for any byte, every other byte printable ASCII and not `%`, so the text is one word. */
-bool Decode(const std::string &s, size_t max, std::string &out) {
-    out.clear();
-    for (size_t i = 0; i < s.size(); i++) {
-        const unsigned char c = (unsigned char)s[i];
-        if (c == '%') {
-            if (i + 2 >= s.size() || !std::isxdigit((unsigned char)s[i + 1]) ||
-                !std::isxdigit((unsigned char)s[i + 2]))
-                return false;
-            out += (char)std::strtoul(s.substr(i + 1, 2).c_str(), nullptr, 16);
-            i += 2;
-        } else if (c > 0x20 && c < 0x7f) {
-            out += (char)c;
-        } else {
-            return false;
-        }
-        if (out.size() > max) return false;
-    }
-    return true;
-}
-
 std::vector<std::string> Split(const std::string &s) {
     std::vector<std::string> parts;
     if (s.empty()) return parts;
@@ -119,17 +97,8 @@ std::vector<std::string> Split(const std::string &s) {
     return parts;
 }
 
-/* A caption wider than its band is cut to what fits and marked with a dot pair: a line that
-   moves cannot be read while the machine runs, and the call is whole in the client's own
-   transcript. A band that cannot hold the marker holds no text. */
-std::string FitText(const std::string &text, unsigned glyphs) {
-    if (text.size() <= glyphs) return text;
-    if (glyphs < 2) return "";
-    return text.substr(0, glyphs - 2) + "..";
-}
-
 const char *StateName(State s) {
-    return s == State::Acting ? "acting" : s == State::Held ? "held" : s == State::Paused ? "paused" : "off";
+    return s == State::Acting ? "acting" : s == State::Held ? "held" : "off";
 }
 
 /* A colour at alpha `a` of 255, premultiplied. */
@@ -157,40 +126,6 @@ uint32_t Over(uint32_t dst, uint32_t src) {
 }
 
 } /* namespace */
-
-namespace placement {
-
-void Points(unsigned width, unsigned height, Point top[SAMPLES], Point bottom[SAMPLES]) {
-    const unsigned band = std::max(1u, height / BAND_DIVISOR);
-    for (unsigned j = 0; j < ROWS; j++)
-        for (unsigned i = 0; i < COLUMNS; i++) {
-            const unsigned x = (2 * i + 1) * width / (2 * COLUMNS);
-            const unsigned y = (2 * j + 1) * band / (2 * ROWS);
-            top[j * COLUMNS + i] = {x, y};
-            bottom[j * COLUMNS + i] = {x, height - band + y};
-        }
-}
-
-unsigned Score(const uint32_t colours[SAMPLES]) {
-    unsigned most = 0;
-    for (unsigned i = 0; i < SAMPLES; i++) {
-        unsigned n = 0;
-        for (unsigned j = 0; j < SAMPLES; j++) n += colours[j] == colours[i];
-        most = std::max(most, n);
-    }
-    return SAMPLES - most;
-}
-
-Place Step(Place band, unsigned &streak, unsigned top, unsigned bottom) {
-    const int here = (int)(band == Place::Top ? top : bottom);
-    const int other = (int)(band == Place::Top ? bottom : top);
-    if (here - other < (int)MARGIN) { streak = 0; return band; }
-    if (streak + 1 < CONSECUTIVE) { streak++; return band; }
-    streak = 0;
-    return band == Place::Top ? Place::Bottom : Place::Top;
-}
-
-} /* namespace placement */
 
 bool FormatFromPixels(unsigned bytes, uint32_t black, uint32_t r, uint32_t g, uint32_t b,
                       Format &out) {
@@ -226,26 +161,18 @@ bool Overlay::LayerKey::operator==(const LayerKey &o) const {
 bool Overlay::Configure(const std::string &args, std::string &error, uint32_t now_ms) {
     std::istringstream in(args);
     std::string word;
-    if (!(in >> word)) { error = "PRESENCE needs a state: off, held, acting or paused"; return false; }
+    if (!(in >> word)) { error = "PRESENCE needs a state: off, held or acting"; return false; }
     State next;
     if (word == "off") next = State::Off;
     else if (word == "held") next = State::Held;
     else if (word == "acting") next = State::Acting;
-    else if (word == "paused") next = State::Paused;
-    else { error = "PRESENCE state must be off, held, acting or paused, not " + word; return false; }
+    else { error = "PRESENCE state must be off, held or acting, not " + word; return false; }
 
     Look look = look_;
     bool pointer = pointer_;
     bool layers[LAYER_COUNT];
     std::copy(layers_, layers_ + LAYER_COUNT, layers);
-    Place place = place_;
-    uint32_t tint = tint_;
     Recording recording = recording_;
-    bool have_caption = false, have_serial = false, have_keys = false;
-    std::string caption;
-    uint64_t serial = 0;
-    std::vector<std::string> keys;
-    std::vector<float> keys_alpha;
     while (in >> word) {
         const size_t eq = word.find('=');
         if (eq == std::string::npos) { error = "PRESENCE argument without a value: " + word; return false; }
@@ -258,24 +185,8 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
         else if (key == "held") ok = ParseFloat(value, 0.0f, 1.0f, look.held);
         else if (key == "fade") ok = ParseFloat(value, 0.0f, 60.0f, look.fade);
         else if (key == "glide") ok = ParseFloat(value, 0.0f, 5.0f, look.glide);
-        else if (key == "caption_text_rgb") ok = ParseHex(value, look.caption_text_rgb);
-        else if (key == "caption_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.caption_alpha);
-        else if (key == "caption_in") ok = ParseFloat(value, 0.0f, 5.0f, look.caption_in);
-        else if (key == "caption_out") ok = ParseFloat(value, 0.0f, 5.0f, look.caption_out);
-        /* A word the servers of protocol 4 still send: taken and ignored, so an older server
-           keeps the whole overlay instead of losing the command over one it no longer needs. */
-        else if (key == "scroll_cps") {
-            float legacy = 0.0f;
-            ok = ParseFloat(value, 0.0f, 100.0f, legacy);
-            (void)legacy;
-        }
-        else if (key == "keycap_rgb") ok = ParseHex(value, look.keycap_rgb);
-        else if (key == "keycap_text_rgb") ok = ParseHex(value, look.keycap_text_rgb);
-        else if (key == "keycap_alpha") ok = ParseFloat(value, 0.0f, 1.0f, look.keycap_alpha);
-        else if (key == "font_share") ok = ParseFloat(value, 0.005, 0.25, look.font_share);
         else if (key == "record_rgb") ok = ParseHex(value, look.record_rgb);
         else if (key == "record_blink_s") ok = ParseFloat(value, 0.1, 10.0, look.record_blink_s);
-        else if (key == "tint") ok = ParseHex(value, tint);
         else if (key == "rec") {
             const auto *at = std::find_if(std::begin(RECORDING_NAMES), std::end(RECORDING_NAMES),
                                           [&](const char *n) { return value == n; });
@@ -311,45 +222,6 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
                 if (ok) layers[at - LAYER_NAMES] = true;
             }
         }
-        else if (key == "place") {
-            ok = value == "top" || value == "bottom" || value == "auto";
-            place = value == "top" ? Place::Top : value == "bottom" ? Place::Bottom : Place::Auto;
-        }
-        else if (key == "caption") {
-            have_caption = true;
-            ok = Decode(value, MAX_CAPTION, caption);
-        }
-        else if (key == "serial") {
-            have_serial = true;
-            ok = !value.empty() && value.size() <= 19 &&
-                 value.find_first_not_of("0123456789") == std::string::npos;
-            if (ok) serial = std::strtoull(value.c_str(), nullptr, 10);
-        }
-        else if (key == "keys") {
-            have_keys = true;
-            const std::vector<std::string> names = Split(value);
-            ok = names.size() <= MAX_KEYS;
-            for (const std::string &name : names) {
-                std::string decoded;
-                ok = ok && Decode(name, MAX_KEY, decoded) && !decoded.empty();
-                keys.push_back(decoded);
-            }
-        }
-        else if (key == "key_alpha") {
-            /* each keycap's alpha as a percentage, in the order `keys` names them */
-            const std::vector<std::string> parts = Split(value);
-            ok = parts.size() <= MAX_KEYS;
-            for (const std::string &part : parts) {
-                long level = 0;
-                ok = ok && !part.empty() && part.size() <= 3 &&
-                     part.find_first_not_of("0123456789") == std::string::npos;
-                if (!ok) break;
-                level = std::strtol(part.c_str(), nullptr, 10);
-                ok = level <= 100;
-                if (!ok) break;
-                keys_alpha.push_back((float)level / 100.0f);
-            }
-        }
         else { error = "PRESENCE does not know the argument " + key; return false; }
         if (!ok) { error = "PRESENCE " + key + "=" + value + " is not a value it takes"; return false; }
     }
@@ -366,39 +238,9 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
     if (!pointer) glide_ = Glide();  /* turned off: the next arrow appears where it is */
     pointer_ = pointer;
     std::copy(layers, layers + LAYER_COUNT, layers_);
-    if (place != place_) streak_ = 0;
-    place_ = place;
-    if (tint != tint_) caption_generation_++;
-    tint_ = tint;
-    if (have_caption) {
-        if (caption.empty()) {
-            if (caption_on_ && !caption_leaving_) {
-                caption_leaving_ = true;
-                caption_left_ms_ = now_ms;
-            }
-        } else {
-            const bool same = have_serial ? serial_known_ && serial == serial_ && caption_on_ : false;
-            if (!same) {
-                caption_on_ = true;
-                caption_leaving_ = false;
-                caption_since_ms_ = now_ms;
-            }
-            if (!same || caption != caption_) caption_generation_++;
-            caption_ = caption;
-        }
-    }
-    if (have_serial) {
-        serial_known_ = true;
-        serial_ = serial;
-    }
     if (recording != recording_) {
         recording_ = recording;
         recording_since_ms_ = now_ms;
-    }
-    if (have_keys && (keys != keys_ || keys_alpha != keys_alpha_)) {
-        keys_ = keys;
-        keys_alpha_ = keys_alpha;
-        keys_generation_++;
     }
     return true;
 }
@@ -485,48 +327,30 @@ Rect Overlay::OutRect(unsigned gx0, unsigned gy0, unsigned gx1, unsigned gy1) co
     return r;
 }
 
-void Overlay::Band(Scene &s, uint32_t now_ms) const {
+void Overlay::Marks(Scene &s, uint32_t now_ms) const {
     const unsigned gw = guest_width_ ? guest_width_ : width_, gh = guest_height_ ? guest_height_ : height_;
-    // One size for both layers: the client's share of the picture, taken as the BIOS font
-    // nearest it, so 8 on a 320x200 game and 16 on a 640x400 one.
-    s.font_h = (look_.font_share * gh) >= 12 ? 16 : 8;
+    // The BIOS font nearest the mark's share, so 8 on a 320x200 game and 16 on a 640x400 one.
+    s.font_h = (MARK_FONT_SHARE * gh) >= 12 ? 16 : 8;
     s.box_h = s.font_h + 2 * PAD;
-    s.top = place_ == Place::Top || (place_ == Place::Auto && band_ == Place::Top);
-    /* The box sits at the edge's own depth, as the clip draws it: never centred in the eighth,
-       whose height only tells where the tint stops. The depth is a vertical distance, so it is
-       the height's scale that converts it: on an aspect-corrected output the two differ. */
+    /* The mark sits at the edge's own depth, as the clip draws it: the depth is a vertical
+       distance, so it is the height's scale that converts it. */
     const unsigned edge = (unsigned)(((uint64_t)EdgeBand() * gw + width_ - 1) / std::max(1u, width_));
     const unsigned edge_y = (unsigned)(((uint64_t)EdgeBand() * gh + height_ - 1)
                                        / std::max(1u, height_));
     const unsigned margin = std::max((unsigned)PAD, edge);
     const unsigned margin_y = std::max((unsigned)PAD, edge_y);
-    if (s.top) s.box_y = margin_y;
-    else s.box_y = gh > margin_y + s.box_h ? gh - margin_y - s.box_h
-                                           : gh > s.box_h ? gh - s.box_h : 0;
-    unsigned left = margin, right = gw > margin ? gw - margin : 0;
-    const unsigned y0 = s.box_y, y1 = s.box_y + s.box_h;
-    auto set = [&](Layer l, unsigned gx0, unsigned gx1, unsigned gy0, unsigned gy1, uint64_t stamp) {
-        LayerKey &k = s.key[l];
-        k.r[0] = OutRect(gx0, gy0, gx1, gy1);
-        k.n = 1;
-        k.on = !k.r[0].empty();
-        k.stamp = stamp;
-    };
-
-    /* the record mark keeps the top right corner whatever the band; a band at the top makes
-       room for it in both halves of the blink, so the captions never move with it */
+    const unsigned right = gw > margin ? gw - margin : 0;
     if (layers_[RECORD] && recording_ != Recording::None) {
         const unsigned dot = s.font_h * REC_DOT_EIGHTHS / 8;
         const bool video = recording_ != Recording::Audio, audio = recording_ != Recording::Video;
         const unsigned w = 2 * PAD + (video ? dot + PAD + 3 * GLYPH_W : 0) +
                            (audio ? dot + PAD + GLYPH_W : 0) + (video && audio ? GAP : 0);
         const unsigned top = margin_y;
-        if (right >= left + w && top + s.box_h <= gh) {
+        if (right >= margin + w && top + s.box_h <= gh) {
             s.rec_x0 = right - w;
             s.rec_y0 = top;
-            if (s.top && y0 < top + s.box_h && y1 > top)
-                right = s.rec_x0 > left + GAP ? s.rec_x0 - GAP : left;
-            const uint32_t period = std::max<uint32_t>(2, (uint32_t)std::lround(look_.record_blink_s * 1000.0f));
+            const uint32_t period = std::max<uint32_t>(
+                2, (uint32_t)std::lround(look_.record_blink_s * 1000.0f));
             if ((uint32_t)(now_ms - recording_since_ms_) % period < period / 2) {
                 LayerKey &k = s.key[RECORD];
                 k.r[0] = OutRect(s.rec_x0, top, s.rec_x0 + w, top + s.box_h);
@@ -534,67 +358,6 @@ void Overlay::Band(Scene &s, uint32_t now_ms) const {
                 k.on = !k.r[0].empty();
                 k.stamp = ((uint64_t)recording_ << 32) | look_generation_;
             }
-        }
-    }
-
-    if (layers_[PAUSE] && s.state == State::Paused && left + PAUSE_W <= right) {
-        s.pause_x0 = left;
-        set(PAUSE, left, left + PAUSE_W, y0, y1, look_generation_);
-        left += PAUSE_W + GAP;
-    }
-
-    /* The held keys' marks take the edge the band leaves free, one row, never inside the band
-       and never over the record mark: the newest key at the left, the oldest making room where
-       the row fills, so the key being pressed is always the one shown. */
-    s.key_font_h = s.font_h;
-    s.key_box_h = s.key_font_h + 2 * PAD;
-    const unsigned key_y0 = s.top ? (gh > margin_y + s.key_box_h
-                                     && gh - margin_y - s.key_box_h >= y1
-                                     ? gh - margin_y - s.key_box_h : 0)
-                                  : (margin_y + s.key_box_h <= y0 ? margin_y : 0);
-    if (layers_[KEYS] && !keys_.empty() && key_y0 != 0) {
-        unsigned key_right = gw > margin ? gw - margin : 0;
-        if (!s.top && recording_ != Recording::None && s.rec_x0 != 0 &&
-            key_y0 < s.rec_y0 + s.box_h && key_y0 + s.key_box_h > s.rec_y0)
-            key_right = s.rec_x0 > left + GAP ? s.rec_x0 - GAP : left;
-        unsigned x = left, x1 = left;
-        for (size_t i = keys_.size(); i-- > 0;) {
-            const unsigned need = (unsigned)keys_[i].size() * GLYPH_W + 2 * PAD;
-            if (x + need > key_right) break;
-            s.key_x0.push_back(x);
-            x1 = x + need;
-            x += need + GAP;
-        }
-        if (!s.key_x0.empty()) {
-            s.key_y0 = key_y0;
-            set(KEYS, s.key_x0.front(), x1, s.key_y0, s.key_y0 + s.key_box_h,
-                ((uint64_t)keys_generation_ << 32) | (look_generation_ & 0xFFFFu));
-        }
-    }
-
-    if (layers_[CALLS] && caption_on_ && right > left + 2 * PAD) {
-        float f_in = 1.0f, f_out = 1.0f;
-        if (look_.caption_in > 0)
-            f_in = std::min(1.0f, (float)(uint32_t)(now_ms - caption_since_ms_) / (look_.caption_in * 1000.0f));
-        if (caption_leaving_)
-            f_out = look_.caption_out > 0
-                ? std::max(0.0f, 1.0f - (float)(uint32_t)(now_ms - caption_left_ms_) / (look_.caption_out * 1000.0f))
-                : 0.0f;
-        s.cap_level = (int)std::lround(f_in * f_out * CAPTION_LEVELS);
-        if (s.cap_level > 0) {
-            const unsigned room = right - left;
-            s.cap_text = FitText(caption_, room > 2 * PAD ? (room - 2 * PAD) / GLYPH_W : 0);
-            const unsigned text = (unsigned)s.cap_text.size() * GLYPH_W;
-            s.cap_x0 = left + (room - text - 2 * PAD) / 2;
-            s.cap_x1 = s.cap_x0 + text + 2 * PAD;
-            /* the band the clip shows: the caption's tint spans the room between the insets,
-               and the text is centred in whatever the pause mark leaves of it, so the cut
-               follows that room: its left edge is part of the stamp, or a caption laid while
-               the mark was on would never be laid again when it leaves */
-            set(CALLS, margin, right, y0, y1,
-                ((uint64_t)caption_generation_ << 40) |
-                ((uint64_t)(s.cap_x0 & 0xFFFFu) << 24) |
-                ((uint64_t)s.cap_level << 16) | (look_generation_ & 0xFFFFu));
         }
     }
 }
@@ -643,7 +406,7 @@ Overlay::Scene Overlay::SceneAt(uint32_t now_ms, bool have_pointer, float fx, fl
         k.stamp = look_generation_;
     }
 
-    Band(s, now_ms);
+    Marks(s, now_ms);
     return s;
 }
 
@@ -769,72 +532,9 @@ void Overlay::PaintRow(const Scene &s, unsigned y, unsigned x0, unsigned x1) {
                 }
                 break;
             }
-            case KEYS: {
-                const int radius = CellEdge(scale_x_, KEY_RADIUS);
-                for (size_t n = 0; n < s.key_x0.size(); n++) {
-                    const size_t which = keys_.size() - 1 - n;
-                    const std::string &name = keys_[which];
-                    /* A mark the server let go fades: it sends each keycap's own alpha. */
-                    const float key_alpha = which < keys_alpha_.size() ? keys_alpha_[which] : 1.0f;
-                    const uint32_t cap = Premul(look_.keycap_rgb,
-                                                Alpha255(look_.keycap_alpha * key_alpha));
-                    const uint32_t ink = Premul(look_.keycap_text_rgb, Alpha255(key_alpha));
-                    const uint32_t line = Premul(look_.keycap_text_rgb,
-                                                 (unsigned)std::lround(KEY_OUTLINE_ALPHA * key_alpha));
-                    const unsigned gx0 = s.key_x0[n], gx1 = gx0 + (unsigned)name.size() * GLYPH_W + 2 * PAD;
-                    /* The mark as the clip draws it: a rounded box, its outline half the text's
-                       brightness, drawn over the fill. */
-                    const Rect box = OutRect(gx0, s.key_y0, gx1, s.key_y0 + s.key_box_h);
-                    const int w = (int)(box.x1 - box.x0), h = (int)(box.y1 - box.y0);
-                    auto inside = [&](int dx, int dy, int inset) {
-                        const int r = std::max(0, radius - inset), ww = w - 2 * inset,
-                                  hh = h - 2 * inset;
-                        if (dx < 0 || dy < 0 || dx >= ww || dy >= hh) return false;
-                        if (r == 0 || (dx >= r && dx < ww - r) || (dy >= r && dy < hh - r))
-                            return true;
-                        const int cx = dx < r ? r - dx - 1 : dx - (ww - r);
-                        const int cy = dy < r ? r - dy - 1 : dy - (hh - r);
-                        return cx * cx + cy * cy <= r * r;
-                    };
-                    for (unsigned x = a; x < b; x++) {
-                        const int dx = (int)x - (int)box.x0, dy = (int)y - (int)box.y0;
-                        if (!inside(dx, dy, 0)) continue;
-                        row[x] = Over(row[x], cap);
-                        if (!inside(dx - 1, dy - 1, 1)) row[x] = Over(row[x], line);
-                    }
-                    PaintText(y, a, b, row, gx0 + PAD, gx1 - PAD, s.key_y0 + PAD, s.key_font_h,
-                              name, ink);
-                }
-                break;
-            }
-            case CALLS: {
-                const unsigned level = (unsigned)s.cap_level;
-                /* The tint arrives darkened for the band and is laid at the look's alpha, so
-                   the picture shows through it: the text keeps its AA over the dark pictures
-                   these sessions draw, and a bright one is what the translucency costs. */
-                const uint32_t box = Premul(tint_, Alpha255(look_.caption_alpha) * level / CAPTION_LEVELS);
-                const uint32_t ink = Premul(look_.caption_text_rgb, 255 * level / CAPTION_LEVELS);
-                for (unsigned x = a; x < b; x++) row[x] = Over(row[x], box);
-                PaintText(y, a, b, row, s.cap_x0 + PAD, s.cap_x1 - PAD, s.box_y + PAD, s.font_h,
-                          s.cap_text, ink);
-                break;
-            }
-            case PAUSE: {
-                const uint32_t cap = Premul(look_.keycap_rgb, Alpha255(look_.keycap_alpha));
-                const uint32_t ink = Premul(look_.keycap_text_rgb, 255);
-                const unsigned gy = gy_of_y_[y];
-                const bool bars = gy >= s.box_y + PAD && gy < s.box_y + s.box_h - PAD;
-                for (unsigned x = a; x < b; x++) {
-                    row[x] = Over(row[x], cap);
-                    const unsigned lx = gx_of_x_[x] - s.pause_x0;
-                    if (bars && ((lx >= PAD && lx < PAD + BAR_W) || (lx >= PAD + 2 * BAR_W && lx < PAD + 3 * BAR_W)))
-                        row[x] = Over(row[x], ink);
-                }
-                break;
-            }
             case RECORD: {
-                const uint32_t cap = Premul(look_.keycap_rgb, Alpha255(look_.keycap_alpha));
-                const uint32_t ink = Premul(look_.keycap_text_rgb, 255);
+                const uint32_t cap = Premul(MARK_RGB, Alpha255(MARK_ALPHA));
+                const uint32_t ink = Premul(MARK_TEXT_RGB, 255);
                 const uint32_t red = Premul(look_.record_rgb, 255);
                 const unsigned dot = s.font_h * REC_DOT_EIGHTHS / 8, gy = gy_of_y_[y];
                 const unsigned dot_y0 = s.rec_y0 + (s.box_h - dot) / 2;
@@ -1099,23 +799,6 @@ bool Overlay::Columns(const uint16_t *runs, const uint16_t *&rows, const std::ve
     return true;
 }
 
-void Overlay::Sample(uint32_t now_ms, const Picture &picture) {
-    if (place_ != Place::Auto || picture.pixel == nullptr || picture.width == 0 || picture.height == 0)
-        return;
-    if (sampled_ && (uint32_t)(now_ms - sampled_ms_) < placement::SAMPLE_MS) return;
-    sampled_ = true;
-    sampled_ms_ = now_ms;
-    placement::Point top[placement::SAMPLES], bottom[placement::SAMPLES];
-    placement::Points(picture.width, picture.height, top, bottom);
-    uint32_t ct[placement::SAMPLES], cb[placement::SAMPLES];
-    for (unsigned i = 0; i < placement::SAMPLES; i++) {
-        ct[i] = picture.pixel(picture.context, top[i].x, top[i].y);
-        cb[i] = picture.pixel(picture.context, bottom[i].x, bottom[i].y);
-    }
-    cost_.read += 2 * placement::SAMPLES;
-    band_ = placement::Step(band_, streak_, placement::Score(ct), placement::Score(cb));
-}
-
 /* Walked as the outputs walk them: unchanged and changed counts in turn until the frame's height. */
 uint64_t Overlay::RunBytes(const uint16_t *runs) const {
     if (runs == nullptr) return 0;
@@ -1136,23 +819,21 @@ std::string Overlay::Describe(bool with_version) const {
     std::string asked;
     for (int l = 0; l < LAYER_COUNT; l++)
         if (layers_[l]) asked += std::string(asked.empty() ? "" : ",") + LAYER_NAMES[l];
-    const char *band = band_ == Place::Top ? "top" : "bottom";
-    const char *place = place_ == Place::Top ? "top" : place_ == Place::Bottom ? "bottom" : band;
     if (drawable())
         std::snprintf(line, sizeof(line),
                       "PRESENCE %s frames=%llu pointer=%d output=%ux%ux%u px_read=%llu"
                       " px_written=%llu bytes_presented=%llu uploads=%llu upload_bytes=%llu"
-                      " layers=%s place=%s",
+                      " layers=%s",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0, width_,
                       height_, fmt_.bytes * 8u, (unsigned long long)cost_.read,
                       (unsigned long long)cost_.written, (unsigned long long)cost_.presented,
                       (unsigned long long)cost_.uploads, (unsigned long long)cost_.upload_bytes,
-                      asked.c_str(), place);
+                      asked.c_str());
     else if (width_ != 0 && height_ != 0)
         std::snprintf(line, sizeof(line),
-                      "PRESENCE %s frames=%llu pointer=%d output=undrawable layers= place=%s%s%s",
-                      StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0, place,
-                      asked.empty() ? "" : " lacks=", asked.c_str());
+                      "PRESENCE %s frames=%llu pointer=%d output=undrawable layers= %s%s",
+                      StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0,
+                      asked.empty() ? "" : "lacks=", asked.c_str());
     else
         std::snprintf(line, sizeof(line), "PRESENCE %s frames=%llu pointer=%d output=none",
                       StateName(state_), (unsigned long long)frames_, pointer_ ? 1 : 0);
@@ -1177,43 +858,6 @@ size_t frame_pitch = 0;
 bool Idle() {
     const presence::Overlay &o = presence::Instance();
     return o.state() == presence::State::Off && !o.drawn() && !o.NeedsRepaint(0, false, 0, 0);
-}
-
-/* The guest's pixel from the scaler's source cache, which never holds the overlay. */
-uint32_t GuestPixel(const void *, unsigned x, unsigned y) {
-    const uint8_t *line = scalerSourceCacheBuffer + (size_t)y * render.scale.cachePitch;
-    switch (render.src.bpp) {
-    case 8: {
-        const auto &c = render.pal.rgb[line[x]];
-        return ((uint32_t)c.red << 16) | ((uint32_t)c.green << 8) | c.blue;
-    }
-    case 15: case 16: {
-        uint16_t v;
-        std::memcpy(&v, line + (size_t)x * 2, 2);
-        if (render.src.bpp == 15)
-            return ((uint32_t)((v >> 10) & 31) * 255 / 31) << 16 | ((uint32_t)((v >> 5) & 31) * 255 / 31) << 8 |
-                   (uint32_t)(v & 31) * 255 / 31;
-        return ((uint32_t)((v >> 11) & 31) * 255 / 31) << 16 | ((uint32_t)((v >> 5) & 63) * 255 / 63) << 8 |
-               (uint32_t)(v & 31) * 255 / 31;
-    }
-    case 32: {
-        uint32_t v;
-        std::memcpy(&v, line + (size_t)x * 4, 4);
-        return v & 0xFFFFFFu;
-    }
-    default: return 0;
-    }
-}
-
-/* Placement samples the guest's own picture, once a second; the complex scalers keep theirs
-   elsewhere, so `auto` stays where it is with them. */
-void Sample(uint32_t now_ms) {
-    if (scalerSourceCacheBuffer == nullptr || useTraditionalRenderCache) return;
-    presence::Picture picture;
-    picture.width = (unsigned)render.src.width;
-    picture.height = (unsigned)render.src.height;
-    picture.pixel = GuestPixel;
-    presence::Instance().Sample(now_ms, picture);
 }
 
 } /* namespace */
@@ -1264,7 +908,6 @@ const uint16_t *PRESENCE_EndFrame(uint8_t *buf, size_t pitch, const uint16_t *ch
     const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
     const uint32_t now = (uint32_t)GetTicks();
     presence::Instance().Guest(guest_width, guest_height);
-    Sample(now);
     return presence::Instance().Compose(buf, pitch, changed, now, pointer, fx, fy, shown);
 }
 
@@ -1280,7 +923,6 @@ bool PRESENCE_WantsRepaint() {
     const bool pointer = Mouse_PresencePointer(fx, fy, guest_width, guest_height);
     const uint32_t now = (uint32_t)GetTicks();
     presence::Instance().Guest(guest_width, guest_height);
-    Sample(now);
     return presence::Instance().NeedsRepaint(now, pointer, fx, fy);
 }
 
