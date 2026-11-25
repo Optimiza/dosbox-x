@@ -72,7 +72,7 @@ bool FormatFromPixels(unsigned bytes, uint32_t black, uint32_t r, uint32_t g, ui
                       Format &out);
 
 /* What drawing the overlay has cost, counted since the output was made: the output pixels it read
-   (saved, sampled for placement), the output pixels it wrote (put back, blended), the bytes it
+   (saved before drawing), the output pixels it wrote (put back, blended), the bytes it
    handed on to be presented, and the rectangles uploaded to an overlay texture (none on the CPU
    path, and nothing read, written or presented of the frame on the texture path). Pixels and
    bytes, so the same on any host. */

@@ -486,6 +486,24 @@ TEST(PresenceLayers, TheLayersWordTurnsLayersOff) {
     EXPECT_NE(b.o.Describe().find(" layers=edge"), std::string::npos) << b.o.Describe();
 }
 
+TEST(PresenceLayers, FramesCountOnlyFramesThatCarryALayer) {
+    Band b("held layers=record rec=none");
+    b.Draw(0);
+    b.Draw(16);
+    EXPECT_EQ(b.o.frames(), 0u) << "no layer is on, so no frame carries the overlay";
+    std::string error;
+    ASSERT_TRUE(b.o.Configure("held layers=edge", error, 0)) << error;
+    b.Draw(32);
+    EXPECT_EQ(b.o.frames(), 1u) << "the frame the edge came on";
+}
+
+TEST(PresenceLayers, AnEmptyLayersWordIsRefusedAsAnEmptyRecordingIs) {
+    Overlay o;
+    std::string error;
+    EXPECT_FALSE(o.Configure("held layers=", error, 0)) << "no layer named";
+    EXPECT_FALSE(o.Configure("held layers=edge,", error, 0)) << "a trailing comma names none";
+}
+
 TEST(PresenceLayers, AnOutputItCannotDrawOnSaysWhichLayersItLacks) {
     Overlay o;
     std::string error;
@@ -505,6 +523,7 @@ TEST(PresenceLayers, TheProtocolRefusesWhatItCannotDrawAndChangesNothing) {
     EXPECT_FALSE(o.Configure("held place=top", error, 0));
     EXPECT_FALSE(o.Configure("held tint=red", error, 0));
     EXPECT_FALSE(o.Configure("held key_alpha=100", error, 0));
+    EXPECT_FALSE(o.Configure("held scroll=1", error, 0)) << "the caption's scroll, refused";
     EXPECT_FALSE(o.Configure("paused", error, 0)) << "no pause state";
     EXPECT_FALSE(o.Configure("paused rec=screen", error, 0)) << "an unknown recording";
     EXPECT_FALSE(o.Configure("held rec=", error, 0));

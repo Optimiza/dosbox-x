@@ -214,8 +214,10 @@ bool Overlay::Configure(const std::string &args, std::string &error, uint32_t no
             if (ok) look.sprite = rows;
         }
         else if (key == "layers") {
+            const std::vector<std::string> names = Split(value);
+            ok = !names.empty();
             std::fill(layers, layers + LAYER_COUNT, false);
-            for (const std::string &name : Split(value)) {
+            for (const std::string &name : names) {
                 const auto *at = std::find_if(LAYER_NAMES, LAYER_NAMES + LAYER_COUNT,
                                               [&](const char *n) { return name == n; });
                 ok = ok && at != LAYER_NAMES + LAYER_COUNT;
@@ -615,6 +617,13 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
                                  bool shown) {
     if (!drawable() || (buf == nullptr && texture_ == nullptr)) return changed;
     const Scene s = SceneAt(now_ms, have_pointer, fx, fy);
+    /* A frame carries the overlay only when one of its layers is on: the state alone is not
+       enough now that a client can ask for none, and `frames` counts the frames it was drawn on. */
+    const auto any_layer_on = [](const Scene &scene) {
+        for (const auto &k : scene.key)
+            if (k.on) return true;
+        return false;
+    };
     const unsigned bytes = fmt_.bytes;
 
     /* what changed: the old and the new places of every layer that is not as drawn */
@@ -638,7 +647,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
     if (texture_) {
         uploads_.insert(uploads_.end(), dirty.begin(), dirty.end());
         drawn_ = s;
-        if (s.state != State::Off) frames_++;
+        if (any_layer_on(s)) frames_++;
         return changed;
     }
     std::vector<Rect> &cover = cover_now_;
@@ -701,7 +710,7 @@ const uint16_t *Overlay::Compose(uint8_t *buf, size_t pitch, const uint16_t *cha
     cover_old_.swap(cover);
     pending_.insert(pending_.end(), dirty.begin(), dirty.end());
     drawn_ = s;
-    if (s.state != State::Off) frames_++;
+    if (any_layer_on(s)) frames_++;
     if (!shown) return changed;
     if (pending_.empty()) {
         cost_.presented += RunBytes(changed);
