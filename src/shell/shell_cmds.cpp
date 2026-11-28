@@ -953,6 +953,14 @@ void DOS_Shell::CMD_DELTREE(char * args) {
 		WriteOut(MSG_Get("SHELL_MISSING_PARAMETER"));
 		return;
 	}
+	/* A name DOS holds with a space is one word only in quotes: MS-DOS's DELTREE deletes
+	 * nothing for `DELTREE A B` and the folder for `DELTREE "A B"`, as MD, RD and DEL refuse
+	 * the second word */
+	StripSpaces(args);
+	if (char* word = SecondWord(args)) {
+		WriteOut(MSG_Get("SHELL_TOO_MANY_PARAMETERS"), word);
+		return;
+	}
 
 	if (uselfn&&strchr(args, '*')) {
 		char * find_last;
