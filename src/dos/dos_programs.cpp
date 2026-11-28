@@ -2046,6 +2046,14 @@ extern PhysPt boot_code_image_load_to;
 extern uint16_t boot_code_image_stack_ss;
 extern uint16_t boot_code_image_stack_sp;
 
+/* A word CommandLine hands a program has lost the quotes it was typed in, and DOS_MakeName
+ * packs the spaces of a name that arrives outside them, reaching another file: "PROGRAM FILES"
+ * is PROGRAM. A word holding a space was quoted, so it is given its quotes back. */
+static std::string DOS_QuotedWord(const std::string& word) {
+	if (word.empty() || word[0]=='"' || word.find(' ')==std::string::npos) return word;
+	return "\"" + word + "\"";
+}
+
 /*! \brief          BOOT.COM utility to boot a floppy or hard disk device.
  *
  *  \description    Users will use this command to boot a guest operating system from
@@ -2083,7 +2091,7 @@ private:
 
         localDrive* ldp=nullptr;
 		bool readonly=wpcolon&&strlen(filename)>1&&filename[0]==':';
-        if (!DOS_MakeName(readonly?filename+1:filename,fullname,&drive)) return NULL;
+        if (!DOS_MakeName(DOS_QuotedWord(readonly?filename+1:filename).c_str(),fullname,&drive)) return NULL;
 
         try {
             ldp=dynamic_cast<localDrive*>(Drives[drive]);
@@ -3631,7 +3639,10 @@ public:
         uint8_t drive;
         char fullname[DOS_PATHLENGTH];
         localDrive* ldp=nullptr;
-        if (!DOS_MakeName(temp_line.c_str(),fullname,&drive)) return;
+        if (!DOS_MakeName(DOS_QuotedWord(temp_line).c_str(),fullname,&drive)) {
+            WriteOut(MSG_Get("PROGRAM_LOADROM_CANT_OPEN"));
+            return;
+        }
 
         try {
             /* try to read ROM file into buffer */
@@ -3713,7 +3724,10 @@ public:
         uint8_t drive;
         char fullname[DOS_PATHLENGTH];
         localDrive* ldp = nullptr;
-        if (!DOS_MakeName(temp_line.c_str(), fullname, &drive)) return;
+        if (!DOS_MakeName(DOS_QuotedWord(temp_line).c_str(), fullname, &drive)) {
+            WriteOut(MSG_Get("PROGRAM_BIOSTEST_OPEN_ERROR"));
+            return;
+        }
 
         try {
             /* try to read ROM file into buffer */
